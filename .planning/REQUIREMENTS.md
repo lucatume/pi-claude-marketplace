@@ -300,6 +300,33 @@
 - [x] **NFR-11**: Pi extension API declared as `@mariozechner/pi-coding-agent` peer dep; successor SHOULD pin a minimum version once API stabilizes
 - [ ] **NFR-12**: `marketplace.json` parser is forward-compatible (no schema-version check; unknown source kinds parse to `{ kind: "unknown", reason }`)
 
+## Milestone v1.2 Requirements
+
+Requirements for the Claude settings import milestone. These are additive to the original PRD-derived V1 requirement set and are expected to map to Phases 8 and 9 after v1.1 is merged.
+
+### Import Command & Scope
+
+- [x] **IMP-01**: User can run `/claude:plugin import [--scope user|project]` to import enabled Claude Code plugins into Pi.
+- [x] **IMP-02**: When `--scope` is omitted, import processes both user and project Claude settings and writes to the matching Pi scopes.
+- [x] **IMP-03**: When `--scope user` or `--scope project` is provided, import processes only that Claude settings scope and writes only to the matching Pi scope.
+
+### Claude Settings Parsing
+
+- [x] **IMP-04**: Import reads both `settings.json` and `settings.local.json` for each selected Claude scope, with local settings overriding base settings.
+- [x] **IMP-05**: Import considers only merged `enabledPlugins` entries whose value is exactly `true`; false, null, missing, and non-boolean values are ignored.
+- [x] **IMP-06**: Import parses enabled plugin keys as `plugin@marketplace` refs and reports malformed keys without aborting valid imports.
+
+### Marketplace Source Import
+
+- [x] **IMP-07**: If an enabled plugin references `claude-plugins-official` and that marketplace is missing in the target Pi scope, import adds it from `anthropics/claude-plugins-official`.
+- [x] **IMP-08**: For non-official marketplaces, import reads merged `extraKnownMarketplaces` and maps Claude `directory` sources to Pi path-source marketplace adds and Claude `github.repo` sources to Pi GitHub-source marketplace adds.
+
+### Plugin Import Orchestration
+
+- [x] **IMP-09**: Import is idempotent: already-added marketplaces and already-installed plugins are skipped without error, while enabled plugins in both Claude scopes are imported into both matching Pi scopes unless `--scope` narrows the run.
+- [x] **IMP-10**: Import continues after per-plugin unavailable/uninstallable results and reports those skipped plugins as warnings.
+- [x] **IMP-11**: Import uses existing marketplace-add and plugin-install semantics for atomicity, state locking, network policy, output channel, soft-dependency warnings, and reload hints.
+
 ## v2 Requirements
 
 ### Listing & Inspection
@@ -345,7 +372,7 @@ Surfaced by FEATURES research; these are spec ambiguities, not new requirements.
 01. **Cross-marketplace plugin name handling** -- when the same `<plugin>` exists in two marketplaces in the same scope, what does `install <plugin>@<mp1>` then `install <plugin>@<mp2>` produce? (PRD silent; FEATURES Gap 1)
 02. **Cascade abort vs continue on failure** -- when `marketplace update` cascade hits a per-plugin failure, MR-3/MU-7 say partition+continue, but is "abort entire cascade on first failure" ever the right call? (FEATURES Gap 2)
 03. **Custom component-path supplement vs replace** -- PRD §11 deferral may actually be a spec-compliance bug; decide whether to fix in V1 successor or document continued deferral (FEATURES Gap 3, COMP-01)
-04. ~~**Simultaneous-scope install semantics** -- if a plugin is installable in both `user` and `project` scopes, does install in one scope shadow the other?~~ **Resolved by D-26 / CMP-1..8:** same plugin may be installed in both scopes; project install takes precedence for unqualified single-target operations; explicit `--scope` selects the target.
+04. ~~**Simultaneous-scope install semantics** -- if a plugin is installable in both `user` and `project` scopes, does install in one scope shadow the other?~~ **Resolved by D-29 / CMP-1..8:** same plugin may be installed in both scopes; project install takes precedence for unqualified single-target operations; explicit `--scope` selects the target.
 05. **Reload-hint-when-soft-dep-unloaded interaction** -- RH-5 says soft-dep warning before reload hint; what about when ONLY soft-dep resources changed and the dep is unloaded? (FEATURES Gap 5)
 06. **Empty-marketplace ergonomics** -- `marketplace add` to an empty marketplace succeeds without reload hint (MA-11); does `list` show it differently? (FEATURES Gap 6)
 07. **Hash version stability across encoding** -- PI-7 specifies SHA-256 over recursive walk; what about plugins with files that contain BOM or different line endings? (FEATURES Gap 7)
@@ -571,6 +598,17 @@ Every v1 REQ-ID maps to exactly one phase. Status `Pending` until execution upda
 | NFR-10      | Phase 1 | Pending |
 | NFR-11      | Phase 7 | Complete |
 | NFR-12      | Phase 2 | Pending |
+| IMP-01      | Phase 11 | Complete |
+| IMP-02      | Phase 11 | Complete |
+| IMP-03      | Phase 11 | Complete |
+| IMP-04      | Phase 10 | Complete |
+| IMP-05      | Phase 10 | Complete |
+| IMP-06      | Phase 10 | Complete |
+| IMP-07      | Phase 10 | Complete |
+| IMP-08      | Phase 10 | Complete |
+| IMP-09      | Phase 11 | Complete |
+| IMP-10      | Phase 11 | Complete |
+| IMP-11      | Phase 11 | Complete |
 
 **Coverage:**
 
@@ -589,9 +627,11 @@ Every v1 REQ-ID maps to exactly one phase. Status `Pending` until execution upda
 | Phase 5: Plugin Orchestrators                 | 52 (PI-1..14, PI-16..17, PU-1..8, PUP-1..9, PL-1..7, CMP-2..5, RN-3, AS-2..3, AS-6..7, NFR-2..3) -- PI-15 superseded by Phase 7 D-08                           |
 | Phase 6: Edge Layer & Tab Completion          | 16 (TC-1..9, CMP-6..8, AP-1..4)                                                                                                                   |
 | Phase 7: Integration & Pi Wiring              | 4 (NFR-8, NFR-11) -- note: NFR-2/3 land in Phase 5 since they describe orchestrator behavior; Phase 7 verifies them in live environment |
+| Phase 10: Claude Settings Import Foundation   | 5 (IMP-04..8)                                                                                                                         |
+| Phase 11: Import Command Orchestration        | 6 (IMP-01..3, IMP-09..11)                                                                                                             |
 
 > **Phase 7 count clarification:** NFR-8 and NFR-11 are the two REQ-IDs uniquely owned by Phase 7. The "live e2e against `anthropics/claude-plugins-official`" work in Phase 7 verifies NFR-2/NFR-3/NFR-5 in production-like conditions but those REQ-IDs are owned by their primary phase (5 / 5 / 4).
 
 ______________________________________________________________________
 
-*Requirements defined: 2026-05-09 from `docs/prd/pi-claude-marketplace-prd.md` v1.0* *Last updated: 2026-05-15 -- D-26 / CMP-1..8 clarify marketplace-vs-plugin scope semantics and make install completion available-only for the current target scope.*
+*Requirements defined: 2026-05-09 from `docs/prd/pi-claude-marketplace-prd.md` v1.0* *Last updated: 2026-05-16 -- merged origin/main; D-29 (renumbered from main's D-26) / CMP-1..8 clarify marketplace-vs-plugin scope semantics and make install completion available-only for the current target scope. Earlier same-week: Phase 11 completed IMP-01..IMP-03 and IMP-09..IMP-11 for import command orchestration; Phase 10 completed IMP-04..IMP-08 for Claude settings import foundation.*

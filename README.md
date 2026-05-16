@@ -219,11 +219,12 @@ Update one installed plugin, every installed plugin from one marketplace, or all
 
 ```text
 /claude:plugin update context7-plugin@context7-marketplace
-/context7-plugin@context7-marketplace
+/claude:plugin update @context7-marketplace
 /claude:plugin update
 ```
 
-[!NOTE] Agent definitions in plugins may include a preferred model for running the agent, e.g. "sonnet", "opus", etc. These are discarded by default, but the `--map-models` option for `install` can be used to make a best-effort attempt at mapping these models to Pi models.
+> [!NOTE]
+> Agent definitions in plugins may include a preferred model for running the agent, e.g. "sonnet", "opus", etc. These are discarded by default, but the `--map-model` option for `install` can be used to make a best-effort attempt at mapping these models to Pi models.
 
 Uninstall a plugin.
 
@@ -248,9 +249,26 @@ Bootstrap is a convenience one-shot setup of the official Anthropic marketplace 
 This is equivalent to running.
 
 ```text
-/claude:plugin marketplace add upstash/context7-marketplace
-/claude:plugin marketplace autoupdate context7-marketplace
+/claude:plugin marketplace add anthropics/claude-plugins-marketplace
+/claude:plugin marketplace autoupdate anthropics/claude-plugins-marketplace
 ```
+
+### Import
+
+Import is a convenience command to import marketplaces and plugins already defined in Claude Code settings.
+
+```text
+/claude:plugin import
+```
+
+By default, marketplaces and plugins are added in accordance to the scope that they're defined in Claude Code. It's also possible to limit the import to a specific scope.
+
+```text
+/claude:plugin import --scope user
+/claude:plugin import --scope project
+```
+
+Plugins that are not available for installation in Pi because of unsupported components are skipped with a warning.
 
 ## Development
 
