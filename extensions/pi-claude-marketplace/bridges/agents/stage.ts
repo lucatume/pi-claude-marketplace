@@ -1,6 +1,8 @@
 // bridges/agents/stage.ts
 //
 // Two-phase staging for the agents bridge: prepare / commit / abort.
+// Phase 8 adds three-phase replacement exports: replacePreparedAgents,
+// rollbackAgentsReplacement, finalizeAgentsReplacement.
 // Carry-forward of V1 agent/stage.ts (lines 280-525) with the Phase 3
 // successor deltas:
 //
@@ -23,13 +25,17 @@
 //      without touching disk.
 
 import { randomUUID } from "node:crypto";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import writeFileAtomic from "write-file-atomic";
+
+import { assertSafeName } from "../../domain/name.ts";
 import { loadAgentsIndex, saveAgentsIndex } from "../../persistence/agents-index-io.ts";
 import { AgentOwnershipConflictError } from "../../shared/errors-bridges.ts";
-import { appendLeakToError } from "../../shared/errors.ts";
-import { cleanupStaging } from "../../shared/fs-utils.ts";
+import { appendLeakToError, errorMessage } from "../../shared/errors.ts";
+import { cleanupStaging, pathExists, rollbackReplacementCommon } from "../../shared/fs-utils.ts";
+import { MANUAL_RECOVERY_REQUIRED } from "../../shared/markers.ts";
 import { assertPathInside } from "../../shared/path-safety.ts";
 
 import { assertNoAgentCollisions, convertAgent } from "./convert.ts";
@@ -38,15 +44,29 @@ import { findOwnershipConflicts, partitionByOwner } from "./index-mutation.ts";
 import { isOwnedAgentFile } from "./marker.ts";
 
 import type {
+  AgentsReplacement,
   ConvertedAgent,
   DiscoveredAgent,
   PreparedAgentsStaging,
+  ReplacePreparedAgentsOptions,
   StageAgentsCommitResult,
   StageAgentsInput,
   StagedAgentRecord,
   UnstageAgentFailure,
 } from "./types.ts";
 import type { AgentsIndexEntry } from "../../persistence/agents-index-schema.ts";
+
+type AgentsReplacementInternals = Readonly<{
+  backupRoot: string;
+  oldIndexText: string | undefined;
+  backups: readonly { name: string; from: string; to: string }[];
+  renamed: readonly { from: string; to: string }[];
+}>;
+
+const agentsReplacementInternals = new WeakMap<
+  Extract<AgentsReplacement, { kind: "replaced" }>,
+  AgentsReplacementInternals
+>();
 
 /**
  * 10-step prepare. NOTHING outside `<extensionRoot>/agents-staging/<uuid>/`
@@ -56,7 +76,7 @@ import type { AgentsIndexEntry } from "../../persistence/agents-index-schema.ts"
  * failure during the staging-dir write.
  *
  * Steps:
- *   1. Discover (or [] if agentsSourceDir === "")
+ *   1. Discover (or [] if agentsSourceDir === null)
  *   2. AG-12 collision detection within this plugin
  *   3. Convert (AG-7 mapping pipeline)
  *   4. Load index, partition by (marketplace, plugin)
@@ -82,15 +102,15 @@ export async function prepareStagePluginAgents(
   } = input;
 
   // Step 1: discover. D-07 signature: discoverPluginAgents now takes
-  // `agentsDirs: readonly string[]`. The legacy `agentsSourceDir: ""`
-  // sentinel maps to an empty array; a non-empty string maps to a
+  // `agentsDirs: readonly string[]`. A null agentsSourceDir means the
+  // plugin has no agents component; a non-null string maps to a
   // single-element array. Phase 5 callers building over the new
   // `componentPaths.agents: readonly string[]` shape pass the array
   // directly (translation lives at the StageAgentsInput boundary).
   // D-07 warnings (duplicate generated names across array elements)
   // are folded into `aggregatedWarnings` below.
   const discoverResult =
-    agentsSourceDir === ""
+    agentsSourceDir === null
       ? { discovered: [] as readonly DiscoveredAgent[], warnings: [] as readonly string[] }
       : await discoverPluginAgents({ pluginName, agentsDirs: [agentsSourceDir] });
   const discovered: readonly DiscoveredAgent[] = discoverResult.discovered;
@@ -361,4 +381,190 @@ export async function abortPreparedAgents(
   }
 
   return cleanupStaging(prepared.stagingDir, "agents staging directory");
+}
+
+/**
+ * Reinstall-safe replacement helper. Unlike commitPreparedAgents, this
+ * backs up previous plugin-owned agent files and agents-index.json before
+ * staged renames so later orchestrator failures can restore the old install.
+ */
+export async function replacePreparedAgents(
+  prepared: PreparedAgentsStaging,
+  options?: ReplacePreparedAgentsOptions,
+): Promise<AgentsReplacement> {
+  if (prepared.kind === "noop") {
+    return { kind: "noop", prepared };
+  }
+
+  if (prepared.result.failed.length > 0 && options?.force !== true) {
+    throw new Error(
+      `Agent replacement blocked by foreign previous content:\n${prepared.result.failed
+        .map((f) => `  - ${f.generatedName} at ${f.targetPath}: ${f.reason}`)
+        .join("\n")}`,
+    );
+  }
+
+  const oldIndexText = await readOptionalText(prepared.locations.agentsIndexPath);
+  const backupRoot = path.join(prepared.locations.agentsStagingDir, `backup-${randomUUID()}`);
+  await mkdir(backupRoot, { recursive: true });
+  await assertPathInside(prepared.locations.agentsStagingDir, backupRoot, "agents backup root");
+  const backupEntries =
+    options?.force === true
+      ? [...prepared._previousEntries, ...prepared._foreignPreservedEntries]
+      : [...prepared._previousEntries];
+  const backups: { name: string; from: string; to: string }[] = [];
+  const renamed: { from: string; to: string }[] = [];
+
+  try {
+    for (const entry of backupEntries) {
+      assertSafeName(entry.generatedName, "previous agent name");
+      await assertPathInside(prepared.locations.agentsDir, entry.targetPath, "previous agent file");
+      if (!(await pathExists(entry.targetPath))) {
+        continue;
+      }
+
+      const backup = path.join(backupRoot, entry.generatedName + ".md");
+      await assertPathInside(backupRoot, backup, "agents backup file");
+      await rename(entry.targetPath, backup);
+      backups.push({ name: entry.generatedName, from: entry.targetPath, to: backup });
+    }
+
+    await mkdir(prepared.locations.agentsDir, { recursive: true });
+    for (const pair of prepared._stagedFilePaths) {
+      if (await pathExists(pair.to)) {
+        throw new Error(`Cannot replace agent target with non-previous content at ${pair.to}`);
+      }
+
+      await rename(pair.from, pair.to);
+      renamed.push(pair);
+    }
+
+    await saveAgentsIndex(prepared.locations, {
+      schemaVersion: 1,
+      agents: [...prepared._otherEntries, ...prepared._newEntries],
+    });
+  } catch (err) {
+    const leaks = await rollbackAgentsReplacementInternal(
+      prepared,
+      renamed,
+      backups,
+      backupRoot,
+      oldIndexText,
+    );
+    if (leaks.length > 0) {
+      throw new Error(`${errorMessage(err)} ${MANUAL_RECOVERY_REQUIRED}${leaks.join("; ")}`, {
+        cause: err,
+      });
+    }
+
+    throw err;
+  }
+
+  const replacement: Extract<AgentsReplacement, { kind: "replaced" }> = {
+    kind: "replaced",
+    prepared,
+  };
+  agentsReplacementInternals.set(replacement, {
+    backupRoot,
+    oldIndexText,
+    backups: Object.freeze(backups),
+    renamed: Object.freeze(renamed),
+  });
+  return replacement;
+}
+
+export async function rollbackAgentsReplacement(
+  replacement: AgentsReplacement,
+): Promise<readonly string[]> {
+  if (replacement.kind === "noop") {
+    return Object.freeze([]);
+  }
+
+  const internals = requireAgentsReplacementInternals(replacement);
+  return rollbackAgentsReplacementInternal(
+    replacement.prepared,
+    internals.renamed,
+    internals.backups,
+    internals.backupRoot,
+    internals.oldIndexText,
+  );
+}
+
+export async function finalizeAgentsReplacement(
+  replacement: AgentsReplacement,
+): Promise<readonly string[]> {
+  if (replacement.kind === "noop") {
+    return Object.freeze([]);
+  }
+
+  const internals = requireAgentsReplacementInternals(replacement);
+  const leaks = [
+    await cleanupStaging(internals.backupRoot, "agents replacement backup directory"),
+    await cleanupStaging(replacement.prepared.stagingDir, "agents staging directory"),
+  ].filter((leak): leak is string => leak !== undefined);
+  return Object.freeze(leaks);
+}
+
+function requireAgentsReplacementInternals(
+  replacement: Extract<AgentsReplacement, { kind: "replaced" }>,
+): AgentsReplacementInternals {
+  const internals = agentsReplacementInternals.get(replacement);
+  if (internals === undefined) {
+    throw new Error("Unknown agents replacement handle.");
+  }
+
+  return internals;
+}
+
+async function rollbackAgentsReplacementInternal(
+  prepared: Extract<PreparedAgentsStaging, { kind: "staged" }>,
+  renamed: readonly { from: string; to: string }[],
+  backups: readonly { name: string; from: string; to: string }[],
+  backupRoot: string,
+  oldIndexText: string | undefined,
+): Promise<readonly string[]> {
+  return rollbackReplacementCommon({
+    renamed,
+    backups,
+    stagingRoot: prepared.stagingDir,
+    backupRoot,
+    removeMode: "file",
+    labels: {
+      replacement: "replacement agent file",
+      previous: "previous agent file",
+      stagingDir: "agents staging directory",
+      backupDir: "agents replacement backup directory",
+    },
+    beforeCleanup: () => restoreAgentsIndex(prepared.locations.agentsIndexPath, oldIndexText),
+  });
+}
+
+async function restoreAgentsIndex(
+  agentsIndexPath: string,
+  oldIndexText: string | undefined,
+): Promise<readonly string[]> {
+  try {
+    if (oldIndexText === undefined) {
+      await rm(agentsIndexPath, { force: true });
+    } else {
+      await mkdir(path.dirname(agentsIndexPath), { recursive: true });
+      await writeFileAtomic(agentsIndexPath, oldIndexText, { encoding: "utf8" });
+    }
+
+    return [];
+  } catch (err) {
+    return [`failed to restore agents index at ${agentsIndexPath}: ${errorMessage(err)}`];
+  }
+}
+
+async function readOptionalText(filePath: string): Promise<string | undefined> {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+
+    throw err;
+  }
 }

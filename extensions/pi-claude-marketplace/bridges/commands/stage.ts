@@ -1,6 +1,8 @@
 // bridges/commands/stage.ts
 //
-// CommandsBridge: prepare/commit/abort + RN-6 collision detection.
+// CommandsBridge: prepare/commit/abort + RN-6 collision detection, plus Phase 8
+// replacement exports: replacePreparedCommands, rollbackCommandsReplacement,
+// finalizeCommandsReplacement.
 // Pattern carry-forward from V1 `resource/stage.ts` (commands branch of
 // `stagePluginResources`) for the body-substitute + per-file rename
 // logic; prepare/commit/abort discipline mirrors V1 `agent/stage.ts`.
@@ -26,19 +28,32 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { assertSafeName } from "../../domain/name.ts";
-import { appendLeakToError } from "../../shared/errors.ts";
-import { cleanupStaging } from "../../shared/fs-utils.ts";
+import { appendLeakToError, errorMessage } from "../../shared/errors.ts";
+import { cleanupStaging, pathExists, rollbackReplacementCommon } from "../../shared/fs-utils.ts";
+import { MANUAL_RECOVERY_REQUIRED } from "../../shared/markers.ts";
 import { assertPathInside } from "../../shared/path-safety.ts";
 import { substituteClaudeVars } from "../../shared/vars.ts";
 
 import { discoverPluginCommands } from "./discover.ts";
 
 import type {
+  CommandsReplacement,
   DiscoveredCommand,
   PreparedCommandsStaging,
   StageCommandsInput,
   StagedCommandRecord,
 } from "./types.ts";
+
+type CommandsReplacementInternals = Readonly<{
+  backupRoot: string;
+  backups: readonly { name: string; from: string; to: string }[];
+  renamed: readonly { from: string; to: string }[];
+}>;
+
+const commandsReplacementInternals = new WeakMap<
+  Extract<CommandsReplacement, { kind: "replaced" }>,
+  CommandsReplacementInternals
+>();
 
 /**
  * RN-6: detect two source command names that elide to the same generated
@@ -213,10 +228,141 @@ export async function commitPreparedCommands(
  * Abort a prepared staging. Cleans up the staging dir; the noop branch
  * has nothing to clean.
  */
-export async function abortPreparedCommands(prepared: PreparedCommandsStaging): Promise<void> {
+export async function abortPreparedCommands(
+  prepared: PreparedCommandsStaging,
+): Promise<string | undefined> {
   if (prepared.kind === "noop") {
-    return;
+    return undefined;
   }
 
-  await cleanupStaging(prepared.stagingRoot, "commands staging directory");
+  return cleanupStaging(prepared.stagingRoot, "commands staging directory");
+}
+
+/**
+ * Reinstall-safe replacement helper. Unlike commitPreparedCommands, this
+ * backs up previous plugin-owned prompt files before staged renames so a
+ * later orchestrator failure can restore the old install.
+ */
+export async function replacePreparedCommands(
+  prepared: PreparedCommandsStaging,
+): Promise<CommandsReplacement> {
+  if (prepared.kind === "noop") {
+    return { kind: "noop", prepared };
+  }
+
+  const backupRoot = path.join(prepared.locations.commandsStagingDir, `backup-${randomUUID()}`);
+  await mkdir(backupRoot, { recursive: true });
+  await assertPathInside(prepared.locations.commandsStagingDir, backupRoot, "commands backup root");
+
+  const backups: { name: string; from: string; to: string }[] = [];
+  const renamed: { from: string; to: string }[] = [];
+
+  try {
+    for (const name of prepared._previousNames) {
+      assertSafeName(name, "previous command name");
+      const target = path.join(prepared.locations.promptsTargetDir, name + ".md");
+      await assertPathInside(prepared.locations.promptsTargetDir, target, "previous command file");
+      if (!(await pathExists(target))) {
+        continue;
+      }
+
+      const backup = path.join(backupRoot, name + ".md");
+      await assertPathInside(backupRoot, backup, "commands backup file");
+      await rename(target, backup);
+      backups.push({ name, from: target, to: backup });
+    }
+
+    await mkdir(prepared.locations.promptsTargetDir, { recursive: true });
+    for (const pair of prepared._renamePairs) {
+      if (await pathExists(pair.to)) {
+        throw new Error(`Cannot replace command target with non-previous content at ${pair.to}`);
+      }
+
+      await rename(pair.from, pair.to);
+      renamed.push(pair);
+    }
+  } catch (err) {
+    const leaks = await rollbackCommandsReplacementInternal(prepared, renamed, backups, backupRoot);
+    if (leaks.length > 0) {
+      throw new Error(`${errorMessage(err)} ${MANUAL_RECOVERY_REQUIRED}${leaks.join("; ")}`, {
+        cause: err,
+      });
+    }
+
+    throw err;
+  }
+
+  const replacement: Extract<CommandsReplacement, { kind: "replaced" }> = {
+    kind: "replaced",
+    prepared,
+  };
+  commandsReplacementInternals.set(replacement, {
+    backupRoot,
+    backups: Object.freeze(backups),
+    renamed: Object.freeze(renamed),
+  });
+  return replacement;
+}
+
+export async function rollbackCommandsReplacement(
+  replacement: CommandsReplacement,
+): Promise<readonly string[]> {
+  if (replacement.kind === "noop") {
+    return Object.freeze([]);
+  }
+
+  const internals = requireCommandsReplacementInternals(replacement);
+  return rollbackCommandsReplacementInternal(
+    replacement.prepared,
+    internals.renamed,
+    internals.backups,
+    internals.backupRoot,
+  );
+}
+
+export async function finalizeCommandsReplacement(
+  replacement: CommandsReplacement,
+): Promise<readonly string[]> {
+  if (replacement.kind === "noop") {
+    return Object.freeze([]);
+  }
+
+  const internals = requireCommandsReplacementInternals(replacement);
+  const leaks = [
+    await cleanupStaging(internals.backupRoot, "commands replacement backup directory"),
+    await cleanupStaging(replacement.prepared.stagingRoot, "commands staging directory"),
+  ].filter((leak): leak is string => leak !== undefined);
+  return Object.freeze(leaks);
+}
+
+function requireCommandsReplacementInternals(
+  replacement: Extract<CommandsReplacement, { kind: "replaced" }>,
+): CommandsReplacementInternals {
+  const internals = commandsReplacementInternals.get(replacement);
+  if (internals === undefined) {
+    throw new Error("Unknown commands replacement handle.");
+  }
+
+  return internals;
+}
+
+async function rollbackCommandsReplacementInternal(
+  prepared: Extract<PreparedCommandsStaging, { kind: "staged" }>,
+  renamed: readonly { from: string; to: string }[],
+  backups: readonly { name: string; from: string; to: string }[],
+  backupRoot: string,
+): Promise<readonly string[]> {
+  return rollbackReplacementCommon({
+    renamed,
+    backups,
+    stagingRoot: prepared.stagingRoot,
+    backupRoot,
+    removeMode: "file",
+    labels: {
+      replacement: "replacement command file",
+      previous: "previous command file",
+      stagingDir: "commands staging directory",
+      backupDir: "commands replacement backup directory",
+    },
+  });
 }

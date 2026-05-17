@@ -54,6 +54,7 @@ function makeHandlers(): { handlers: SubcommandHandlers; calls: HandlerCall[] } 
     install: mk("install"),
     uninstall: mk("uninstall"),
     update: mk("update"),
+    reinstall: mk("reinstall"),
     list: mk("list"),
     import: mk("import"),
     marketplaceAdd: mk("marketplaceAdd"),
@@ -76,6 +77,11 @@ test("AP-3 :: empty input emits TOP_LEVEL_USAGE at error severity", async () => 
   // notifyUsageError emits `${message}\n\n${usageBlock}` -- assert the
   // Usage block is present in the surfaced message.
   assert.ok(notifications[0]?.message.includes(TOP_LEVEL_USAGE));
+  assert.ok(
+    TOP_LEVEL_USAGE.includes(
+      "reinstall [<plugin>@<marketplace> | @<marketplace>] [--scope user|project] [--force]",
+    ),
+  );
   assert.ok(notifications[0]?.message.includes("import"));
 });
 
@@ -140,6 +146,14 @@ test("routeClaudePlugin :: dispatches update to handlers.update", async () => {
   const { handlers, calls } = makeHandlers();
   await routeClaudePlugin("update foo@bar", handlers, ctx);
   assert.deepEqual(calls, [{ name: "update", args: "foo@bar" }]);
+  assert.deepEqual(notifications, []);
+});
+
+test("routeClaudePlugin :: dispatches reinstall to handlers.reinstall", async () => {
+  const { ctx, notifications } = makeCtx();
+  const { handlers, calls } = makeHandlers();
+  await routeClaudePlugin("reinstall foo@bar --force", handlers, ctx);
+  assert.deepEqual(calls, [{ name: "reinstall", args: "foo@bar --force" }]);
   assert.deepEqual(notifications, []);
 });
 

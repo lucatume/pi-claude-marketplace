@@ -1,6 +1,7 @@
 // transaction/with-state-guard.ts
 //
-// Cross-process state lifecycle wrapper (ST-7 + Phase 7 D-06).
+// Cross-process state lifecycle wrapper (ST-7 + Phase 7 D-06). Phase 8 adds
+// withLockedStateTransaction for callers that need explicit save control.
 //
 // Concurrency scope:
 //   Phase 7 D-06 adds a per-scope proper-lockfile lock around the full
@@ -36,6 +37,16 @@ import { errorMessage, StateLockHeldError } from "../shared/errors.ts";
 
 import type { ScopedLocations } from "../persistence/locations.ts";
 
+export interface LockedStateTransaction {
+  readonly state: ExtensionState;
+  save(): Promise<void>;
+}
+
+export interface LockedStateTransactionDeps {
+  readonly loadState?: typeof loadState;
+  readonly saveState?: typeof saveState;
+}
+
 /**
  * ST-7: load fresh state, hand to closure, save only on no-throw.
  *
@@ -56,17 +67,53 @@ export async function withStateGuard<T>(
   locations: ScopedLocations,
   mutate: (state: ExtensionState) => Promise<T> | T,
 ): Promise<T> {
+  return withScopeLock(locations, async () => {
+    const fresh = await loadState(locations.extensionRoot);
+    const result = await mutate(fresh);
+    await saveState(locations.extensionRoot, fresh);
+    return result;
+  });
+}
+
+/**
+ * Phase 8 / PRL-10: hold the per-scope state lock while callers explicitly
+ * choose when to save. Reinstall uses this to rollback already-swapped
+ * physical resources if state persistence fails.
+ */
+export async function withLockedStateTransaction<T>(
+  locations: ScopedLocations,
+  run: (tx: LockedStateTransaction) => Promise<T> | T,
+  deps?: LockedStateTransactionDeps,
+): Promise<T> {
+  return withScopeLock(locations, async () => {
+    const fresh = await (deps?.loadState ?? loadState)(locations.extensionRoot);
+    let saved = false;
+    const tx: LockedStateTransaction = {
+      state: fresh,
+      save: async (): Promise<void> => {
+        if (saved) {
+          throw new Error("LockedStateTransaction.save() called more than once.");
+        }
+
+        saved = true;
+        await (deps?.saveState ?? saveState)(locations.extensionRoot, fresh);
+      },
+    };
+    return run(tx);
+  });
+}
+
+/**
+ * Per-scope proper-lockfile lifecycle. Acquires the lock (mapping ELOCKED
+ * to StateLockHeldError), runs the body, and releases the lock -- chaining
+ * release errors into the body error if both fail so neither is dropped.
+ */
+async function withScopeLock<T>(locations: ScopedLocations, body: () => Promise<T>): Promise<T> {
   await mkdir(locations.extensionRoot, { recursive: true });
 
-  let release: (() => Promise<void>) | undefined;
+  let release: () => Promise<void>;
   try {
-    release = await lockfile.lock(locations.extensionRoot, {
-      lockfilePath: locations.stateLockFile,
-      realpath: false,
-      retries: 0,
-      stale: 10_000,
-      update: 2_000,
-    });
+    release = await acquireStateLock(locations);
   } catch (err) {
     if (isLockHeldError(err)) {
       throw new StateLockHeldError(locations.scope, locations.stateLockFile, { cause: err });
@@ -78,9 +125,7 @@ export async function withStateGuard<T>(
   let result: T | undefined;
   let primaryError: unknown;
   try {
-    const fresh = await loadState(locations.extensionRoot);
-    result = await mutate(fresh);
-    await saveState(locations.extensionRoot, fresh);
+    result = await body();
   } catch (err) {
     primaryError = err;
   } finally {
@@ -89,6 +134,13 @@ export async function withStateGuard<T>(
     } catch (releaseErr) {
       if (primaryError === undefined) {
         primaryError = releaseErr;
+      } else {
+        const base =
+          primaryError instanceof Error ? primaryError : new Error(errorMessage(primaryError));
+        primaryError = new Error(
+          `${base.message} (lock release also failed: ${errorMessage(releaseErr)})`,
+          { cause: base },
+        );
       }
     }
   }
@@ -98,6 +150,16 @@ export async function withStateGuard<T>(
   }
 
   return result as T;
+}
+
+function acquireStateLock(locations: ScopedLocations): Promise<() => Promise<void>> {
+  return lockfile.lock(locations.extensionRoot, {
+    lockfilePath: locations.stateLockFile,
+    realpath: false,
+    retries: 0,
+    stale: 10_000,
+    update: 2_000,
+  });
 }
 
 function toError(err: unknown): Error {

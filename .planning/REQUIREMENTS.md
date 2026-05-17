@@ -300,9 +300,32 @@
 - [x] **NFR-11**: Pi extension API declared as `@mariozechner/pi-coding-agent` peer dep; successor SHOULD pin a minimum version once API stabilizes
 - [ ] **NFR-12**: `marketplace.json` parser is forward-compatible (no schema-version check; unknown source kinds parse to `{ kind: "unknown", reason }`)
 
+## Milestone v1.1 Requirements
+
+Requirements for the Reinstall Command milestone. Additive to the v1.0 PRD set, mapped to Phases 8 and 9.
+
+### Plugin Reinstall
+
+- [x] **PRL-01**: User can run `/claude:plugin reinstall` as a top-level plugin lifecycle command with a clear `Usage:` block
+- [x] **PRL-02**: User can reinstall one installed plugin with `reinstall <plugin>@<marketplace>`
+- [x] **PRL-03**: User can reinstall every installed plugin in one marketplace with `reinstall @<marketplace>`
+- [x] **PRL-04**: User can reinstall every installed plugin in the selected scope set with bare `reinstall`
+- [x] **PRL-05**: User can pass `--scope user|project` at any argument position, with scope resolution matching `update`
+- [x] **PRL-06**: Reinstall targets installed plugins only; empty target sets succeed with `No plugins installed.` and no reload hint
+- [x] **PRL-07**: Reinstall uses cached marketplace manifests only and never performs network sync or Git operations
+- [x] **PRL-08**: Reinstall preserves the installed record's existing version instead of recomputing or upgrading it
+- [x] **PRL-09**: Reinstall prepares replacement resources before removing old resources
+- [x] **PRL-10**: If reinstall preflight, preparation, replacement, or state save fails, the previously installed plugin state, resources, and data directory remain available
+- [x] **PRL-11**: Reinstall deletes the plugin data directory only after replacement resources and state commit succeed
+- [x] **PRL-12**: Plugin data-directory cleanup failure is reported as a warning without turning a successful reinstall into a failed reinstall
+- [x] **PRL-13**: Batch reinstall continues per plugin and reports deterministic success/skipped/failed partitions without corrupting other plugins
+- [x] **PRL-14**: Successful reinstall emits the existing `refresh` reload hint only when generated resources changed
+- [x] **PRL-15**: Successful reinstall includes existing soft-dependency warnings when agents or MCP servers are restaged and the relevant Pi companion plugin is unloaded
+- [x] **PRL-16**: Tab completion includes `reinstall`, completes installed plugin refs, supports `@<marketplace>` form, and preserves existing completion failure semantics
+
 ## Milestone v1.2 Requirements
 
-Requirements for the Claude settings import milestone. These are additive to the original PRD-derived V1 requirement set and are expected to map to Phases 8 and 9 after v1.1 is merged.
+Requirements for the Claude settings import milestone. Additive to the v1.0 PRD set, mapped to Phases 10 and 11.
 
 ### Import Command & Scope
 
@@ -609,11 +632,29 @@ Every v1 REQ-ID maps to exactly one phase. Status `Pending` until execution upda
 | IMP-09      | Phase 11 | Complete |
 | IMP-10      | Phase 11 | Complete |
 | IMP-11      | Phase 11 | Complete |
+| PRL-01      | Phase 9  | Complete |
+| PRL-02      | Phase 8  | Complete |
+| PRL-03      | Phase 9  | Complete |
+| PRL-04      | Phase 9  | Complete |
+| PRL-05      | Phase 9  | Complete |
+| PRL-06      | Phase 8  | Complete |
+| PRL-07      | Phase 8  | Complete |
+| PRL-08      | Phase 8  | Complete |
+| PRL-09      | Phase 8  | Complete |
+| PRL-10      | Phase 8  | Complete |
+| PRL-11      | Phase 8  | Complete |
+| PRL-12      | Phase 8  | Complete |
+| PRL-13      | Phase 9  | Complete |
+| PRL-14      | Phase 9  | Complete |
+| PRL-15      | Phase 9  | Complete |
+| PRL-16      | Phase 9  | Complete |
 
 **Coverage:**
 
 - v1 requirements: 210 total (200 original IDs + 10 scope-rule clarification IDs: PI-16, PI-17, CMP-1..8)
 - Mapped to phases: 205 (97.6%) -- MA-7 superseded by D-21 (Phase 1 adopted isomorphic-git, removing the "git CLI not found" failure mode); MU-2 and MU-3 superseded by Phase 4 D-14 (follow-upstream-blindly semantics; the local marketplace clone is read-only by contract, so non-fast-forward divergence cannot occur); PR-4 superseded by Phase 5 D-07 (custom componentPath arrays now SUPPLEMENT defaults rather than replace them; behavior corrected vs V1 per COMP-01 / Gap 3); PI-15 superseded by Phase 7 D-08 (per-scope lock acquisition fails losers with `STATE_LOCK_HELD_PREFIX` before state-guard commit)
+- v1.1 requirements: 16 total (PRL-01..16), all mapped to Phases 8/9.
+- v1.2 requirements: 11 total (IMP-01..11), all mapped to Phases 10/11.
 - Unmapped: 0 (MA-7, MU-2, MU-3, PR-4, PI-15 are superseded, not unmapped)
 
 **Per-phase counts:**
@@ -627,6 +668,8 @@ Every v1 REQ-ID maps to exactly one phase. Status `Pending` until execution upda
 | Phase 5: Plugin Orchestrators                 | 52 (PI-1..14, PI-16..17, PU-1..8, PUP-1..9, PL-1..7, CMP-2..5, RN-3, AS-2..3, AS-6..7, NFR-2..3) -- PI-15 superseded by Phase 7 D-08                           |
 | Phase 6: Edge Layer & Tab Completion          | 16 (TC-1..9, CMP-6..8, AP-1..4)                                                                                                                   |
 | Phase 7: Integration & Pi Wiring              | 4 (NFR-8, NFR-11) -- note: NFR-2/3 land in Phase 5 since they describe orchestrator behavior; Phase 7 verifies them in live environment |
+| Phase 8: Atomic Reinstall Core                | 8 (PRL-02, PRL-06..12)                                                                                                                |
+| Phase 9: Reinstall Edge & Bulk UX             | 8 (PRL-01, PRL-03..05, PRL-13..16)                                                                                                    |
 | Phase 10: Claude Settings Import Foundation   | 5 (IMP-04..8)                                                                                                                         |
 | Phase 11: Import Command Orchestration        | 6 (IMP-01..3, IMP-09..11)                                                                                                             |
 
@@ -634,4 +677,4 @@ Every v1 REQ-ID maps to exactly one phase. Status `Pending` until execution upda
 
 ______________________________________________________________________
 
-*Requirements defined: 2026-05-09 from `docs/prd/pi-claude-marketplace-prd.md` v1.0* *Last updated: 2026-05-16 -- merged origin/main; D-29 (renumbered from main's D-26) / CMP-1..8 clarify marketplace-vs-plugin scope semantics and make install completion available-only for the current target scope. Earlier same-week: Phase 11 completed IMP-01..IMP-03 and IMP-09..IMP-11 for import command orchestration; Phase 10 completed IMP-04..IMP-08 for Claude settings import foundation.*
+*Requirements defined: 2026-05-09 from `docs/prd/pi-claude-marketplace-prd.md` v1.0* *Last updated: 2026-05-16 -- merged origin/main into v1.1 reinstall branch; added Milestone v1.1 (PRL-01..16) covered by Phases 8 and 9. Inherited from main: D-29 (renumbered from main's D-26) / CMP-1..8 clarify marketplace-vs-plugin scope semantics and make install completion available-only for the current target scope; Phase 11 completed IMP-01..IMP-03 and IMP-09..IMP-11 for import command orchestration; Phase 10 completed IMP-04..IMP-08 for Claude settings import foundation.*

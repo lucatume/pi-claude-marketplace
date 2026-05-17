@@ -1,20 +1,21 @@
 // edge/completions/provider.ts
 //
 // `getArgumentCompletions(prefix, resolver)` dispatcher -- the single entry
-// point Pi calls per keystroke. Five branches mirror the V1 dispatcher
-// (PRD §6.7 TC-1..TC-6) with status-aware refinements per D-03 corollary.
+// point Pi calls per keystroke. Five branches implement PRD §6.7 TC-1..TC-6
+// with status-aware refinements per D-03 corollary.
 //
 // Branches in priority order:
 //
 //   1. TC-1 -- tokens.length === 0 -> top-level keywords
-//      (install / uninstall / update / list / ls / marketplace).
+//      (install / uninstall / update / reinstall / list / ls / marketplace /
+//       bootstrap / import).
 //   2. TC-4 -- prevToken === "--scope" -> user / project.
 //   2b. TC-3 -- current.startsWith("-") -> flag names (--scope
 //      always; --installed / --available / --unavailable when head ===
 //      "list").
 //   3. TC-2 -- head === "marketplace" && tokens.length === 1 -> nested
 //      marketplace subcommand keywords, including aliases (`rm`, `ls`).
-//   4. TC-6 -- head in {install, uninstall, update} && tokens.length === 1
+//   4. TC-6 -- head in {install, uninstall, update, reinstall} && tokens.length === 1
 //      -> `<plugin>@<marketplace>` via getPluginRefCompletions (status-
 //      aware filter per D-03).
 //   5. TC-5 -- (head in {list, ls} && tokens.length === 1) ||
@@ -41,6 +42,7 @@ import {
 } from "./data.ts";
 
 import type { LocationsResolver } from "./data.ts";
+import type { Scope } from "../../shared/types.ts";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
 /**
@@ -78,6 +80,14 @@ function flagCompletions(
   const flags: { name: string; description?: string }[] = [
     { name: "--scope", description: "Scope: user or project" },
   ];
+  if (positionalHead === "reinstall") {
+    flags.push({
+      name: "--force",
+      description:
+        "Allow overwriting agents that previously had foreign content from this plugin's own install",
+    });
+  }
+
   if (positionalHead === "list" || positionalHead === "ls") {
     flags.push(
       { name: "--installed", description: "Show installed plugins" },
@@ -151,6 +161,44 @@ function marketplaceNameWanted(positionals: readonly string[]): boolean {
   );
 }
 
+type PluginRefMode = "install" | "uninstall" | "update" | "reinstall";
+
+interface PluginRefBranchConfig {
+  readonly mode: PluginRefMode;
+  readonly allowMarketplaceOnly: boolean;
+  readonly targetScope?: Scope;
+}
+
+function pluginRefBranchConfig(
+  positionalHead: string,
+  explicitScope: Scope | undefined,
+): PluginRefBranchConfig | null {
+  switch (positionalHead) {
+    case "install":
+      return { mode: "install", allowMarketplaceOnly: false, targetScope: explicitScope ?? "user" };
+    case "uninstall":
+      return {
+        mode: "uninstall",
+        allowMarketplaceOnly: false,
+        ...(explicitScope !== undefined && { targetScope: explicitScope }),
+      };
+    case "update":
+      return {
+        mode: "update",
+        allowMarketplaceOnly: true,
+        ...(explicitScope !== undefined && { targetScope: explicitScope }),
+      };
+    case "reinstall":
+      return {
+        mode: "reinstall",
+        allowMarketplaceOnly: true,
+        ...(explicitScope !== undefined && { targetScope: explicitScope }),
+      };
+    default:
+      return null;
+  }
+}
+
 export async function getArgumentCompletions(
   prefix: string,
   resolver: LocationsResolver,
@@ -164,7 +212,8 @@ export async function getArgumentCompletions(
     return topLevelCompletions(current);
   }
 
-  const positionals = extractPositionals(tokens);
+  const rawHead = extractPositionals(tokens)[0] ?? "";
+  const positionals = extractPositionals(tokens, rawHead === "reinstall" ? ["--force"] : []);
   const positionalHead = positionals[0] ?? "";
   const explicitScope = extractScope(tokens);
 
@@ -188,29 +237,16 @@ export async function getArgumentCompletions(
     return marketplaceSubcommandCompletions(current, headPrefix);
   }
 
-  // Branch 4 (TC-6): <plugin>@<marketplace> for install / uninstall / update.
+  // Branch 4 (TC-6): <plugin>@<marketplace> for install / uninstall / update / reinstall.
   // CMP-6..8: install completion follows target-scope/source-marketplace
-  // visibility and is available-only. Uninstall/update consume installed
-  // plugins, with project precedence when --scope is omitted.
-  if (positionalHead === "install" && positionals.length === 1) {
-    return getPluginRefCompletions("install", current, argumentTextPrefix, resolver, {
-      allowMarketplaceOnly: false,
-      targetScope: explicitScope ?? "user",
-    });
-  }
-
-  if (positionalHead === "uninstall" && positionals.length === 1) {
-    return getPluginRefCompletions("uninstall", current, argumentTextPrefix, resolver, {
-      allowMarketplaceOnly: false,
-      ...(explicitScope !== undefined && { targetScope: explicitScope }),
-    });
-  }
-
-  if (positionalHead === "update" && positionals.length === 1) {
-    return getPluginRefCompletions("update", current, argumentTextPrefix, resolver, {
-      allowMarketplaceOnly: true,
-      ...(explicitScope !== undefined && { targetScope: explicitScope }),
-    });
+  // visibility and is available-only. Uninstall/update/reinstall consume installed
+  // plugins, with project precedence when --scope is omitted. `allowMarketplaceOnly`
+  // is true for update and reinstall (bare `@<marketplace>` operates on every
+  // installed plugin in that marketplace).
+  const pluginRefConfig = pluginRefBranchConfig(positionalHead, explicitScope);
+  if (pluginRefConfig !== null && positionals.length === 1) {
+    const { mode, ...options } = pluginRefConfig;
+    return getPluginRefCompletions(mode, current, argumentTextPrefix, resolver, options);
   }
 
   // Branch 5 (TC-5): marketplace-name positional for `list <here>` / `ls <here>` and

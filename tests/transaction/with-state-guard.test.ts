@@ -12,7 +12,10 @@ import {
   type ScopedLocations,
 } from "../../extensions/pi-claude-marketplace/persistence/locations.ts";
 import { StateLockHeldError } from "../../extensions/pi-claude-marketplace/shared/errors.ts";
-import { withStateGuard } from "../../extensions/pi-claude-marketplace/transaction/with-state-guard.ts";
+import {
+  withLockedStateTransaction,
+  withStateGuard,
+} from "../../extensions/pi-claude-marketplace/transaction/with-state-guard.ts";
 
 import type { ExtensionState } from "../../extensions/pi-claude-marketplace/persistence/state-io.ts";
 
@@ -242,6 +245,129 @@ test("D-06 save failure releases the lock for the next state guard call", async 
 });
 
 // ──────────────────────────────────────────────────────────────────────────
+// Phase 8 / PRL-10: manual-save transaction helper for reinstall rollback
+// ──────────────────────────────────────────────────────────────────────────
+
+test("Phase 8 / PRL-10 manual transaction saves only when tx.save is called", async () => {
+  const { loc, cleanup } = await setupTmpScope();
+  try {
+    await withStateGuard(loc, (state) => {
+      withInstalledPlugin(state, "mp1", "p1", "1.0.0");
+    });
+
+    await withLockedStateTransaction(loc, async (tx) => {
+      const record = tx.state.marketplaces.mp1?.plugins.p1;
+      assert.equal(record?.version, "1.0.0", "transaction receives freshly loaded state");
+      assert.ok(record, "expected pre-populated plugin record");
+
+      record.version = "2.0.0";
+
+      const beforeSave = await readOnDisk(loc.stateJsonPath);
+      assert.equal(
+        beforeSave.marketplaces.mp1?.plugins.p1?.version,
+        "1.0.0",
+        "mutating tx.state must not write state.json before tx.save()",
+      );
+
+      await tx.save();
+    });
+
+    const afterSave = await readOnDisk(loc.stateJsonPath);
+    assert.equal(afterSave.marketplaces.mp1?.plugins.p1?.version, "2.0.0");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 manual transaction holds the per-scope lock while callback runs", async () => {
+  const { loc, cleanup } = await setupTmpScope();
+  try {
+    await withLockedStateTransaction(loc, async () => {
+      assert.equal(
+        await lockfile.check(loc.extensionRoot, {
+          lockfilePath: loc.stateLockFile,
+          realpath: false,
+        }),
+        true,
+      );
+    });
+
+    assert.equal(
+      await lockfile.check(loc.extensionRoot, {
+        lockfilePath: loc.stateLockFile,
+        realpath: false,
+      }),
+      false,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 manual transaction save failure releases lock", async () => {
+  const { loc, cleanup } = await setupTmpScope();
+  try {
+    await assert.rejects(
+      () =>
+        withLockedStateTransaction(
+          loc,
+          async (tx) => {
+            withInstalledPlugin(tx.state, "mp1", "p1", "1.0.0");
+            await tx.save();
+          },
+          {
+            saveState: () => Promise.reject(new Error("simulated explicit save failure")),
+          },
+        ),
+      /simulated explicit save failure/,
+    );
+
+    await withStateGuard(loc, (state) => {
+      withInstalledPlugin(state, "mp1", "p1", "1.0.0");
+    });
+
+    const onDisk = await readOnDisk(loc.stateJsonPath);
+    assert.equal(onDisk.marketplaces.mp1?.plugins.p1?.version, "1.0.0");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 manual transaction callback failure does not save and releases lock", async () => {
+  const { loc, cleanup } = await setupTmpScope();
+  try {
+    await withStateGuard(loc, (state) => {
+      withInstalledPlugin(state, "mp1", "p1", "1.0.0");
+    });
+
+    await assert.rejects(
+      () =>
+        withLockedStateTransaction(loc, (tx) => {
+          const record = tx.state.marketplaces.mp1?.plugins.p1;
+          assert.ok(record, "expected pre-populated plugin record");
+          record.version = "2.0.0";
+          throw new Error("simulated callback failure before save");
+        }),
+      /simulated callback failure before save/,
+    );
+
+    const onDisk = await readOnDisk(loc.stateJsonPath);
+    assert.equal(onDisk.marketplaces.mp1?.plugins.p1?.version, "1.0.0");
+
+    await withStateGuard(loc, (state) => {
+      const record = state.marketplaces.mp1?.plugins.p1;
+      assert.ok(record, "expected plugin record after callback failure");
+      record.version = "1.0.1";
+    });
+
+    const afterRetry = await readOnDisk(loc.stateJsonPath);
+    assert.equal(afterRetry.marketplaces.mp1?.plugins.p1?.version, "1.0.1");
+  } finally {
+    await cleanup();
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
 // SC-3 success criterion 3: in-process concurrent install round-trip
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -340,6 +466,103 @@ test("ST-9 update concurrent change: caller B sees caller A's version bump and t
       /changed concurrently; retry the update/,
     );
   } finally {
+    await cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 manual transaction surfaces StateLockHeldError when scope lock is pre-held", async () => {
+  const { loc, cleanup } = await setupTmpScope();
+  const release = await lockfile.lock(loc.extensionRoot, {
+    lockfilePath: loc.stateLockFile,
+    realpath: false,
+  });
+
+  try {
+    let callbackRan = false;
+    await assert.rejects(
+      () =>
+        withLockedStateTransaction(loc, () => {
+          callbackRan = true;
+        }),
+      (err: unknown) =>
+        err instanceof StateLockHeldError &&
+        err.lockPath === loc.stateLockFile &&
+        err.scope === loc.scope,
+    );
+    assert.equal(callbackRan, false);
+  } finally {
+    await release();
+    await cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 manual transaction surfaces release errors when callback succeeds", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX-only chmod 0 failure path");
+    return;
+  }
+
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("running as root -- chmod 0 does not block unlink");
+    return;
+  }
+
+  const { chmod: chmodFn } = await import("node:fs/promises");
+  const { loc, cleanup } = await setupTmpScope();
+  const lockParent = path.dirname(loc.stateLockFile);
+
+  try {
+    let releaseError: Error | undefined;
+    try {
+      await withLockedStateTransaction(loc, async () => {
+        // Chmod the lockfile's parent dir to read-only so proper-lockfile's
+        // release() cannot unlink the sentinel during finally. The release
+        // throw is surfaced as primaryError because the callback succeeded,
+        // exercising the `primaryError = releaseErr` branch.
+        await chmodFn(lockParent, 0o500);
+      });
+    } catch (err) {
+      releaseError = err as Error;
+    }
+
+    assert.ok(releaseError !== undefined, "release() should have failed and surfaced");
+  } finally {
+    await chmodFn(lockParent, 0o755);
+    await cleanup();
+  }
+});
+
+test("ST-7 withStateGuard surfaces release errors when mutate succeeds", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX-only chmod 0 failure path");
+    return;
+  }
+
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("running as root -- chmod 0 does not block unlink");
+    return;
+  }
+
+  const { chmod: chmodFn } = await import("node:fs/promises");
+  const { loc, cleanup } = await setupTmpScope();
+  const lockParent = path.dirname(loc.stateLockFile);
+
+  try {
+    let releaseError: Error | undefined;
+    try {
+      await withStateGuard(loc, async () => {
+        // Same chmod trick used for the locked-transaction variant: the
+        // unlink in finally fails, so the release error surfaces as the
+        // primary error since mutate succeeded.
+        await chmodFn(lockParent, 0o500);
+      });
+    } catch (err) {
+      releaseError = err as Error;
+    }
+
+    assert.ok(releaseError !== undefined, "release() should have failed and surfaced");
+  } finally {
+    await chmodFn(lockParent, 0o755);
     await cleanup();
   }
 });

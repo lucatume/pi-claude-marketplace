@@ -33,6 +33,7 @@ export interface SubcommandHandlers {
   install: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   uninstall: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   update: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+  reinstall: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   list: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   import: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   marketplaceAdd: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
@@ -52,6 +53,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "install",
   "uninstall",
   "update",
+  "reinstall",
   "list",
   "ls",
   "import",
@@ -74,11 +76,12 @@ export const MARKETPLACE_SUBCOMMANDS = [
 ] as const;
 
 export const TOP_LEVEL_USAGE =
-  "Usage: /claude:plugin <bootstrap|install|uninstall|update|list|ls|import|marketplace> ...\n" +
+  "Usage: /claude:plugin <bootstrap|install|uninstall|update|reinstall|list|ls|import|marketplace> ...\n" +
   "  bootstrap                                          add anthropics/claude-plugins-official to user scope and enable autoupdate\n" +
   "  install <plugin>@<marketplace> [--scope user|project]\n" +
   "  uninstall <plugin>@<marketplace> [--scope user|project]\n" +
   "  update [<plugin>@<marketplace> | @<marketplace>] [--scope user|project]\n" +
+  "  reinstall [<plugin>@<marketplace> | @<marketplace>] [--scope user|project] [--force]\n" +
   "  list [<marketplace>] [--scope user|project]   (alias: ls)\n" +
   "  import [--scope user|project]\n" +
   "  marketplace <add|remove|rm|list|ls|update|autoupdate|noautoupdate> ...";
@@ -132,6 +135,8 @@ export async function routeClaudePlugin(
       return handlers.uninstall(rest, ctx);
     case "update":
       return handlers.update(rest, ctx);
+    case "reinstall":
+      return handlers.reinstall(rest, ctx);
     case "list":
     case "ls":
       return handlers.list(rest, ctx);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -94,7 +94,7 @@ async function emptyFixture(): Promise<Fixture> {
 // TC-1 -- top-level subcommand keywords.
 // ---------------------------------------------------------------------------
 
-test("TC-1 :: first positional surfaces top-level keywords (bootstrap/install/uninstall/update/list/ls/marketplace)", async () => {
+test("TC-1 :: first positional surfaces top-level keywords (bootstrap/install/uninstall/update/reinstall/list/ls/import/marketplace)", async () => {
   __resetCacheForTests();
   const f = await emptyFixture();
   try {
@@ -108,6 +108,7 @@ test("TC-1 :: first positional surfaces top-level keywords (bootstrap/install/un
       "list",
       "ls",
       "marketplace",
+      "reinstall",
       "uninstall",
       "update",
     ]);
@@ -145,6 +146,18 @@ test('TC-1 :: top-level keyword filtering by prefix ("l" -> list and ls)', async
       items.map((i) => i.label),
       ["list", "ls"],
     );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: top-level rei completes to reinstall with trailing space", async () => {
+  __resetCacheForTests();
+  const f = await emptyFixture();
+  try {
+    const items = await getArgumentCompletions("rei", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(items, [{ label: "reinstall", value: "reinstall " }]);
   } finally {
     await f.cleanup();
   }
@@ -309,6 +322,29 @@ test("TC-3 :: -- and - prefixes behave identically", async () => {
       single.map((i) => i.label),
       double.map((i) => i.label),
     );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: reinstall flag completion includes --force only for reinstall", async () => {
+  __resetCacheForTests();
+  const f = await emptyFixture();
+  try {
+    const reinstallItems = await getArgumentCompletions("reinstall -", f.resolver);
+    assert.ok(reinstallItems !== null);
+    assert.ok(reinstallItems.some((i) => i.label === "--force"));
+    assert.ok(reinstallItems.some((i) => i.label === "--scope"));
+
+    for (const head of ["install", "uninstall", "update", "list", "ls", "marketplace"]) {
+      const items = await getArgumentCompletions(`${head} -`, f.resolver);
+      assert.ok(items !== null, head);
+      assert.equal(
+        items.some((i) => i.label === "--force"),
+        false,
+        head,
+      );
+    }
   } finally {
     await f.cleanup();
   }
@@ -777,6 +813,132 @@ test("TC-6 :: update accepts bare @<marketplace> form", async () => {
   }
 });
 
+test("PRL-16 :: reinstall completion mode shows only installed plugins", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: {
+      user: {
+        mp: [
+          { name: "p-installed", status: "installed" },
+          { name: "p-avail", status: "available" },
+          { name: "p-unavail", status: "unavailable" },
+        ],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("reinstall ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    assert.deepEqual(labels, ["p-installed@mp"]);
+    assert.deepEqual(
+      items.map((i) => i.value),
+      ["reinstall p-installed@mp "],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: reinstall --force completion still reaches installed refs", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: { user: { mp: [{ name: "solo", status: "installed" }] }, project: {} },
+  });
+  try {
+    const items = await getArgumentCompletions("reinstall --force ", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(
+      items.map((i) => i.label),
+      ["solo@mp"],
+    );
+    assert.deepEqual(
+      items.map((i) => i.value),
+      ["reinstall --force solo@mp "],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: reinstall @ completes marketplace-only targets", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { "mp-a": {}, "mp-b": {} }, project: {} },
+    manifests: {
+      user: {
+        "mp-a": [{ name: "p", status: "installed" }],
+        "mp-b": [{ name: "p", status: "installed" }],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("reinstall @", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual([...items.map((i) => i.label)].sort(), ["@mp-a", "@mp-b"]);
+    for (const item of items) {
+      assert.match(
+        item.value,
+        / $/,
+        `marketplace-only completion needs trailing space: ${item.value}`,
+      );
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: reinstall @m ignores stale marketplace-name cache", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { "mp-a": {}, market: {} }, project: {} },
+    manifests: {
+      user: {
+        "mp-a": [{ name: "p", status: "installed" }],
+        market: [{ name: "p", status: "installed" }],
+      },
+      project: {},
+    },
+  });
+  try {
+    const staleUserCache = f.resolver.marketplaceNamesCachePath("user");
+    await mkdir(path.dirname(staleUserCache), { recursive: true });
+    await writeFile(staleUserCache, JSON.stringify({ schemaVersion: 2, names: [] }));
+
+    const items = await getArgumentCompletions("reinstall @m", f.resolver);
+
+    assert.ok(items !== null);
+    assert.deepEqual([...items.map((i) => i.label)].sort(), ["@market", "@mp-a"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: reinstall plugin half preserves multi-marketplace no trailing space", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { "mp-a": {}, "mp-b": {} }, project: {} },
+    manifests: {
+      user: {
+        "mp-a": [{ name: "shared", status: "installed" }],
+        "mp-b": [{ name: "shared", status: "installed" }],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("reinstall shared", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(items, [{ label: "shared@", value: "reinstall shared@" }]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("TC-6 :: update --scope user limits installed plugin refs to user scope", async () => {
   __resetCacheForTests();
   const f = await makeFixture({
@@ -895,6 +1057,32 @@ test("TC-8 :: per-marketplace manifest load failure soft-fails to empty list (no
   }
 });
 
+test("PRL-16 :: reinstall per-marketplace manifest soft-fail preserves other marketplace completions", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { broken: {}, healthy: {} }, project: {} },
+    manifests: {
+      user: { healthy: [{ name: "ok", status: "installed" }] },
+      project: {},
+    },
+    manifestThrows: {
+      user: { broken: new Error("manifest read EACCES") },
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("reinstall ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    assert.ok(labels.includes("ok@healthy"));
+    assert.deepEqual(items.find((i) => i.label === "ok@healthy")?.value, "reinstall ok@healthy ");
+    for (const l of labels) {
+      assert.equal(l.includes("broken"), false, `unexpected broken-mp label: ${l}`);
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("TC-9 :: state.json error propagates (throw escapes getArgumentCompletions)", async () => {
   __resetCacheForTests();
   const f = await makeFixture({
@@ -907,6 +1095,20 @@ test("TC-9 :: state.json error propagates (throw escapes getArgumentCompletions)
       () => getArgumentCompletions("uninstall ", f.resolver),
       /state\.json corrupt/,
     );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("PRL-16 :: reinstall state load errors propagate", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: { user: { mp: [] }, project: {} },
+    stateThrows: { user: new Error("state boom") },
+  });
+  try {
+    await assert.rejects(() => getArgumentCompletions("reinstall ", f.resolver), /state boom/);
   } finally {
     await f.cleanup();
   }

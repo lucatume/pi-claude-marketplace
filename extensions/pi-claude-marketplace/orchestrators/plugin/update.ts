@@ -41,13 +41,11 @@
 import {
   abortPreparedAgents,
   commitPreparedAgents,
-  discoverPluginAgents,
   prepareStagePluginAgents,
 } from "../../bridges/agents/index.ts";
 import {
   abortPreparedCommands,
   commitPreparedCommands,
-  discoverPluginCommands,
   prepareStageCommands,
 } from "../../bridges/commands/index.ts";
 import {
@@ -58,7 +56,6 @@ import {
 import {
   abortPreparedSkills,
   commitPreparedSkills,
-  discoverPluginSkills,
   prepareStageSkills,
 } from "../../bridges/skills/index.ts";
 import { PLUGIN_ENTRY_VALIDATOR, type PluginEntry } from "../../domain/components/plugin.ts";
@@ -86,9 +83,9 @@ import {
   type GitOps,
 } from "../marketplace/shared.ts";
 
+import { discoverGeneratedNames } from "./discover-names.ts";
 import {
   assertNoCrossPluginConflicts,
-  pickAgentsSourceDir,
   resolveInstalledMarketplaceTarget,
   resolveInstalledPluginTarget,
   resolvePluginVersion,
@@ -410,38 +407,10 @@ function isOutcome(value: PluginPreflight | PluginUpdateOutcome): value is Plugi
   return "partition" in value;
 }
 
-async function discoverGeneratedNames(
-  plugin: string,
-  installable: ResolvedPluginInstallable,
-): Promise<{
-  skills: readonly string[];
-  commands: readonly string[];
-  agents: readonly string[];
-  agentsSourceDir: string;
-}> {
-  const skillsDiscovery = await discoverPluginSkills({ pluginName: plugin, resolved: installable });
-  const commandsDiscovery = await discoverPluginCommands({
-    pluginName: plugin,
-    resolved: installable,
-  });
-  const agentsSourceDir = pickAgentsSourceDir(installable);
-  const agentsDiscovery =
-    agentsSourceDir === ""
-      ? { discovered: [] as readonly { readonly generatedName: string }[] }
-      : await discoverPluginAgents({ pluginName: plugin, agentsDirs: [agentsSourceDir] });
-
-  return {
-    skills: skillsDiscovery.discovered.map((s) => s.generatedName),
-    commands: commandsDiscovery.discovered.map((c) => c.generatedName),
-    agents: agentsDiscovery.discovered.map((a) => a.generatedName),
-    agentsSourceDir,
-  };
-}
-
 async function prepareUpdateHandles(
   args: ThreePhaseArgs,
   preflight: PluginPreflight,
-  agentsSourceDir: string,
+  agentsSourceDir: string | null,
 ): Promise<PrepHandles> {
   const { plugin, marketplace, cwd, locations } = args;
   const { installable, record } = preflight;

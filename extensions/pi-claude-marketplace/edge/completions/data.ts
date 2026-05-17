@@ -25,19 +25,16 @@
 //                           already installed in the target scope.
 //   - mode = "uninstall" -> keep status === "installed".
 //   - mode = "update"    -> keep status === "installed".
+//   - mode = "reinstall" -> keep status === "installed".
 
-import {
-  getMarketplaceNames,
-  getPluginIndex,
-  ManifestSoftFailError,
-} from "../../shared/completion-cache.ts";
+import { getPluginIndex, ManifestSoftFailError } from "../../shared/completion-cache.ts";
 import { SCOPES } from "../../shared/types.ts";
 
 import type { PluginIndexRow } from "../../shared/completion-cache.ts";
 import type { Scope } from "../../shared/types.ts";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
-type PluginRefCompletionMode = "install" | "uninstall" | "update";
+type PluginRefCompletionMode = "install" | "uninstall" | "update" | "reinstall";
 
 // ---------------------------------------------------------------------------
 // LocationsResolver -- the edge/ -> persistence/ injection seam.
@@ -121,13 +118,21 @@ export function splitCompletionInput(input: string): { tokens: string[]; current
  * arguments in order. Used by completion handlers to know which positional
  * the cursor is currently typing.
  */
-export function extractPositionals(tokens: readonly string[]): string[] {
+export function extractPositionals(
+  tokens: readonly string[],
+  booleanFlags: readonly string[] = [],
+): string[] {
   const positionals: string[] = [];
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === "--scope") {
       i += 2;
+      continue;
+    }
+
+    if (t !== undefined && booleanFlags.includes(t)) {
+      i += 1;
       continue;
     }
 
@@ -219,17 +224,15 @@ async function rebuildPluginIndex(
 /**
  * Union of marketplace names visible from user + project scopes (deduped).
  * State.json errors from either scope propagate (TC-9).
+ *
+ * Marketplace-name completion reads state directly instead of trusting the
+ * optimization cache. The cache has no TTL, and stale marketplace-name files
+ * from an older process/version should not hide valid command targets.
  */
 export async function getMarketplaceNamesAcrossScopes(
   resolver: LocationsResolver,
 ): Promise<readonly string[]> {
-  const perScope = await Promise.all(
-    SCOPES.map((scope) =>
-      getMarketplaceNames(resolver.marketplaceNamesCachePath(scope), scope, () =>
-        rebuildNamesForScope(resolver, scope),
-      ),
-    ),
-  );
+  const perScope = await Promise.all(SCOPES.map((scope) => rebuildNamesForScope(resolver, scope)));
   return Array.from(new Set(perScope.flat()));
 }
 
@@ -251,9 +254,7 @@ async function marketplaceNamesForScope(
   resolver: LocationsResolver,
   scope: Scope,
 ): Promise<readonly string[]> {
-  return getMarketplaceNames(resolver.marketplaceNamesCachePath(scope), scope, () =>
-    rebuildNamesForScope(resolver, scope),
-  );
+  return rebuildNamesForScope(resolver, scope);
 }
 
 async function sourceMarketplacesForInstall(
@@ -340,6 +341,7 @@ async function getInstalledPluginToMarketplacesMap(
 /**
  * Map plugin name -> [marketplaces] that carry the plugin under the given
  * mode's target-scope rules. CMP-7 makes install completion available-only.
+ * Reinstall mode flows through the installed-only path.
  */
 export async function getPluginToMarketplacesMap(
   mode: PluginRefCompletionMode,

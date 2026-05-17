@@ -8,7 +8,10 @@ import { CLAUDE_MARKETPLACE_MARKER_KEY } from "../../../extensions/pi-claude-mar
 import {
   abortPreparedMcp,
   commitPreparedMcp,
+  finalizeMcpReplacement,
   prepareStageMcpServers,
+  replacePreparedMcp,
+  rollbackMcpReplacement,
 } from "../../../extensions/pi-claude-marketplace/bridges/mcp/stage.ts";
 import { locationsFor } from "../../../extensions/pi-claude-marketplace/persistence/locations.ts";
 import { McpServerCollisionError } from "../../../extensions/pi-claude-marketplace/shared/errors-bridges.ts";
@@ -350,6 +353,101 @@ test("MC-3 prepare preserves non-mcp top-level fields in mcp.json", async () => 
 });
 
 // ---------------------------------------------------------------------------
+// Phase 8 replacement rollback
+// ---------------------------------------------------------------------------
+
+test("Phase 8 / PRL-10 replacePreparedMcp rollback restores previous mcp.json bytes", async () => {
+  await withTmpScope(async ({ cwd, locations }) => {
+    await mkdir(path.dirname(locations.mcpJsonPath), { recursive: true });
+    const previous = '{"customField":"keep-shape","mcpServers":{"old":{"command":"old"}}}\n';
+    await writeFile(locations.mcpJsonPath, previous, "utf8");
+
+    const prepared = await prepareStageMcpServers({
+      locations,
+      cwd,
+      marketplaceName: MP,
+      pluginName: PLUGIN,
+      servers: { srv: { command: "new" } },
+    });
+
+    const replacement = await replacePreparedMcp(prepared);
+    const replaced = await readFile(locations.mcpJsonPath, "utf8");
+    assert.notEqual(replaced, previous);
+    assert.ok(replaced.includes("srv"));
+
+    const leaks = await rollbackMcpReplacement(replacement);
+    assert.deepEqual([...leaks], []);
+    assert.equal(await readFile(locations.mcpJsonPath, "utf8"), previous);
+  });
+});
+
+test("Phase 8 / PRL-10 replacePreparedMcp rollback removes newly-created mcp.json when absent before", async () => {
+  await withTmpScope(async ({ cwd, locations }) => {
+    const prepared = await prepareStageMcpServers({
+      locations,
+      cwd,
+      marketplaceName: MP,
+      pluginName: PLUGIN,
+      servers: { srv: { command: "new" } },
+    });
+
+    const replacement = await replacePreparedMcp(prepared);
+    assert.ok(await stat(locations.mcpJsonPath));
+
+    const leaks = await rollbackMcpReplacement(replacement);
+    assert.deepEqual([...leaks], []);
+    const mcpStat = await stat(locations.mcpJsonPath).catch(() => null);
+    assert.equal(mcpStat, null);
+  });
+});
+
+test("Phase 8 / PRL-10 noop MCP replacements rollback and finalize without leaks", async () => {
+  await withTmpScope(async ({ cwd, locations }) => {
+    const prepared = await prepareStageMcpServers({
+      locations,
+      cwd,
+      marketplaceName: MP,
+      pluginName: PLUGIN,
+      servers: {},
+    });
+
+    const replacement = await replacePreparedMcp(prepared);
+    assert.equal(replacement.kind, "noop");
+    assert.deepEqual([...(await rollbackMcpReplacement(replacement))], []);
+    assert.deepEqual([...finalizeMcpReplacement(replacement)], []);
+  });
+});
+
+test("Phase 8 / PRL-10 replacePreparedMcp preserves prepare-owned MCP collision policy", async () => {
+  await withTmpScope(async ({ cwd, locations }) => {
+    await mkdir(path.dirname(locations.mcpJsonPath), { recursive: true });
+    await writeFile(
+      locations.mcpJsonPath,
+      JSON.stringify({
+        mcpServers: {
+          dup: {
+            command: "x",
+            [CLAUDE_MARKETPLACE_MARKER_KEY]: { plugin: "other", marketplace: MP },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    await assert.rejects(
+      prepareStageMcpServers({
+        locations,
+        cwd,
+        marketplaceName: MP,
+        pluginName: PLUGIN,
+        servers: { dup: { command: "y" } },
+      }),
+      McpServerCollisionError,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // abort
 // ---------------------------------------------------------------------------
 
@@ -408,5 +506,56 @@ test("stagedNames matches recorded.map(r=>r.generatedName)", async () => {
       [...result.stagedNames],
       result.recorded.map((r) => r.generatedName),
     );
+  });
+});
+
+test("Phase 8 / PRL-10 finalizeMcpReplacement throws on unknown replacement handle (defensive)", () => {
+  const bogus = { kind: "replaced" } as Parameters<typeof finalizeMcpReplacement>[0];
+  assert.throws(() => finalizeMcpReplacement(bogus), /Unknown MCP replacement handle/);
+});
+
+test("Phase 8 / PRL-10 replacePreparedMcp rollback records leak when restore fails", async (t) => {
+  // POSIX-only: chmod the mcp.json parent dir read-only so the rollback's
+  // writeFile fails. The catch block accumulates a leak message rather
+  // than throwing, exercising lines 300-303.
+  if (process.platform === "win32") {
+    t.skip("POSIX-only chmod 0 failure path");
+    return;
+  }
+
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("running as root -- chmod 0 does not block writeFile");
+    return;
+  }
+
+  const { chmod } = await import("node:fs/promises");
+
+  await withTmpScope(async ({ cwd, locations }) => {
+    await mkdir(path.dirname(locations.mcpJsonPath), { recursive: true });
+    const previous = '{"mcpServers":{"old":{"command":"old"}}}\n';
+    await writeFile(locations.mcpJsonPath, previous, "utf8");
+
+    const prepared = await prepareStageMcpServers({
+      locations,
+      cwd,
+      marketplaceName: MP,
+      pluginName: PLUGIN,
+      servers: { srv: { command: "new" } },
+    });
+
+    const replacement = await replacePreparedMcp(prepared);
+    // Remove mcp.json, then chmod its parent dir read-only so the rollback's
+    // `mkdir(recursive: true)` followed by `writeFile` fails on the create
+    // step (O_CREAT requires parent write).
+    await rm(locations.mcpJsonPath, { force: true });
+    await chmod(path.dirname(locations.mcpJsonPath), 0o500);
+
+    try {
+      const leaks = await rollbackMcpReplacement(replacement);
+      assert.ok(leaks.length >= 1, "expected a restore leak");
+      assert.match(leaks[0] ?? "", /failed to restore mcp\.json/);
+    } finally {
+      await chmod(path.dirname(locations.mcpJsonPath), 0o755);
+    }
   });
 });

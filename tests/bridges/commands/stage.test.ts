@@ -8,7 +8,10 @@ import {
   abortPreparedCommands,
   assertNoCommandCollisions,
   commitPreparedCommands,
+  finalizeCommandsReplacement,
   prepareStageCommands,
+  replacePreparedCommands,
+  rollbackCommandsReplacement,
 } from "../../../extensions/pi-claude-marketplace/bridges/commands/stage.ts";
 import { locationsFor } from "../../../extensions/pi-claude-marketplace/persistence/locations.ts";
 import { pathExists } from "../../../extensions/pi-claude-marketplace/shared/fs-utils.ts";
@@ -288,6 +291,120 @@ test("commitPreparedCommands removes previous-named files (re-stage path)", asyn
   }
 });
 
+test("Phase 8 / PRL-10 replacePreparedCommands can rollback to previous prompt bytes", async () => {
+  const scope = await tmpScope();
+
+  try {
+    await mkdir(scope.loc.promptsTargetDir, { recursive: true });
+    const oldFile = path.join(scope.loc.promptsTargetDir, "acme:deploy.md");
+    await writeFile(oldFile, "old prompt bytes");
+
+    const prepared = await prepareStageCommands({
+      locations: scope.loc,
+      marketplaceName: "test-mp",
+      pluginName: "acme",
+      pluginRoot: FIXTURE_PLUGIN_ROOT,
+      pluginDataDir: "/tmp/pi-data/test-mp/acme",
+      resolved: makeResolved(FIXTURE_PLUGIN_ROOT, "commands"),
+      previousCommandNames: ["acme:deploy"],
+    });
+
+    const replacement = await replacePreparedCommands(prepared);
+    const replaced = await readFile(oldFile, "utf8");
+    assert.notEqual(replaced, "old prompt bytes");
+    assert.ok(replaced.includes(FIXTURE_PLUGIN_ROOT));
+
+    const leaks = await rollbackCommandsReplacement(replacement);
+    assert.deepEqual([...leaks], []);
+    assert.equal(await readFile(oldFile, "utf8"), "old prompt bytes");
+    assert.equal(await pathExists(path.join(scope.loc.promptsTargetDir, "acme:status.md")), false);
+  } finally {
+    await scope.cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 finalizeCommandsReplacement removes backups and keeps staged content", async () => {
+  const scope = await tmpScope();
+
+  try {
+    await mkdir(scope.loc.promptsTargetDir, { recursive: true });
+    const oldFile = path.join(scope.loc.promptsTargetDir, "acme:deploy.md");
+    await writeFile(oldFile, "old prompt bytes");
+
+    const prepared = await prepareStageCommands({
+      locations: scope.loc,
+      marketplaceName: "test-mp",
+      pluginName: "acme",
+      pluginRoot: FIXTURE_PLUGIN_ROOT,
+      pluginDataDir: "/tmp/pi-data/test-mp/acme",
+      resolved: makeResolved(FIXTURE_PLUGIN_ROOT, "commands"),
+      previousCommandNames: ["acme:deploy"],
+    });
+    assert.equal(prepared.kind, "staged");
+
+    const replacement = await replacePreparedCommands(prepared);
+    const leaks = await finalizeCommandsReplacement(replacement);
+    assert.deepEqual([...leaks], []);
+    assert.equal(await pathExists(prepared.stagingRoot), false);
+
+    const current = await readFile(oldFile, "utf8");
+    assert.notEqual(current, "old prompt bytes");
+    assert.equal(await pathExists(path.join(scope.loc.promptsTargetDir, "acme:status.md")), true);
+  } finally {
+    await scope.cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 replacePreparedCommands restores backups if unrelated prompt blocks rename", async () => {
+  const scope = await tmpScope();
+
+  try {
+    await mkdir(scope.loc.promptsTargetDir, { recursive: true });
+    const oldFile = path.join(scope.loc.promptsTargetDir, "acme:deploy.md");
+    const unrelatedFile = path.join(scope.loc.promptsTargetDir, "acme:status.md");
+    await writeFile(oldFile, "old prompt bytes");
+    await writeFile(unrelatedFile, "manual status bytes");
+
+    const prepared = await prepareStageCommands({
+      locations: scope.loc,
+      marketplaceName: "test-mp",
+      pluginName: "acme",
+      pluginRoot: FIXTURE_PLUGIN_ROOT,
+      pluginDataDir: "/tmp/pi-data/test-mp/acme",
+      resolved: makeResolved(FIXTURE_PLUGIN_ROOT, "commands"),
+      previousCommandNames: ["acme:deploy"],
+    });
+
+    await assert.rejects(() => replacePreparedCommands(prepared), /non-previous content/);
+    assert.equal(await readFile(oldFile, "utf8"), "old prompt bytes");
+    assert.equal(await readFile(unrelatedFile, "utf8"), "manual status bytes");
+  } finally {
+    await scope.cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 noop command replacements rollback and finalize without leaks", async () => {
+  const scope = await tmpScope();
+
+  try {
+    const prepared = await prepareStageCommands({
+      locations: scope.loc,
+      marketplaceName: "test-mp",
+      pluginName: "noop-plugin",
+      pluginRoot: FIXTURE_EMPTY_MCP_ROOT,
+      pluginDataDir: "/tmp/pi-data/test-mp/noop-plugin",
+      resolved: makeResolved(FIXTURE_EMPTY_MCP_ROOT, undefined),
+    });
+
+    const replacement = await replacePreparedCommands(prepared);
+    assert.equal(replacement.kind, "noop");
+    assert.deepEqual([...(await rollbackCommandsReplacement(replacement))], []);
+    assert.deepEqual([...(await finalizeCommandsReplacement(replacement))], []);
+  } finally {
+    await scope.cleanup();
+  }
+});
+
 test("commitPreparedCommands tolerates missing previous-named file (ENOENT silenced)", async () => {
   const scope = await tmpScope();
 
@@ -465,6 +582,37 @@ test("StageCommandsCommitResult.recorded captures sourcePath + targetPath per co
     assert.ok(status, "missing acme:status record");
     assert.equal(status.sourcePath, path.join(FIXTURE_PLUGIN_ROOT, "commands", "status.md"));
     assert.equal(status.targetPath, path.join(scope.loc.promptsTargetDir, "acme:status.md"));
+  } finally {
+    await scope.cleanup();
+  }
+});
+
+test("Phase 8 / PRL-10 finalizeCommandsReplacement throws on unknown replacement handle (defensive)", async () => {
+  const bogus = { kind: "replaced" } as Parameters<typeof finalizeCommandsReplacement>[0];
+  await assert.rejects(
+    () => finalizeCommandsReplacement(bogus),
+    /Unknown commands replacement handle/,
+  );
+});
+
+test("Phase 8 / PRL-10 replacePreparedCommands skips backup when previous command file vanished", async () => {
+  const scope = await tmpScope();
+
+  try {
+    const prepared = await prepareStageCommands({
+      locations: scope.loc,
+      marketplaceName: "test-mp",
+      pluginName: "acme",
+      pluginRoot: FIXTURE_PLUGIN_ROOT,
+      pluginDataDir: "/tmp/pi-data/test-mp/acme",
+      resolved: makeResolved(FIXTURE_PLUGIN_ROOT, "commands"),
+      previousCommandNames: ["acme:was-here-but-gone"], // never written to disk
+    });
+
+    const replacement = await replacePreparedCommands(prepared);
+    assert.equal(replacement.kind, "replaced");
+    const leaks = await rollbackCommandsReplacement(replacement);
+    assert.deepEqual([...leaks], []);
   } finally {
     await scope.cleanup();
   }
