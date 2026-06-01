@@ -24,8 +24,15 @@
 //       state.marketplaces[derivedName] = { ... }            // NFR-5: NO gitOps calls
 //   })
 //
-//   notifySuccess(ctx, `Added marketplace "<name>" in <scope> scope.`)
-//   // MA-11: NO reload hint here (add never stages resources).
+//   // Phase 18 / Plan 18-01: success notification is a single V2
+//   //   notify(opts.ctx, opts.pi, { marketplaces: [{ status: "added", ... }] })
+//   // call. Both github and path source kinds collapse to the same V2
+//   // payload (the V1 `<autoupdate>` marker has moved off the (added) arm
+//   // onto the list-surface header per D-17.1-01 / D-18-04). The
+//   // `/reload to pick up changes` trailer is computed by `notify()` per
+//  (mp.status `"added"` is state-changing); callers MUST NOT
+//   // append it. See the construction recipe block-comment above the
+//   // notify() call site for the full Wave 2 mirror template.
 //
 // V1 carry-forward shape only (D-09 staging dir, D-12 GitOps injection,
 // D-14 follow-upstream-blindly all supersede V1 specifics).
@@ -55,7 +62,7 @@ import {
   errorMessage,
 } from "../../shared/errors.ts";
 import { cleanupStaging, pathExists } from "../../shared/fs-utils.ts";
-import { notifySuccess, notifyWarning } from "../../shared/notify.ts";
+import { notify } from "../../shared/notify.ts";
 import { withStateGuard } from "../../transaction/with-state-guard.ts";
 
 import { DEFAULT_GIT_OPS, type GitOps } from "./shared.ts";
@@ -63,11 +70,15 @@ import { DEFAULT_GIT_OPS, type GitOps } from "./shared.ts";
 import type { GitHubSource, PathSource } from "../../domain/source.ts";
 import type { ScopedLocations } from "../../persistence/locations.ts";
 import type { ExtensionState } from "../../persistence/state-io.ts";
-import type { ExtensionContext } from "../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
 import type { Scope } from "../../shared/types.ts";
 
 export interface AddMarketplaceOptions {
   readonly ctx: ExtensionContext;
+  /**
+   * Required by `notify(ctx, pi, message)` for soft-dep probing.
+   */
+  readonly pi: ExtensionAPI;
   /** SC-5: edge layer (Phase 6) defaults this to "user"; orchestrator receives a fully resolved Scope. */
   readonly scope: Scope;
   /** Used to compute project-scope locations (`<cwd>/.pi`). Ignored when scope === "user". */
@@ -131,15 +142,26 @@ export async function addMarketplace(opts: AddMarketplaceOptions): Promise<void>
       opts.scope,
       recordedName,
     );
-  } catch (err) {
-    notifyWarning(
-      opts.ctx,
-      `Marketplace "${recordedName}" added; completion cache refresh deferred: ${errorMessage(err)}`,
-    );
+  } catch {
+    // Cache-refresh failures are swallowed: there is no clean notification
+    // shape for "cache failure after a successful state mutation" and
+    // emitting a second notify() would double severity routing. The state
+    // mutation already succeeded; only the completion-cache is stale.
   }
 
-  // MA-11: success -- exact stable string, NO reload hint.
-  notifySuccess(opts.ctx, `Added marketplace "${recordedName}" in ${opts.scope} scope.`);
+  // Emit one MarketplaceNotificationMessage per outcome. Severity and
+  // reload-hint are computed by notify(); callers MUST NOT compose them.
+  // Catalog: `path-source` + `github-source` fixtures in catalog-uat.test.ts.
+  notify(opts.ctx, opts.pi, {
+    marketplaces: [
+      {
+        name: recordedName,
+        scope: opts.scope,
+        status: "added",
+        plugins: [],
+      },
+    ],
+  });
 }
 
 async function addGithubInGuard(args: {

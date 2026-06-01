@@ -21,6 +21,11 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(HERE, "fixtures/legacy");
+const REPO_ROOT = path.resolve(HERE, "../..");
+const MIGRATE_PATH = path.join(
+  REPO_ROOT,
+  "extensions/pi-claude-marketplace/persistence/migrate.ts",
+);
 
 test("ST-4 migrate fills missing manifestPath + marketplaceRoot (v0 fixture)", async () => {
   const fixture = JSON.parse(
@@ -116,8 +121,9 @@ test("IL-3 persistMigratedState swallows write failures and emits ONE console.wa
       "IL-3 sanctioned console.warn must fire exactly once on persist failure",
     );
     const warnArg = warnMock.mock.calls[0]?.arguments[0] as string;
-    assert.match(warnArg, /pi-claude-marketplace: failed to persist migrated state/);
-    assert.match(warnArg, /continuing with in-memory normalized state/);
+    assert.match(warnArg, /Legacy marketplace migration could not be persisted/);
+    assert.match(warnArg, /the in-memory normalized state is being used/);
+    assert.match(warnArg, /Cause: /);
     assert.ok(
       warnArg.includes(targetThatCannotBeWritten),
       "warn message must name the failed path so the user can act",
@@ -160,4 +166,46 @@ test("IL-3 persistMigratedState does NOT throw even when atomic write fails", as
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("CMC-36: persistence/migrate.ts warn body matches style guide §14.1 wording", async () => {
+  const src = await readFile(MIGRATE_PATH, "utf8");
+  // Source-byte assertion: the migrate.ts file MUST contain the byte-exact
+  // template-literal body locked by D-CMC-14 / §14.1 of the messaging style
+  // guide. The `expected` value below is the literal source text we expect
+  // to find (including backticks and the `${stateJsonPath}` / `${errMsg}`
+  // interpolation tokens as they appear in the TypeScript source).
+  const expected =
+    "`Legacy marketplace migration could not be persisted to ${stateJsonPath}; " +
+    "the in-memory normalized state is being used and the on-disk state.json " +
+    "is unchanged. Cause: ${errMsg}.`";
+  assert.ok(src.includes(expected), "Expected §14.1 wording at persistence/migrate.ts; not found.");
+  assert.ok(
+    !src.includes("failed to persist migrated state to"),
+    "Legacy wording 'failed to persist migrated state to' must be fully replaced (CMC-36)",
+  );
+});
+
+test("CMC-37 / D-21-04: IL-3 console.warn callsite carries no inline eslint-disable directive (block-level override supersedes)", async () => {
+  const src = await readFile(MIGRATE_PATH, "utf8");
+  // Plan 21-01 D-21-04 retired the inline `eslint-disable-next-line` above the
+  // warn in favor of a block-level files-override (BLOCK B-2 in eslint.config.js)
+  // scoped to this single file. Assert the inline directive is GONE.
+  assert.ok(
+    !/eslint-disable-next-line\s+no-restricted-syntax/.test(src),
+    "Inline `eslint-disable-next-line` directive at the IL-3 warn callsite must be removed; the BLOCK B-2 files-override in eslint.config.js supplies the equivalent suppression.",
+  );
+  // The console.warn callsite itself must still be present and lint clean
+  // (verified by `npm run lint` separately).
+  assert.match(src, /console\.warn\(/, "IL-3 console.warn callsite must remain");
+});
+
+test("CMC-37: exactly one sanctioned warn callsite in persistence/migrate.ts", async () => {
+  const src = await readFile(MIGRATE_PATH, "utf8");
+  const matches = src.match(/console\.warn\(/g) ?? [];
+  assert.equal(
+    matches.length,
+    1,
+    "persistence/migrate.ts must have exactly one sanctioned warn (IL-3)",
+  );
 });

@@ -22,6 +22,7 @@ import path from "node:path";
 
 import Type from "typebox";
 
+import { PluginShapeError } from "../shared/errors.ts";
 import { PathContainmentError, assertPathInside } from "../shared/path-safety.ts";
 
 import { MCP_SERVERS_VALIDATOR } from "./components/mcp.ts";
@@ -772,7 +773,13 @@ export async function resolveLoose(
 }
 
 /**
- * PR-6: narrow to installable-or-throw. Used by Phase 5 install/update.
+ * PR-6: narrow to installable-or-throw.
+ *
+ * Throws `PluginShapeError` (typed discriminated carrier) so catch sites
+ * dispatch on `instanceof PluginShapeError` + `.kind` rather than
+ * substring-matching `.message`. `r.notes` is passed through as the
+ * `reasons` array (free-form strings; closed `Reason` narrowing happens
+ * at the renderer boundary in `classifyEntityShapeError`).
  */
 export function requireInstallable(
   r: ResolvedPlugin,
@@ -782,6 +789,9 @@ export function requireInstallable(
     return;
   }
 
-  const verb = op === "update" ? "is no longer installable" : "is not installable";
-  throw new Error(`Plugin "${r.name}" ${verb}: ${r.notes.join("; ")}`);
+  throw new PluginShapeError({
+    kind: op === "update" ? "no-longer-installable" : "not-installable",
+    plugin: r.name,
+    reasons: r.notes,
+  });
 }

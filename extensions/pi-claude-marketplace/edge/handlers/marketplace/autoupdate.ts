@@ -11,10 +11,10 @@
 // `makeAutoupdateHandler(false)`.
 
 import { setMarketplaceAutoupdate } from "../../../orchestrators/marketplace/autoupdate.ts";
-import { notifyError } from "../../../shared/notify.ts";
+import { notifyUsageError } from "../../../shared/notify.ts";
 import { parseCommandArgs } from "../../args-schema.ts";
 
-import type { ExtensionCommandContext } from "../../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionCommandContext } from "../../../platform/pi-api.ts";
 
 function usageFor(enable: boolean): string {
   return enable
@@ -23,6 +23,7 @@ function usageFor(enable: boolean): string {
 }
 
 export function makeAutoupdateHandler(
+  pi: ExtensionAPI,
   enable: boolean,
 ): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
   const usage = usageFor(enable);
@@ -34,7 +35,7 @@ export function makeAutoupdateHandler(
         usage,
       },
       (message) => {
-        notifyError(ctx, message);
+        notifyUsageError(ctx, { message, usage });
       },
     );
     if (parsed === undefined) {
@@ -43,6 +44,7 @@ export function makeAutoupdateHandler(
 
     await setMarketplaceAutoupdate({
       ctx,
+      pi,
       cwd: ctx.cwd,
       enable,
       ...(parsed.name !== undefined && { name: parsed.name }),

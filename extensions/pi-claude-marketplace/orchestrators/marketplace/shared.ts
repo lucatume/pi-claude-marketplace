@@ -22,10 +22,6 @@
 //     autoupdate.ts. Idempotent -- already-matching marketplaces land
 //     in `unchanged[]`.
 //
-//   - formatErrorWithCauses (ES-4 / Pitfall 10): depth-5 Error.cause
-//     walker. Local to Phase 4; Phase 6 may promote to shared/errors.ts
-//     without changing this file's public signature.
-//
 // Per D-02 ANTI-PATTERN: this file MUST NOT import from `transaction/`
 // (no phase-ledger runner). The cascade is the wrong shape for ledger
 // semantics (MR-3 requires continuation across plugin failures; the
@@ -116,6 +112,19 @@ export const DEFAULT_GIT_OPS: GitOps = {
 };
 
 /**
+ * Recognize isomorphic-git's `NotFoundError` without importing the library
+ * into the orchestrator tier (D-13). The class sets both `name` and `code`
+ * to the string `"NotFoundError"` (see `node_modules/isomorphic-git`
+ * `index.cjs` -- `NotFoundError.code = 'NotFoundError'` and
+ * `this.code = this.name = NotFoundError.code`), and `Errors.NotFoundError`
+ * is the documented surface used by `git.resolveRef` when a ref is absent.
+ * Matching on the name keeps the boundary in `platform/git.ts` intact.
+ */
+function isGitNotFoundError(err: unknown): boolean {
+  return err instanceof Error && err.name === "NotFoundError";
+}
+
+/**
  * D-14 follow-upstream-blindly sequence. Three forms:
  *   - storedRef === undefined (default-branch tracking):
  *       fetch + resolveRef('refs/remotes/origin/HEAD') + forceUpdateRef + checkout
@@ -164,8 +173,22 @@ export async function refreshGitHubClone(
       dir: cloneDir,
       ref: `refs/remotes/origin/${storedRef}`,
     });
-  } catch {
-    remoteSha = undefined;
+  } catch (err) {
+    // isomorphic-git's `resolveRef` throws `NotFoundError` (with
+    // `name === "NotFoundError"` and `code === "NotFoundError"`) when the
+    // requested ref does not exist on the remote -- the documented case
+    // where falling back to a detached-HEAD checkout of the stored ref is
+    // the right behavior (D-14 third form). Every OTHER kind of throw
+    // (corrupted git dir, EACCES on .git, EIO, OOM, programming bugs in
+    // a `GitOps` stub) is a real failure: rethrow it so the caller
+    // surfaces the actual cause instead of silently falling back to
+    // stale local state. Name-check rather than `instanceof` keeps the
+    // orchestrator tier free of a direct `isomorphic-git` import (D-13).
+    if (isGitNotFoundError(err)) {
+      remoteSha = undefined;
+    } else {
+      throw err;
+    }
   }
 
   if (remoteSha === undefined) {
@@ -192,13 +215,23 @@ export function renderPartition(
 
   lines.push(`${label}:`);
   for (const o of [...outcomes].sort((a, b) => a.name.localeCompare(b.name))) {
-    if (withVersions && o.fromVersion !== undefined && o.toVersion !== undefined) {
+    // Narrow on the discriminated partition before reading partition-specific
+    // fields. The renderer's `withVersions`
+    // gate maps to the (updated)/(unchanged) partitions that carry
+    // `fromVersion` + `toVersion`; the notes-bearing branch maps to
+    // (skipped)/(failed). The bare-row fallback is the (updated) +
+    // !withVersions case (typically the legacy unchanged-row form).
+    if (withVersions && (o.partition === "updated" || o.partition === "unchanged")) {
       lines.push(`  - ${o.name} (${o.fromVersion} → ${o.toVersion})`);
-    } else if (o.notes !== undefined && o.notes.length > 0) {
-      lines.push(`  - ${o.name}: ${o.notes.join("; ")}`);
-    } else {
-      lines.push(`  - ${o.name}`);
+      continue;
     }
+
+    if ((o.partition === "skipped" || o.partition === "failed") && o.notes.length > 0) {
+      lines.push(`  - ${o.name}: ${o.notes.join("; ")}`);
+      continue;
+    }
+
+    lines.push(`  - ${o.name}`);
   }
 }
 
@@ -408,7 +441,7 @@ export async function resolveScopeFromState(
     return { scope: "user", locations: userLocations };
   }
 
-  throw new MarketplaceNotFoundError(mpName, ["user", "project"]);
+  throw new MarketplaceNotFoundError(mpName, ["project", "user"]);
 }
 
 /**
@@ -427,7 +460,9 @@ export async function loadVisibleMarketplaces(opts: {
   /** When undefined, enumerate BOTH scopes (SC-6). */
   readonly scope?: Scope;
 }): Promise<readonly { scope: Scope; record: ExtensionState["marketplaces"][string] }[]> {
-  const scopes: readonly Scope[] = opts.scope === undefined ? ["user", "project"] : [opts.scope];
+  // Iteration order is project-first per MSG-GR-3 / compareByNameThenScope
+  // so same-name cross-scope stable-sort ties render project-before-user.
+  const scopes: readonly Scope[] = opts.scope === undefined ? ["project", "user"] : [opts.scope];
   const out: { scope: Scope; record: ExtensionState["marketplaces"][string] }[] = [];
   for (const scope of scopes) {
     const locations = locationsFor(scope, opts.cwd);
@@ -440,39 +475,9 @@ export async function loadVisibleMarketplaces(opts: {
   return out;
 }
 
-/**
- * ES-4 / Pitfall 10: walk Error.cause up to depth 5 and join the
- * messages with ` -- caused by: `. Phase 4-local; Phase 6 may
- * promote to shared/errors.ts without changing this signature.
- *
- * The depth bound prevents pathological cycles (an Error whose
- * cause is itself or forms a loop). 5 levels matches V1's
- * reference (marketplace/update.ts::formatErrorWithCauses).
- */
-// eslint-disable-next-line @typescript-eslint/no-inferrable-types -- explicit `: number = 5` matches the plan's grep-gate done criterion (Plan 04-02 Task 2).
-export function formatErrorWithCauses(err: unknown, maxDepth: number = 5): string {
-  const parts: string[] = [];
-  let current: unknown = err;
-  for (let depth = 0; depth < maxDepth && current !== undefined; depth++) {
-    // Rule 1 deviation from verbatim: `String(current)` violates @typescript-eslint/no-base-to-string
-    // on unknown-with-toString. Equivalent semantics via instanceof / typeof / Object.prototype.toString.
-    const message = errorCauseMessage(current);
-
-    parts.push(message);
-    if (current instanceof Error && current.cause !== undefined && current.cause !== current) {
-      current = current.cause;
-    } else {
-      break;
-    }
-  }
-
-  return parts.join(" -- caused by: ");
-}
-
-function errorCauseMessage(current: unknown): string {
-  if (current instanceof Error) {
-    return current.message;
-  }
-
-  return typeof current === "string" ? current : Object.prototype.toString.call(current);
-}
+// The depth-5 cause-chain walker lives at `shared/errors.ts::causeChainTrailer`
+// and renders as `cause: <l1> -> <l2> -> ... [(truncated)]`. Callers pass
+// failure facts to `notify()`; the renderer composes the trailer internally.
+// Callers that need the trailer outside the notify path compose it inline via
+// `causeChainTrailer(err)` imported from `shared/errors.ts` (canonicalised
+// there in Phase 21 from the retired `presentation/cause-chain.ts`).

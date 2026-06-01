@@ -19,7 +19,7 @@ import { loadState } from "../../../../extensions/pi-claude-marketplace/persiste
 import { fixtureMarketplaceDir, makeMockGitOps } from "../../../helpers/git-mock.ts";
 
 import type { EdgeDeps } from "../../../../extensions/pi-claude-marketplace/edge/types.ts";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 interface NotifyRecord {
   message: string;
@@ -38,6 +38,15 @@ function makeCtx(cwd: string): { ctx: ExtensionCommandContext; notifications: No
     pi: { getAllTools: (): unknown[] => [] },
   } as unknown as ExtensionCommandContext;
   return { ctx, notifications };
+}
+
+// Plan 18-00 (Wave 0): `makeBootstrapHandler(pi, deps)` requires `pi`
+// as first positional arg (the composed `addMarketplace` /
+// `setMarketplaceAutoupdate` orchestrators now require `pi`).
+function makePi(): ExtensionAPI {
+  return {
+    getAllTools: (): unknown[] => [],
+  } as unknown as ExtensionAPI;
 }
 
 async function withHermeticHome<T>(fn: (env: { cwd: string }) => Promise<T>): Promise<T> {
@@ -90,17 +99,19 @@ test("bootstrap handler (no args, clean state): dispatches to orchestrator and e
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps, gitState } = makeDeps();
-    const handler = makeBootstrapHandler(deps);
+    const handler = makeBootstrapHandler(makePi(), deps);
 
     await handler("", ctx);
 
     // Both composed orchestrators emitted their messages in order.
     assert.equal(notifications.length, 2);
-    assert.equal(
-      notifications[0]?.message,
-      'Added marketplace "claude-plugins-official" in user scope.',
-    );
-    assert.equal(notifications[1]?.message, "Enabled autoupdate: claude-plugins-official.");
+    // SNM-33 / D-22-01 / D-22-03: both composed orchestrators emit
+    // marketplace-status-only blocks (no plugin rows), so NEITHER carries
+    // the `/reload` trailer -- a marketplace record and its autoupdate flag
+    // are not Pi-visible resources.
+    assert.equal(notifications[0]?.message, "● claude-plugins-official [user] (added)");
+    // UXG-04: fresh autoupdate enable renders the `<autoupdate>` marker-as-outcome.
+    assert.equal(notifications[1]?.message, "● claude-plugins-official [user] <autoupdate>");
 
     // Clone happened against the canonical Anthropic repo URL.
     assert.equal(gitState.cloneCalls.length, 1);
@@ -121,16 +132,15 @@ test("bootstrap handler (whitespace-only args): treated identically to empty arg
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps } = makeDeps();
-    const handler = makeBootstrapHandler(deps);
+    const handler = makeBootstrapHandler(makePi(), deps);
 
     await handler("   ", ctx);
 
     assert.equal(notifications.length, 2);
-    assert.equal(
-      notifications[0]?.message,
-      'Added marketplace "claude-plugins-official" in user scope.',
-    );
-    assert.equal(notifications[1]?.message, "Enabled autoupdate: claude-plugins-official.");
+    // SNM-33 / D-22-01 / D-22-03: see preceding test for the no-trailer rationale.
+    assert.equal(notifications[0]?.message, "● claude-plugins-official [user] (added)");
+    // UXG-04: fresh autoupdate enable renders the `<autoupdate>` marker-as-outcome.
+    assert.equal(notifications[1]?.message, "● claude-plugins-official [user] <autoupdate>");
   });
 });
 
@@ -138,12 +148,19 @@ test("bootstrap handler (positional argument): rejected with usage error, orches
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps, gitState } = makeDeps();
-    const handler = makeBootstrapHandler(deps);
+    const handler = makeBootstrapHandler(makePi(), deps);
 
     await handler("foo", ctx);
 
     assert.equal(notifications.length, 1);
-    assert.equal(notifications[0]?.message, "Usage: /claude:plugin bootstrap");
+    // CMC-34 closure (Phase 14, Plan 14-02): the positional-rejected case now
+    // routes via notifyUsageError, which emits `${message}\n\n${USAGE}`. The
+    // sentence head ("bootstrap takes no arguments.") + blank-line separator
+    // + Usage block is the on-the-wire byte shape (MSG-NC-2 / MSG-SR-7).
+    assert.equal(
+      notifications[0]?.message,
+      "bootstrap takes no arguments.\n\nUsage: /claude:plugin bootstrap",
+    );
     assert.equal(notifications[0]?.severity, "error");
     // Orchestrator never invoked -> clone never attempted.
     assert.equal(gitState.cloneCalls.length, 0);
@@ -154,7 +171,7 @@ test("bootstrap handler (--scope project): rejected with user-scope-only usage e
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps, gitState } = makeDeps();
-    const handler = makeBootstrapHandler(deps);
+    const handler = makeBootstrapHandler(makePi(), deps);
 
     await handler("--scope project", ctx);
 
@@ -172,7 +189,7 @@ test("bootstrap handler (--scope user): rejected too -- the bootstrap subcommand
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps } = makeDeps();
-    const handler = makeBootstrapHandler(deps);
+    const handler = makeBootstrapHandler(makePi(), deps);
 
     await handler("--scope user", ctx);
 
@@ -189,7 +206,7 @@ test("bootstrap handler (invalid --scope value): surfaces parseArgs error", asyn
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps } = makeDeps();
-    const handler = makeBootstrapHandler(deps);
+    const handler = makeBootstrapHandler(makePi(), deps);
 
     await handler("--scope nope", ctx);
 

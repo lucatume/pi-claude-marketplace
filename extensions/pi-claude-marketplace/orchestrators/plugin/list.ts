@@ -2,65 +2,106 @@
 //
 // PL-1..7 top-level plugin list. D-06 orchestrator half -- READ-ONLY.
 //
-// Contract (from PRD §5.3.1 + Plan 05-08):
+// The orchestrator reads BOTH scopes' state (user + project) regardless of
+// which scope the caller requested, computes the orphan-fold per
+// D-13-17..D-13-19, and constructs a `NotificationMessage` of
+// `MarketplaceNotificationMessage`s for the V2 renderer at
+// `shared/notify.ts`. The fold rule:
+//   - For each marketplace `<mp>` that exists in PROJECT scope: emit a
+//     `<mp>[project]` header block with the plugins installed under that
+//     project-scope marketplace.
+//   - For each marketplace `<mp>` that exists in USER scope: emit a
+//     `<mp>[user]` header block; ALSO fold any project-scope plugin records
+//     whose marketplace name equals `<mp>` AND for which NO project-scope
+//     `<mp>` marketplace record exists (the orphan rule). Each folded
+//     plugin row carries `scope: "project"` (D-13-18: actual install scope
+//     on every surface).
+//
+// Each arm emits one notify() call with the full NotificationMessage payload.
+// Probe failures manifest as per-row (unavailable) variants rather than a
+// separate warning -- the per-row shape already carries the signal.
+//
+// CMC-13 / MSG-SD-1..3 per-row soft-dep markers: each installed-variant
+// `PluginPresentMessage` carries `dependencies: readonly Dependency[]`
+// derived from the plugin's installed resources (state-recorded). V2's
+// `notify` owns the single softDepStatus(pi) probe per call
+// and emits the `{requires pi-subagents}` / `{requires pi-mcp}` markers
+// when (declares AND companion unloaded). UAT G-21-01 (SNM-15 surface
+// tightening): the list orchestrator emits the list-only present token
+// for steady-state inventory rows instead of the cascade-context
+// installed token, so `shouldEmitReloadHint` does NOT fire the
+// `/reload to pick up changes` trailer on plain list invocations.
+//
+// Contract (from PRD §5.3.1 + Plan 05-08, preserved):
 //   - PL-1 filter union semantics: when NO filter flags (--installed /
 //     --available / --unavailable) are set, every bucket is shown. When any
 //     one flag is set, show UNION of selected buckets.
-//   - PL-2 nested-tree-grouped-by-scope: enumerate state per scope and let
-//     `renderPluginList` group user-scope before project-scope.
 //   - PL-3 marketplace narrowing: optional opts.marketplace filters which
 //     marketplace records are walked.
 //   - PL-5 upgradable: STRING comparison (manifest.version !== installed
 //     record version). NOT semver.
-//   - PL-6 manifest soft-fail: per-marketplace manifest load is wrapped in
-//     try/catch; failure becomes a warnings[] entry and the orchestrator
-//     continues -- installed plugins still render from state.
-//   - PL-7 [autoupdate] tag: `mp.autoupdate === true` flows through the
-//     payload's PluginListMarketplace.autoupdate; the renderer composes
-//     the header tag.
+//   - PL-6 manifest soft-fail: per-marketplace manifest load failure
+//     surfaces as a `(failed)` MarketplaceNotificationMessage with
+//     `status: "failed"` and `plugins: []`. No marketplace-level cause
+//     trailer in V2 (catalog `unparseable-mp` at docs/output-catalog.md:
+//     215-226). Installed plugins still render under their normal header
+//     when the manifest parses.
 //
 // Architectural constraints (NFR-5 / PI-2 / PL-3):
 //   - No withStateGuard (no mutation, no state file write).
 //   - No `platform/git` import, no `DEFAULT_GIT_OPS`, no `gitOps` reference.
-//   - `tests/architecture/no-orchestrator-network.test.ts` (Plan 05-02)
-//     greps this source after stripComments and asserts zero gitOps surface.
-//   - `domain/resolver.ts::resolveStrict` is permitted (resolver is a pure
-//     fs probe; the architectural test allowlist explicitly covers domain/).
-//
-// Eager-probe rationale (ROADMAP success criterion #5):
-//   Default `list` (no flags) MUST surface every bucket -- including the
-//   ⊘ uninstallable rows. For each not-yet-installed manifest entry we run
-//   `resolveStrict`; on `installable=false` (or thrown error), the entry is
-//   bucketed as `"uninstallable"` with the failure reason captured in
-//   `PluginListEntry.notes`. Per-entry probe cost is O(fs.stat-class) and
-//   marketplaces are small (<100 plugins typical); a resolver-result cache
-//   is the post-V1 NFR-8 perf path -- NOT introduced here.
+//   - `tests/architecture/no-orchestrator-network.test.ts` greps this source
+//     after stripComments and asserts zero gitOps surface.
 
 import { loadMarketplaceManifest, type MarketplaceManifest } from "../../domain/manifest.ts";
 import { resolveStrict } from "../../domain/resolver.ts";
 import { locationsFor } from "../../persistence/locations.ts";
-import { loadState } from "../../persistence/state-io.ts";
-import {
-  renderPluginList,
-  type PluginListEntry,
-  type PluginListMarketplace,
-  type PluginListPayload,
-  type PluginRenderStatus,
-} from "../../presentation/plugin-list.ts";
+import { loadState, type ExtensionState } from "../../persistence/state-io.ts";
 import { errorMessage } from "../../shared/errors.ts";
-import { notifyError, notifySuccess } from "../../shared/notify.ts";
+import { notify } from "../../shared/notify.ts";
 
-import type { ExtensionContext } from "../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
+import type {
+  Dependency,
+  MarketplaceNotificationMessage,
+  PluginAvailableMessage,
+  PluginFailedMessage,
+  PluginNotificationMessage,
+  PluginPresentMessage,
+  PluginUnavailableMessage,
+  PluginUpgradableMessage,
+} from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
+
+/**
+ * PluginRenderStatus retained as an internal alias to keep the orchestrator's
+ * bucketing logic (present / upgradable / available / unavailable) typed.
+ * Maps 1:1 onto the V2 PluginNotificationMessage list-surface discriminator
+ * subset per shared/notify.ts. UAT G-21-01: the installed bucket emits the
+ * list-only `present` token instead of the cascade-context `installed`
+ * token so `shouldEmitReloadHint` does not misfire on steady-state list
+ * invocations; the PL-1 `--installed` filter treats `present` and
+ * `upgradable` as the installed bucket.
+ */
+type PluginRenderStatus = "present" | "upgradable" | "available" | "unavailable";
 
 /**
  * Options bag for {@link listPlugins}. Phase 6 edge layer constructs this
  * from `/claude:plugin list` argv parsing.
+ *
+ * `pi` is REQUIRED -- the V2 `notify(ctx, pi, message)` call consumes it
+ * for the single softDepStatus(pi) probe per invocation. The
+ * renderer derives per-row soft-dep markers from each
+ * `PluginPresentMessage.dependencies` field plus the probe result.
  */
 export interface ListPluginsOptions {
   readonly ctx: ExtensionContext;
+  readonly pi: ExtensionAPI;
   readonly cwd: string;
-  /** SC-6 enumeration: when undefined, both scopes are walked. */
+  /** SC-6 enumeration narrowing: when undefined the cross-scope walk + fold
+   *  rule applies. When set, the orchestrator STILL reads both scopes (the
+   *  fold rule needs visibility into both) but constrains which blocks are
+   *  emitted at the end. */
   readonly scope?: Scope;
   /** PL-3 marketplace narrowing: when undefined, every marketplace is walked. */
   readonly marketplace?: string;
@@ -85,7 +126,7 @@ function shouldShow(opts: ListPluginsOptions, status: PluginRenderStatus): boole
     return true;
   }
 
-  if (opts.installed === true && status === "installed") {
+  if (opts.installed === true && (status === "present" || status === "upgradable")) {
     return true;
   }
 
@@ -93,7 +134,7 @@ function shouldShow(opts: ListPluginsOptions, status: PluginRenderStatus): boole
     return true;
   }
 
-  if (opts.unavailable === true && status === "uninstallable") {
+  if (opts.unavailable === true && status === "unavailable") {
     return true;
   }
 
@@ -101,89 +142,320 @@ function shouldShow(opts: ListPluginsOptions, status: PluginRenderStatus): boole
 }
 
 /**
- * PL-6 manifest soft-fail helper. Reads + validates the cached marketplace.json
- * pointed at by `manifestPath`. Throws on any read or validation failure; the
- * orchestrator's try/catch turns the throw into a `warnings[]` entry.
- *
- * Note: this is `domain/manifest.ts::MARKETPLACE_VALIDATOR.Check` -- the SAME
- * gate used at marketplace-add time (state-io.ts ST-6 funnel). Schema-valid
- * manifests typed-narrow to `MarketplaceManifest` via the .Check return guard.
+ * Per-marketplace manifest load. Wraps `loadMarketplaceManifest` so a thrown
+ * error becomes a `(failed)` MarketplaceNotificationMessage per CMC-22 +
+ * catalog `unparseable-mp` state at docs/output-catalog.md:215-226 (handled
+ * in the block builder).
  */
 async function loadManifestSoftly(manifestPath: string): Promise<MarketplaceManifest> {
   return loadMarketplaceManifest(manifestPath);
 }
 
-function scopesForList(opts: ListPluginsOptions): readonly Scope[] {
-  return opts.scope === undefined ? ["user", "project"] : [opts.scope];
+/**
+ * Reasons emitted by the list orchestrator. The resolver-narrowing path
+ * produces `hooks` / `lsp` / `unsupported source`; the
+ * probe-error path produces `permission denied` / `source missing` /
+ * `unreadable` / `unparseable`. All values are members of the closed
+ * `Reason` set so the renderer accepts them unchanged.
+ */
+type ListReason =
+  | "hooks"
+  | "lsp"
+  | "unsupported source"
+  | "permission denied"
+  | "source missing"
+  | "unreadable"
+  | "unparseable";
+
+/**
+ * Compute `dependencies: readonly Dependency[]` from boolean declares flags.
+ * The renderer probes once and emits `{requires pi-subagents}` / `{requires
+ * pi-mcp}` when (declares AND companion unloaded). Empty array elides both
+ * markers structurally (D-15-02).
+ */
+function dependenciesFromDeclares(declaresAgents: boolean, declaresMcp: boolean): Dependency[] {
+  const deps: Dependency[] = [];
+  if (declaresAgents) {
+    deps.push("agents");
+  }
+
+  if (declaresMcp) {
+    deps.push("mcp");
+  }
+
+  return deps;
 }
 
-function installedEntry(
+/**
+ * Build a `PluginPresentMessage` (or `PluginUpgradableMessage` when the
+ * manifest version differs from the installed record's version per PL-5
+ * string compare) for an INSTALLED plugin record. `dependencies` derives
+ * from the installed record's `resources` (state-recorded counts).
+ *
+ * `pluginScope`: the actual install scope of this plugin record. Passed
+ * through to the V2 row only when it differs from the owning marketplace's
+ * scope -- the renderer's MSG-PL-6 orphan-fold rule suppresses
+ * the `[<scope>]` bracket when `p.scope === mp.scope`.
+ *
+ * Inventory-vs-transition discriminator (UAT G-21-01): the steady-state
+ * list row emits the list-only `present` inventory token (absent from
+ * `shouldEmitReloadHint`'s trigger set) instead of the cascade transition
+ * `installed` token (which DOES trigger the reload hint). The renderer
+ * arm for `"present"` is byte-identical to the `"installed"` arm so the
+ * human-visible row text `● <name> [<scope>] v<ver> (installed)` is
+ * preserved.
+ */
+function installedRowMessage(
   pluginName: string,
-  record: { readonly version: string },
-  manifest: MarketplaceManifest | undefined,
-): PluginListEntry {
-  const manifestEntry = manifest?.plugins.find((p) => p.name === pluginName);
+  pluginScope: Scope,
+  marketplaceScope: Scope,
+  record: ExtensionState["marketplaces"][string]["plugins"][string],
+  manifestEntry: MarketplaceManifest["plugins"][number] | undefined,
+): PluginPresentMessage | PluginUpgradableMessage {
+  const declaresAgents = record.resources.agents.length > 0;
+  const declaresMcp = record.resources.mcpServers.length > 0;
+  const upgradable =
+    manifestEntry?.version !== undefined && manifestEntry.version !== record.version;
+
+  // Same-scope: omit the `scope` field so the renderer's orphan-fold rule
+  //  suppresses the `[<scope>]` bracket. Cross-scope (orphan
+  // fold case): emit the actual install scope so the renderer prints the
+  // `[<actualScope>]` bracket on the row.
+  const scopeField: { readonly scope?: Scope } =
+    pluginScope === marketplaceScope ? {} : { scope: pluginScope };
+
+  if (upgradable) {
+    // V1 emitted (upgradable) rows WITHOUT a typed reason brace; the V2
+    // PluginUpgradableMessage type structurally requires `reasons` per
+    // D-15-01. Use the empty-array sentinel -- the renderer's
+    // composeReasons helper returns "" for an empty reasons array, so the
+    // emitted byte form remains `● <name> [<scope>] v<ver> (upgradable)`
+    // without a trailing `{...}` brace.
+    return {
+      status: "upgradable",
+      name: pluginName,
+      reasons: [],
+      version: record.version,
+      ...scopeField,
+    };
+  }
+
   return {
+    status: "present",
     name: pluginName,
-    status: "installed",
+    dependencies: dependenciesFromDeclares(declaresAgents, declaresMcp),
     version: record.version,
-    upgradable: manifestEntry?.version !== undefined && manifestEntry.version !== record.version,
-    ...(manifestEntry?.description !== undefined && {
-      description: manifestEntry.description,
-    }),
+    ...scopeField,
   };
 }
 
-async function manifestEntryStatus(
+/**
+ * Narrow the resolver `notes` array to closed-set REASONS members. The
+ * manifest field carve-out (MSG-GR-4) passes `hooks` verbatim and maps the
+ * manifest-field detection token `lspServers` to the emitted Reason `lsp`;
+ * any other unsupported-source note falls through to
+ * `unsupported source`. Empty notes -> empty reasons array (the row is
+ * `(unavailable)` without an explicit reason; uncommon path).
+ */
+function narrowResolverNotes(
+  notes: readonly string[],
+): readonly ("hooks" | "lsp" | "unsupported source")[] {
+  const out: ("hooks" | "lsp" | "unsupported source")[] = [];
+  const seen = new Set<string>();
+  for (const note of notes) {
+    // Scan the note for known manifest-field carve-outs in order.
+    if (note.includes("hooks") && !seen.has("hooks")) {
+      out.push("hooks");
+      seen.add("hooks");
+      continue;
+    }
+
+    // DETECT on the camelCase manifest-field token the resolver writes into
+    // the note (`contains lspServers`); EMIT the closed-set Reason `lsp`.
+    if (note.includes("lspServers") && !seen.has("lsp")) {
+      out.push("lsp");
+      seen.add("lsp");
+      continue;
+    }
+
+    if (!seen.has("unsupported source")) {
+      out.push("unsupported source");
+      seen.add("unsupported source");
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Classify a thrown `resolveStrict` failure to a closed-set `ListReason`.
+ *
+ * Errno-bearing Node FS errors map to the matching closed Reason
+ * (`EACCES` -> `permission denied`; `ENOENT` -> `source missing`;
+ * `EIO`/other IO -> `unreadable`). `SyntaxError` (thrown by JSON.parse
+ * inside the resolver / manifest read path) maps to `unparseable`. Any
+ * other thrown shape falls through to `unreadable`, which is the closed
+ * Reason that means "we could not read enough of the source to decide".
+ *
+ * This replaces the previous behavior of substring-matching every
+ * caught error through `narrowResolverNotes` -- which only recognises
+ * `hooks` / `lspServers` and silently degraded EVERY OTHER throw to
+ * `{unsupported source}`, hiding real failure causes from the user.
+ */
+function narrowProbeError(err: unknown): ListReason {
+  return narrowErrnoLikeError(err);
+}
+
+/**
+ * WR-03 shared core: errno-first + SyntaxError + permissive fallback
+ * classifier. Both `narrowProbeError` (per-row resolver probe failures)
+ * and `narrowListFailReason` (orchestrator-level list failures) share
+ * this implementation -- the classifier ladder for a Node FS / JSON
+ * throw is the same regardless of which surface caught it. The two
+ * named wrappers exist for documentation (different callers, different
+ * semantic meaning of "unreadable") and to provide stable test seams
+ * (`__test_narrowProbeError` / `__test_narrowListFailReason`).
+ *
+ * Keeping the function bodies distinct would trip
+ * `sonarjs/no-identical-functions`; collapsing the two named functions
+ * would lose the semantic distinction documented at the call sites.
+ * The shared-core indirection threads the needle.
+ */
+function narrowErrnoLikeError(err: unknown): ListReason {
+  if (err instanceof SyntaxError) {
+    return "unparseable";
+  }
+
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      return "permission denied";
+    }
+
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return "source missing";
+    }
+  }
+
+  return "unreadable";
+}
+
+/**
+ * Resolve a not-yet-installed manifest entry into a V2
+ * `PluginAvailableMessage` or `PluginUnavailableMessage`.
+ *
+ * `resolveStrict` succeeds + `installable: true` -> `(available)`; the
+ * resolver returns `installable: false` (or throws) -> `(unavailable)` with
+ * the failure reasons narrowed to closed-set REASONS.
+ *
+ * SNM-11: both `available` and `unavailable` variants OMIT `scope` (the
+ * list surface does not emit `[<scope>]` brackets for these rows per
+ * MSG-PL-6).
+ *
+ * Probe failures (resolveStrict throws): the thrown error is classified
+ * via `narrowProbeError` into a closed-set Reason and threaded onto the
+ * `(unavailable)` row's `reasons` array. The user sees the cause CLASS on
+ * the per-row line -- there is NO separate trailing summary notification
+ * per D-19-01 (the V1 probe-failure capture-buffer and its drain warning
+ * are removed in this plan).
+ */
+async function availableRowMessage(
   manifestEntry: MarketplaceManifest["plugins"][number],
   marketplaceRoot: string,
-): Promise<{ status: PluginRenderStatus; notes?: readonly string[] }> {
+): Promise<PluginAvailableMessage | PluginUnavailableMessage> {
   try {
     const resolved = await resolveStrict(manifestEntry, { marketplaceRoot });
-
-    if (resolved.installable || resolved.notes.length === 0) {
-      return { status: resolved.installable ? "available" : "uninstallable" };
+    if (resolved.installable) {
+      return {
+        status: "available",
+        name: manifestEntry.name,
+        ...(manifestEntry.version !== undefined && { version: manifestEntry.version }),
+      };
     }
 
-    return { status: "uninstallable", notes: resolved.notes };
+    return {
+      status: "unavailable",
+      name: manifestEntry.name,
+      reasons: narrowResolverNotes(resolved.notes),
+      ...(manifestEntry.version !== undefined && { version: manifestEntry.version }),
+    };
   } catch (probeErr) {
-    return { status: "uninstallable", notes: [errorMessage(probeErr)] };
+    // The previous implementation routed EVERY throw through
+    // `narrowResolverNotes`, which only recognises the strings `hooks`
+    // and `lspServers` and silently degrades everything else to
+    // `{unsupported source}`. That hid EACCES, JSON parse failures,
+    // and programming bugs behind a misleading reason. Route resolver
+    // notes through `narrowResolverNotes` (the path that produces them
+    // is `resolveStrict` returning NotInstallable with structured notes
+    // -- already handled above on the `installable === false` branch),
+    // and route thrown probe failures through `narrowProbeError` so the
+    // row reports the actual cause class. Plan 19-03 D-19-01: the V1
+    // probe-failure capture-buffer + summary `notifyWarning` is GONE;
+    // the per-row `(unavailable) {<reason>}` carries the cause class
+    // at row granularity -- the redundant summary is dropped.
+    const reason = narrowProbeError(probeErr);
+    return {
+      status: "unavailable",
+      name: manifestEntry.name,
+      reasons: [reason],
+      ...(manifestEntry.version !== undefined && { version: manifestEntry.version }),
+    };
   }
 }
 
-async function availableEntry(
-  manifestEntry: MarketplaceManifest["plugins"][number],
-  marketplaceRoot: string,
-): Promise<PluginListEntry> {
-  const { status, notes } = await manifestEntryStatus(manifestEntry, marketplaceRoot);
-  return {
-    name: manifestEntry.name,
-    status,
-    ...(manifestEntry.version !== undefined && { version: manifestEntry.version }),
-    ...(manifestEntry.description !== undefined && {
-      description: manifestEntry.description,
-    }),
-    ...(notes !== undefined && { notes }),
-  };
-}
-
-async function collectMarketplacePlugins(
+/**
+ * Enumerate plugin notification messages for a single (marketplace-record,
+ * plugin-scope) pair. Walks the marketplace's installed plugin records
+ * first, then the manifest entries that are NOT installed (available /
+ * unavailable buckets).
+ *
+ * `mpRecord` is the marketplace record from `<pluginScope>`'s state;
+ * `pluginScope` is the scope under which the plugins are installed (the
+ * `[<scope>]` bracket on each plugin row reflects this -- D-13-18 -- via
+ * the V2 renderer's orphan-fold rule).
+ *
+ * `marketplaceScope` is the scope of the OWNING marketplace block. When
+ * `pluginScope === marketplaceScope` the plugin row OMITS its `scope`
+ * field so the renderer suppresses the bracket; otherwise the row carries
+ * the actual install scope.
+ *
+ * `excludeFromAvailable` is the set of plugin names that should NOT be
+ * emitted as `(available)` rows because they are already installed in
+ * the OTHER scope under the CLONED marketplace record (orphan-fold rule).
+ *
+ * Returns the rows in stable (state-iteration + manifest-order) order;
+ * the orchestrator applies the final MSG-GR-3 sort at the block boundary.
+ */
+async function enumerateMarketplacePlugins(
   opts: ListPluginsOptions,
-  mp: Awaited<ReturnType<typeof loadState>>["marketplaces"][string],
+  mpRecord: ExtensionState["marketplaces"][string],
+  pluginScope: Scope,
+  marketplaceScope: Scope,
   manifest: MarketplaceManifest | undefined,
-): Promise<PluginListEntry[]> {
-  const plugins: PluginListEntry[] = [];
-  const installedRecords = mp.plugins;
+  excludeFromAvailable: ReadonlySet<string> = new Set(),
+): Promise<PluginNotificationMessage[]> {
+  const rows: PluginNotificationMessage[] = [];
+  const installedRecords = mpRecord.plugins;
   const installedNames = new Set(Object.keys(installedRecords));
 
+  // Installed bucket.
   for (const [pluginName, record] of Object.entries(installedRecords)) {
-    if (shouldShow(opts, "installed")) {
-      plugins.push(installedEntry(pluginName, record, manifest));
+    const manifestEntry = manifest?.plugins.find((p) => p.name === pluginName);
+    const row = installedRowMessage(
+      pluginName,
+      pluginScope,
+      marketplaceScope,
+      record,
+      manifestEntry,
+    );
+    if (shouldShow(opts, row.status)) {
+      rows.push(row);
     }
   }
 
+  // Available / unavailable buckets (manifest entries not in state).
   if (manifest === undefined) {
-    return plugins;
+    return rows;
   }
 
   for (const manifestEntry of manifest.plugins) {
@@ -191,80 +463,461 @@ async function collectMarketplacePlugins(
       continue;
     }
 
-    const entry = await availableEntry(manifestEntry, mp.marketplaceRoot);
-    if (shouldShow(opts, entry.status)) {
-      plugins.push(entry);
+    if (excludeFromAvailable.has(manifestEntry.name)) {
+      // Already installed in the OTHER scope under a CLONED marketplace
+      // record (orphan-fold rule). The folded `(installed)` row carries
+      // the plugin's actual install scope (D-13-18); we suppress the
+      // duplicate `(available)` enumeration so the block matches the
+      // catalog `project-orphan-folded` form.
+      continue;
+    }
+
+    const row = await availableRowMessage(manifestEntry, mpRecord.marketplaceRoot);
+    if (shouldShow(opts, row.status)) {
+      rows.push(row);
     }
   }
 
-  return plugins;
+  return rows;
+}
+
+interface ScopedManifest {
+  readonly manifest: MarketplaceManifest | undefined;
+  readonly loadError: string | undefined;
+}
+
+async function loadMarketplaceManifestSoftly(
+  mpRecord: ExtensionState["marketplaces"][string],
+): Promise<ScopedManifest> {
+  try {
+    const manifest = await loadManifestSoftly(mpRecord.manifestPath);
+    return { manifest, loadError: undefined };
+  } catch (err) {
+    return { manifest: undefined, loadError: errorMessage(err) };
+  }
 }
 
 /**
- * Plan 06-04 D-02 extraction: pure payload builder. Performs the same
- * state + manifest + resolver work as {@link listPlugins} but returns the
- * structured payload + warnings instead of emitting via notify. Used by
- * `edge/handlers/tools.ts` (pi_claude_marketplace_plugin_list LLM tool) to
- * read the same data without crossing the edge -> persistence import
- * boundary (BLOCK C).
+ * D-13-17 / D-13-19 fold rule. For a USER-scope marketplace `<mp>` that
+ * has no matching PROJECT-scope marketplace record, the orphan rule folds
+ * project-scope plugin records keyed by `<mp>` under the user-scope header.
  *
- * On any THROWN failure outside the per-marketplace try/catch (e.g.,
- * state.json schema invalid -- TC-9 surface), the throw propagates to the
- * caller. Per-marketplace manifest failures (TC-8) are soft-failed into
- * `warnings[]` per PL-6.
+ * State-shape observation: a project-scope plugin installed from a
+ * user-scope marketplace causes the install orchestrator to clone the
+ * marketplace record into the project scope. The orphan condition is:
+ *   - A PROJECT-scope marketplace `<mp>` EXISTS in project state (cloned
+ *     from user scope at install time) AND
+ *   - A USER-scope marketplace `<mp>` ALSO exists in user state AND
+ *   - The two records reference the SAME marketplace source (same
+ *     `marketplaceRoot`).
+ *
+ * This treatment matches the catalog `project-orphan-folded` state
+ * (docs/output-catalog.md:184-196) and the `same-plugin-both-scopes`
+ * state (lines 168-182).
+ */
+function isCloneOfUserMarketplace(
+  projectMp: ExtensionState["marketplaces"][string] | undefined,
+  userMp: ExtensionState["marketplaces"][string] | undefined,
+): boolean {
+  if (projectMp === undefined || userMp === undefined) {
+    return false;
+  }
+
+  // Identity by marketplaceRoot: the install orchestrator copies this from
+  // the source marketplace verbatim, so a project-scope clone of a user
+  // marketplace always has the same on-disk root.
+  return projectMp.marketplaceRoot === userMp.marketplaceRoot;
+}
+
+interface BuiltMarketplace {
+  readonly mp: MarketplaceNotificationMessage;
+  readonly emitScope: Scope;
+}
+
+async function buildMarketplaceMessage(args: {
+  opts: ListPluginsOptions;
+  mpName: string;
+  mpScope: Scope;
+  mpRecord: ExtensionState["marketplaces"][string];
+  extraPlugins: readonly PluginNotificationMessage[];
+  excludeFromAvailable?: ReadonlySet<string>;
+}): Promise<BuiltMarketplace> {
+  const { opts, mpName, mpScope, mpRecord, extraPlugins, excludeFromAvailable } = args;
+  const { manifest, loadError } = await loadMarketplaceManifestSoftly(mpRecord);
+
+  // Unparseable manifest: V2 catalog `unparseable-mp` form (lines 215-226)
+  // -- bare `(failed)` marketplace header with `plugins: []`. The V1
+  // `causeTrailer` is DROPPED per the catalog "notify() does not emit a
+  // marketplace-level cause: trailer for failed marketplaces with empty
+  // plugins: []" contract. The autoupdate detail also drops on failure --
+  // the renderer's failed-status arm at shared/notify.ts:593 emits a
+  // bare header with no `<autoupdate>` marker.
+  if (loadError !== undefined) {
+    return {
+      mp: {
+        name: mpName,
+        scope: mpScope,
+        status: "failed",
+        plugins: [],
+      },
+      emitScope: mpScope,
+    };
+  }
+
+  // Normal header + enumerated plugins (own scope) + folded extras.
+  const ownPlugins = await enumerateMarketplacePlugins(
+    opts,
+    mpRecord,
+    mpScope,
+    mpScope,
+    manifest,
+    excludeFromAvailable,
+  );
+  const merged: readonly PluginNotificationMessage[] = [...ownPlugins, ...extraPlugins];
+
+  // `details` is OPTIONAL and INDEPENDENT of status per D-15-06. The V1
+  // plugin-list surface only carried the `autoupdate` marker via
+  // `MarketplaceRow.marker` (see the V1 `makeMarketplaceHeader` at
+  // orchestrators/plugin/list.ts pre-Plan-19-03); `lastUpdatedAt` was
+  // NOT surfaced on the plugin-list rendering (it lives on the
+  // marketplace-list surface only). Per the plan's "no expansion of
+  // detail surface in Phase 19" guard (19-03-PLAN.md must_haves), V2
+  // mirrors this: include `details` ONLY when `autoupdate === true`,
+  // and inside `details` carry ONLY `autoupdate`. `lastUpdatedAt` is
+  // intentionally omitted so the renderer's `<last-updated <iso>>`
+  // token never emits on this surface. Catalog reference: every
+  // `/claude:plugin list` fixture at docs/output-catalog.md:139-263
+  // has `details: { autoupdate: true }` -- no `lastUpdatedAt` field.
+  const detailsField: { readonly details?: { autoupdate: boolean } } =
+    mpRecord.autoupdate === true ? { details: { autoupdate: true } } : {};
+
+  return {
+    mp: {
+      name: mpName,
+      scope: mpScope,
+      ...detailsField,
+      plugins: merged,
+    },
+    emitScope: mpScope,
+  };
+}
+
+/**
+ * Plan 06-04 D-02 extraction: pure payload builder for the cross-scope
+ * plugin list. Reads BOTH scopes' state regardless of `opts.scope` -- the
+ * fold rule needs visibility into both; final scope-filtering applies AFTER
+ * the blocks are constructed.
  */
 export async function loadPluginListPayload(
   opts: ListPluginsOptions,
-): Promise<{ payload: PluginListPayload; warnings: readonly string[] }> {
-  const scopes = scopesForList(opts);
-  const marketplaces: PluginListMarketplace[] = [];
-  const warnings: string[] = [];
+): Promise<readonly MarketplaceNotificationMessage[]> {
+  // D-13-19: read both scopes' state.
+  const userLocations = locationsFor("user", opts.cwd);
+  const projectLocations = locationsFor("project", opts.cwd);
+  const [userState, projectState] = await Promise.all([
+    loadState(userLocations.extensionRoot),
+    loadState(projectLocations.extensionRoot),
+  ]);
 
-  for (const scope of scopes) {
-    const locations = locationsFor(scope, opts.cwd);
-    const state = await loadState(locations.extensionRoot);
+  const blocks: BuiltMarketplace[] = [];
 
-    for (const [mpName, mp] of Object.entries(state.marketplaces)) {
-      // PL-3 marketplace narrowing.
-      if (opts.marketplace !== undefined && opts.marketplace !== mpName) {
-        continue;
-      }
-
-      // PL-6 manifest soft-fail.
-      let manifest: MarketplaceManifest | undefined;
-      try {
-        manifest = await loadManifestSoftly(mp.manifestPath);
-      } catch (err) {
-        warnings.push(
-          `could not load manifest for "${mpName}" (${scope} scope): ${errorMessage(err)}`,
-        );
-      }
-
-      const plugins = await collectMarketplacePlugins(opts, mp, manifest);
-
-      marketplaces.push({
-        name: mpName,
-        scope,
-        autoupdate: mp.autoupdate === true,
-        plugins,
-      });
+  // 1. Project-scope marketplace records.
+  for (const [mpName, mpRecord] of Object.entries(projectState.marketplaces)) {
+    if (opts.marketplace !== undefined && opts.marketplace !== mpName) {
+      continue;
     }
+
+    const userMp = userState.marketplaces[mpName];
+    // Orphan-fold rule: if the project-scope record is a CLONE of the
+    // user-scope record (same marketplaceRoot), DO NOT emit a separate
+    // project-scope block. The project-scope plugins fold under the
+    // user-scope header below.
+    if (isCloneOfUserMarketplace(mpRecord, userMp)) {
+      continue;
+    }
+
+    const built = await buildMarketplaceMessage({
+      opts,
+      mpName,
+      mpScope: "project",
+      mpRecord,
+      extraPlugins: [],
+    });
+    blocks.push(built);
   }
 
-  return { payload: { marketplaces }, warnings };
+  // 2. User-scope marketplace records (with optional orphan fold).
+  for (const [mpName, mpRecord] of Object.entries(userState.marketplaces)) {
+    if (opts.marketplace !== undefined && opts.marketplace !== mpName) {
+      continue;
+    }
+
+    // Fold orphan project plugins iff the matching project-scope record
+    // is a clone (per D-13-17 semantics) and exists.
+    const projectMp = projectState.marketplaces[mpName];
+    const isProjectMpClone = isCloneOfUserMarketplace(projectMp, mpRecord);
+    let folded: readonly PluginNotificationMessage[] = [];
+    let foldedNames: ReadonlySet<string> = new Set();
+    if (isProjectMpClone && projectMp !== undefined) {
+      // Each folded row carries scope: "project" (D-13-18 actual install
+      // scope), surfaced via the renderer's orphan-fold rule when
+      // `p.scope !== mp.scope`.
+      const { manifest } = await loadMarketplaceManifestSoftly(projectMp);
+      // WR-02: filter to ONLY installed/upgradable rows. The project-side
+      // enumeration also returns `available` and `unavailable` bucket rows
+      // from the same shared manifest (cloned `marketplaceRoot`); folding
+      // those into the user-scope block would duplicate every manifest-
+      // listed plugin that is not installed in either scope (one row from
+      // the project-side enumeration, one from the user-side's own
+      // enumeration). The documented fold semantic is "fold installed
+      // records from the other scope" -- restrict the carry-over set
+      // accordingly.
+      const projectSideRows = await enumerateMarketplacePlugins(
+        opts,
+        projectMp,
+        "project",
+        "user",
+        manifest,
+      );
+      // UAT G-21-01: after the inventory-vs-transition discriminator split,
+      // `installedRowMessage` emits `status: "present"` (list-only) for the
+      // steady-state inventory row, not the cascade-context `"installed"`
+      // token. The carry-over filter MUST discriminate on `"present"` (plus
+      // the unchanged `"upgradable"` arm) so orphan-folded rows survive.
+      // The prior `r.status === "installed"` half of the predicate was
+      // structurally unreachable post-split and silently dropped every
+      // folded inventory row (CR-01 / 21-04-REVIEW.md). The integration
+      // regression for this fold lives at tests/integration/fold-adoption.test.ts
+      // phase 2; the orchestrator-level reproduction is in
+      // tests/orchestrators/plugin/list.test.ts ("CR-01 / G-21-01 fold-carryover...").
+      folded = projectSideRows.filter((r) => r.status === "present" || r.status === "upgradable");
+      // Record the folded plugin names so the user-scope manifest's
+      // available-bucket enumeration skips them (catalog
+      // `project-orphan-folded` state shows a single
+      // `● alpha [project] ... (installed)` row -- no duplicate
+      // `○ alpha (available)` row under the same header).
+      foldedNames = new Set(folded.map((r) => r.name));
+    }
+
+    const built = await buildMarketplaceMessage({
+      opts,
+      mpName,
+      mpScope: "user",
+      mpRecord,
+      extraPlugins: folded,
+      excludeFromAvailable: foldedNames,
+    });
+    blocks.push(built);
+  }
+
+  // SC-6 scope narrowing: if the caller restricted the scope, only emit
+  // blocks whose ORIGINATING scope matches. The fold rule still applied
+  // above so the cross-scope visibility is preserved -- but the resulting
+  // surface is filtered to the requested scope.
+  const filtered =
+    opts.scope === undefined ? blocks : blocks.filter((b) => b.emitScope === opts.scope);
+
+  // MSG-GR-3 / CMC-03 sort: pre-sort the marketplace blocks AND the plugin
+  // rows within each block at the orchestrator boundary per D-13-19
+  // (CMC-03). : notify does NOT sort -- the caller owns iteration
+  // order. Name primary case-insensitive, scope secondary
+  // project-before-user.
+  const sortedBlocks = [...filtered].sort((a, b) => compareMpForSort(a.mp, b.mp));
+  return sortedBlocks.map(({ mp }) => ({
+    ...mp,
+    plugins: sortPluginsInBlock(mp.scope, mp.plugins),
+  }));
 }
 
 /**
- * D-06 orchestrator half. Read-only listing of plugins grouped by scope
- * then by marketplace. Delegates to {@link loadPluginListPayload} for the
- * payload construction; this wrapper handles notify side-effects.
+ * MSG-GR-3 marketplace-block comparator. Name primary
+ * (case-insensitive base sensitivity), scope secondary
+ * (project-before-user). Marketplaces always carry both `name` and
+ * `scope` (the field is required on `MarketplaceNotificationMessage`).
+ */
+function compareMpForSort(
+  a: MarketplaceNotificationMessage,
+  b: MarketplaceNotificationMessage,
+): number {
+  const byName = a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  if (byName !== 0) {
+    return byName;
+  }
+
+  if (a.scope === b.scope) {
+    return 0;
+  }
+
+  return a.scope === "project" ? -1 : 1;
+}
+
+/**
+ * MSG-GR-3 in-block plugin sort. Name primary (case-insensitive base
+ * sensitivity), scope secondary (project-before-user). Plugin rows in
+ * `PluginAvailableMessage` / `PluginUnavailableMessage` variants do not
+ * carry a `scope` field by construction (SNM-11); for sort purposes those
+ * rows are treated as belonging to the owning marketplace's scope, which
+ * yields a deterministic ordering against orphan-folded rows that DO
+ * carry an explicit cross-scope `scope`.
+ */
+function sortPluginsInBlock(
+  marketplaceScope: Scope,
+  plugins: readonly PluginNotificationMessage[],
+): readonly PluginNotificationMessage[] {
+  if (plugins.length === 0) {
+    return plugins;
+  }
+
+  // SNM-11: `available` / `unavailable` variants have no `scope` field by
+  // construction; the other list-surface variants (`present` /
+  // `upgradable`) carry an optional `scope`. The status-narrowing switch
+  // is the only safe access path under TS strict. UAT G-21-01: the list
+  // orchestrator emits `present` (list-only inventory token) for
+  // steady-state inventory rows; `installed` is the cascade-context
+  // transition token. WR-02 (21-04-REVIEW.md): keep `installed` in the
+  // scope-bearing arm alongside `present` / `upgradable`. The body
+  // `return p.scope ?? marketplaceScope` is correct for both the
+  // (post-fix) unreachable list-surface case AND any future regression
+  // that re-routes a cascade-context `installed` row through the list
+  // orchestrator -- the cross-scope orphan-fold scope on a
+  // `PluginInstalledMessage` (SNM-11 / D-13-18) is preserved instead of
+  // silently overwritten with `marketplaceScope`.
+  const scopeOf = (p: PluginNotificationMessage): Scope => {
+    switch (p.status) {
+      case "present":
+      case "upgradable":
+      case "installed":
+        return p.scope ?? marketplaceScope;
+      case "available":
+      case "unavailable":
+        return marketplaceScope;
+      case "updated":
+      case "reinstalled":
+      case "uninstalled":
+      case "failed":
+      case "skipped":
+      case "manual recovery":
+        // Unreachable on the list surface; renderer-as-spec guard.
+        return marketplaceScope;
+    }
+  };
+
+  return [...plugins].sort((a, b) => {
+    const byName = a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    if (byName !== 0) {
+      return byName;
+    }
+
+    const aScope = scopeOf(a);
+    const bScope = scopeOf(b);
+    if (aScope === bScope) {
+      return 0;
+    }
+
+    return aScope === "project" ? -1 : 1;
+  });
+}
+
+/**
+ * WR-03: dedicated closed-set Reason narrower for orchestrator-level list
+ * failures. Mirrors the `update.ts::narrowDirectFailReason` precedent:
+ * errno-bearing FS errors map to the closed Reason that names the cause
+ * class (`permission denied` / `source missing`); `SyntaxError` maps to
+ * `unparseable` (state.json schema validation throws or JSON.parse
+ * failures); the permissive fallback is `unreadable`.
+ *
+ * Distinct from `narrowProbeError`: that helper classifies per-row
+ * resolver probe failures (NOT orchestrator-level list failures). Using
+ * `narrowProbeError` for the catch path conflated two failure surfaces --
+ * a `loadState` permission error here would surface as `{unreadable}`
+ * which semantically describes a resolver probe failure, not a list
+ * orchestration failure. The narrower here returns closed-set Reasons
+ * accurate to the list-orchestration failure modes (loadState /
+ * loadManifest / cross-scope walk throws).
+ */
+function narrowListFailReason(err: unknown): ListReason {
+  return narrowErrnoLikeError(err);
+}
+
+/**
+ * D-06 orchestrator entrypoint. Read-only listing of plugins. Constructs
+ * the V2 `NotificationMessage` payload inline and forwards it to a single
+ * `notify(ctx, pi, message)` call per orchestration arm (success or
+ * failure). V2's `notify()` owns the single softDepStatus(pi) probe per
+ * invocation and emits per-row `{requires pi-subagents}` /
+ * `{requires pi-mcp}` markers when (declares AND companion unloaded).
  */
 export async function listPlugins(opts: ListPluginsOptions): Promise<void> {
-  const { ctx } = opts;
+  const { ctx, pi } = opts;
   try {
-    const { payload, warnings } = await loadPluginListPayload(opts);
-    notifySuccess(ctx, renderPluginList(payload, warnings));
+    const marketplaces = await loadPluginListPayload(opts);
+    // V2 notify() call mirrors the Plan 19-01 pilot recipe at
+    // orchestrators/plugin/uninstall.ts; list.ts substitutes the
+    // list-surface plugin variants (available / unavailable / upgradable
+    // / installed) per D-19-02. Severity (info; omitted 2nd arg) and
+    // the `/reload to pick up changes` trailer are computed by notify()
+    //  (the trailer fires when at least one
+    // installed/updated/reinstalled/uninstalled plugin row is present;
+    // pure available/unavailable/upgradable lists emit no trailer).
+    notify(ctx, pi, { marketplaces });
   } catch (err) {
-    notifyError(ctx, errorMessage(err), err);
+    // Aggregate list-failure path. The list surface has no dedicated
+    // catalog state for orchestrator-level failure (D-19-03 Claude's
+    // Discretion per Plan 19-03 step 4 Option B): construct a synthetic
+    // `MarketplaceNotificationMessage` carrying a single
+    // `PluginFailedMessage` so the V2 renderer's 4-space-indent cause
+    // chain surfaces the diagnostic verbatim. Severity is
+    // computed as "error" by notify (any failed plugin row
+    // -> error); no reload-hint (failed is not in the
+    // state-changing variant set).
+    //
+    // WR-03: use the dedicated `narrowListFailReason` instead of
+    // `narrowProbeError`. The two failure surfaces have different
+    // semantics -- `narrowProbeError` classifies per-row resolver probe
+    // failures (where `unreadable` means "we could not read the plugin
+    // source"); `narrowListFailReason` classifies list-orchestration
+    // failures (where `unreadable` means "we could not load state.json
+    // or walk the marketplace records"). Both share the closed-set
+    // `ListReason` codomain so the renderer accepts the result unchanged.
+    const cause = err instanceof Error ? err : new Error(errorMessage(err));
+    const failedRow: PluginFailedMessage = {
+      status: "failed",
+      name: SYNTHETIC_LIST_FAILURE_PLUGIN_NAME,
+      reasons: [narrowListFailReason(err)],
+      cause,
+    };
+    const mp: MarketplaceNotificationMessage = {
+      // WR-03: the V1 synthetic marketplace name `"(list)"` rendered as
+      // `● (list) [user]` -- visually indistinguishable from a real
+      // marketplace called "(list)". The current
+      // `MarketplaceNotificationMessage` shape does not support a
+      // failure-trailer channel separate from the marketplace-row form,
+      // so keep the synthetic placeholder but use a more conspicuously-
+      // synthetic name (mirrors the `(reinstall)` / `(targets)` precedent
+      // in reinstall.ts / update.ts). The cause-chain trailer carries
+      // the actual diagnostic text via the failedRow's `cause` field.
+      name: SYNTHETIC_LIST_FAILURE_MARKETPLACE_NAME,
+      scope: opts.scope ?? "user",
+      plugins: [failedRow],
+    };
+    notify(ctx, pi, { marketplaces: [mp] });
   }
 }
+
+/**
+ * WR-03: synthetic identities used by the list-orchestration catch path.
+ * Held as module-level constants so tests can assert against them and
+ * future changes are gated behind a single edit point. Both render under
+ * the V2 cascade grammar as parens-wrapped tokens -- the renderer does
+ * not special-case parens, so the visual marker reads as "synthetic
+ * placeholder" to an operator scanning output.
+ */
+const SYNTHETIC_LIST_FAILURE_MARKETPLACE_NAME = "(list)";
+const SYNTHETIC_LIST_FAILURE_PLUGIN_NAME = "(list)";
+
+// Test-only re-export. Mirrors the `__test_classifyEntityShapeError` /
+// `__test_classifyInstallFailure` precedent in `install.ts`: the helper
+// is file-private but its classification table is the load-bearing
+// contract that callers (and the user) rely on.
+export { narrowProbeError as __test_narrowProbeError };
+export { narrowListFailReason as __test_narrowListFailReason };

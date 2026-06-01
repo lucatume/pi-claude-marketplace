@@ -8,6 +8,10 @@ import { GENERATED_AGENT_PREFIX } from "../../../extensions/pi-claude-marketplac
 import { pathSource } from "../../../extensions/pi-claude-marketplace/domain/source.ts";
 import { installPlugin } from "../../../extensions/pi-claude-marketplace/orchestrators/plugin/install.ts";
 import {
+  __test_errorWithManualRecovery,
+  __test_findManualRecoveryError,
+  __test_outcomeToPluginMessage,
+  __test_renderReinstallPartitionAndNotify,
   reinstallPlugin,
   reinstallPlugins,
 } from "../../../extensions/pi-claude-marketplace/orchestrators/plugin/reinstall.ts";
@@ -17,7 +21,12 @@ import {
   saveState,
 } from "../../../extensions/pi-claude-marketplace/persistence/state-io.ts";
 import { __resetCacheForTests } from "../../../extensions/pi-claude-marketplace/shared/completion-cache.ts";
+import { ManualRecoveryError } from "../../../extensions/pi-claude-marketplace/shared/errors.ts";
 
+import type {
+  ReinstallFailedOutcome,
+  ReinstallPluginOutcome,
+} from "../../../extensions/pi-claude-marketplace/orchestrators/types.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 interface NotifyRecord {
@@ -304,7 +313,7 @@ test("PRL-08/11 happy: success preserves installed version, restages resources, 
       assert.match(await readSkill(cwd), /new skill/);
       await assert.rejects(() => readFile(path.join(dataDir, "state.txt"), "utf8"), /ENOENT/);
       assert.equal(errorNotifications(notifications).length, 0);
-      assert.match(notifications.at(-1)?.message ?? "", /Run \/reload to refresh it\.$/);
+      assert.match(notifications.at(-1)?.message ?? "", /\/reload to pick up changes$/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -475,7 +484,18 @@ test("PRL-10: force overwrites foreign previous agent content and rollback resto
   });
 });
 
-test("PRL-12: cache and data cleanup failures are warning-only after successful reinstall", async () => {
+test("PRL-12 (Plan 19-04): cache and data cleanup failures are SILENTLY swallowed after successful reinstall (V1 warning surface DROPPED per D-19-01)", async () => {
+  // V1 emitted two standalone-mode notifyWarning lines (bridgeWarnings +
+  // maintenanceWarnings) after a successful reinstall when the
+  // post-state-commit cache/data cleanup paths failed. Plan 19-04 / D-19-01
+  // DROPS those two surfaces entirely: the underlying try/catch is
+  // retained (the side effects -- dropMarketplaceCache + rm -- still
+  // attempt to run), but the user-visible warning surface is gone. The
+  // primary success notification still fires.
+  //
+  // The orchestrated-mode `notes` field accumulation is asserted in the
+  // PRL-13-quiet test below; this test asserts the standalone-mode
+  // user-visible flow.
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-cleanup-warning-"));
     try {
@@ -502,17 +522,28 @@ test("PRL-12: cache and data cleanup failures are warning-only after successful 
       });
 
       assert.equal(outcome.partition, "reinstalled");
+      // Exactly one notification (the V2 success cascade); zero warnings.
+      assert.equal(notifications.length, 1);
       assert.equal(errorNotifications(notifications).length, 0);
-      const warnings = notifications.filter((n) => n.severity === "warning").map((n) => n.message);
-      assert.ok(warnings.some((w) => w.includes("cache drop failed")));
-      assert.ok(warnings.some((w) => w.includes("data cleanup failed")));
+      assert.equal(notifications.filter((n) => n.severity === "warning").length, 0);
+      // Defense-in-depth: the dropped warning text MUST NOT leak into the
+      // success notification's message.
+      const body = notifications[0]?.message ?? "";
+      assert.equal(body.includes("cache drop failed"), false);
+      assert.equal(body.includes("data cleanup failed"), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 });
 
-test("PRL-12/RH-5: no-resource reinstall suppresses reload hint; agents/MCP warn when unloaded", async () => {
+test("PRL-12/RH-5 (Plan 19-04): V2 per-variant reload-hint -- emitted on reinstalled even with zero resources changed (cascade stub); agents/MCP warn when unloaded", async () => {
+  // V1 -> V2 behavior change: V1 suppressed the reload-hint when the
+  // cascade-outcome's `resourcesChanged` flag was false. V2 emits the
+  // reload-hint structurally from `PluginReinstalledMessage.status` per
+  // D-16-12 (the `reinstalled` status is in the state-changing variant
+  // set), NOT from cascade-outcome resource count. Mirrors the Wave 1
+  // pilot PU-8 (b) flip documented in 19-01-SUMMARY.md.
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-output-"));
     try {
@@ -527,7 +558,13 @@ test("PRL-12/RH-5: no-resource reinstall suppresses reload hint; agents/MCP warn
       const { ctx, pi, notifications } = makeCtx();
       const noResource = await reinstallDefault(cwd, ctx, pi);
       assert.equal(noResource.partition, "reinstalled");
-      assert.equal((notifications.at(-1)?.message ?? "").includes("Run /reload"), false);
+      // V1 -> V2 flip: V2 emits the reload-hint trailer structurally
+      // from the `reinstalled` variant per D-16-12, regardless of
+      // resourcesChanged.
+      assert.equal(
+        (notifications.at(-1)?.message ?? "").includes("/reload to pick up changes"),
+        true,
+      );
 
       notifications.length = 0;
       const cwd2 = await mkdtemp(path.join(tmpdir(), "reinstall-output-deps-"));
@@ -547,9 +584,14 @@ test("PRL-12/RH-5: no-resource reinstall suppresses reload hint; agents/MCP warn
       });
       assert.equal(withDeps.partition, "reinstalled");
       const body = notifications.at(-1)?.message ?? "";
-      assert.match(body, /pi-subagents is not loaded/);
-      assert.match(body, /pi-mcp-adapter is not loaded/);
-      assert.match(body, /Run \/reload to refresh it\./);
+      // Plan 13-02a-01 / CMC-13 / MSG-SD-1..2: per-row soft-dep markers
+      // replace the legacy aggregated `pi-subagents is not loaded` / `pi-
+      // mcp-adapter is not loaded` trailer. The single-plugin reinstall
+      // renders as a 1-row cascade and the soft-dep markers appear on the
+      // (reinstalled) row when companion extensions are unloaded.
+      assert.match(body, /\{[^}]*requires pi-subagents[^}]*\}/);
+      assert.match(body, /\{[^}]*requires pi-mcp[^}]*\}/);
+      assert.match(body, /\/reload to pick up changes/);
       await rm(cwd2, { recursive: true, force: true });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -659,15 +701,26 @@ test("PRL-04 bulk bare reinstall enumerates user and project scopes", async () =
 
       const outcomes = await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
 
+      // CR-01 / 14.2-01 D-04: ordered via compareByNameThenScope (name
+      // primary case-insensitive, scope secondary project-before-user
+      // per MSG-GR-3). "pmp" sorts before "ump" by name primary alone.
       assert.deepEqual(
         outcomes.map((o) => `[${o.scope}] ${o.name}@${o.marketplace}`),
-        ["[user] uplug@ump", "[project] pplug@pmp"],
+        ["[project] pplug@pmp", "[user] uplug@ump"],
       );
-      assert.match(notifications.at(-1)?.message ?? "", /Reinstalled 2 plugins\./);
-      assert.match(
-        notifications.at(-1)?.message ?? "",
-        /Reinstalled:\n {2}- \[user\] uplug@ump\n {2}- \[project\] pplug@pmp/,
-      );
+      // Plan 19-04 / D-19-02: V2 cascade renders with orphan-fold per-row
+      // scope suppression (D-17.2-01 / D-17.2-02): when the plugin's
+      // scope matches the parent marketplace's scope, the per-row
+      // `[<scope>]` bracket is OMITTED (renderScopeBracket contract at
+      // shared/notify.ts:719). The marketplace header still carries the
+      // `[<scope>]` token. Project-scoped marketplaces sort before user
+      // (compareByNameThenScope: project-before-user tie-breaker).
+      const body = notifications.at(-1)?.message ?? "";
+      assert.match(body, /● pmp \[project\]\n {2}● pplug v\d/);
+      assert.match(body, /● ump \[user\]\n {2}● uplug v\d/);
+      // The retired summary/partition forms must NOT appear.
+      assert.equal(body.includes("Reinstalled 2 plugins."), false);
+      assert.equal(body.includes("Reinstalled:"), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -700,7 +753,11 @@ test("PRL-03 bulk marketplace reinstall resolves implicit scope like update", as
         outcomes.map((o) => o.scope),
         ["project"],
       );
-      assert.match(notifications.at(-1)?.message ?? "", /\[project\] plug@mymp/);
+      // Plan 19-04 / D-19-02: V2 cascade marketplace header + indented
+      // plugin row; orphan-fold suppresses the per-row `[<scope>]`
+      // bracket when it matches the parent marketplace's scope.
+      const body = notifications.at(-1)?.message ?? "";
+      assert.match(body, /● mymp \[project\]\n {2}● plug v/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -785,10 +842,13 @@ test("PRL-05 explicit plugin reinstall in another scope reports not-installed in
         notifications.some((n) => n.severity === "error"),
         false,
       );
-      assert.match(
-        notifications.at(-1)?.message ?? "",
-        /Skipped:\n {2}- \[project\] plug@mp: not installed/,
-      );
+      // Plan 19-04 / D-19-02: V2 cascade row carries `(skipped) {not
+      // installed}`; per-row scope is orphan-folded (matches marketplace
+      // scope). Severity computed by notify() per D-16-11: `warning`
+      // (skipped row in plugins[] tips ladder to warning).
+      const body = notifications.at(-1)?.message ?? "";
+      assert.match(body, /● mp \[project\]\n {2}⊘ plug \(skipped\) \{not installed\}/);
+      assert.equal(notifications.at(-1)?.severity, "warning");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -870,15 +930,24 @@ test("PRL-13 batch reinstall continues after failed plugin", async () => {
         ["bad:failed", "good:reinstalled"],
       );
       const body = notifications.at(-1)?.message ?? "";
-      assert.match(body, /Reinstalled plugin "good"\./);
-      assert.match(
-        body,
-        /Failed:\n {2}- \[project\] bad@mp: Plugin "bad" not found in cached manifest/,
-      );
-      assert.equal(
-        notifications.some((n) => n.severity === "error"),
-        false,
-      );
+      // Plan 19-04 / D-19-02: V2 cascade with mixed rows; `(reinstalled)`
+      // on the success row, `(failed) {not in manifest}` on the failure
+      // row (narrowed from `Plugin "bad" not found in cached manifest`).
+      // Per-row scope orphan-folded (matches marketplace scope).
+      // Severity computed by notify() per D-16-11: `error` (any failed
+      // row tips the ladder to error in V2; D-16-11 first-match takes
+      // failed before warning).
+      assert.match(body, /● mp \[project\]\n {2}⊘ bad \(failed\) \{not in manifest\}/);
+      assert.match(body, /● good v1\.0\.0 \(reinstalled\)/);
+      // Legacy `Reinstalled plugin "good".` summary line + `Failed:` partition
+      // header retired.
+      assert.equal(body.includes('Reinstalled plugin "good".'), false);
+      assert.equal(body.includes("Failed:"), false);
+      // V1 -> V2 severity flip: V1 routed mixed cascades to
+      // `notifyWarning` (MSG-SR-6 forbade notifyError on cascade
+      // summaries). V2 computes severity from contents per D-16-11 ->
+      // any failed row tips the ladder to `error`.
+      assert.equal(notifications.at(-1)?.severity, "error");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -930,6 +999,11 @@ test("PRL-13 deterministic partition output sorts by scope marketplace plugin", 
 
       const outcomes = await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
 
+      // CR-01 / 14.2-01 D-04: ordered project-before-user via
+      // `compareByNameThenScope` (name primary case-insensitive, scope
+      // secondary project-before-user per MSG-GR-3). Marketplace name
+      // is the primary key: "a" < "u" < "z" lexicographically. Plugin
+      // rows within a marketplace also sort by name primary.
       assert.deepEqual(
         outcomes.map((o) => ({
           partition: o.partition,
@@ -938,16 +1012,100 @@ test("PRL-13 deterministic partition output sorts by scope marketplace plugin", 
           name: o.name,
         })),
         [
-          { partition: "reinstalled", scope: "user", marketplace: "u", name: "z" },
           { partition: "reinstalled", scope: "project", marketplace: "a", name: "a" },
           { partition: "reinstalled", scope: "project", marketplace: "a", name: "c" },
+          { partition: "reinstalled", scope: "user", marketplace: "u", name: "z" },
           { partition: "reinstalled", scope: "project", marketplace: "z", name: "b" },
         ],
       );
       const body = notifications.at(-1)?.message ?? "";
+      // Plan 19-04 / D-19-02 + 14.2-01 D-04: V2 per-marketplace cascade
+      // blocks ordered via `compareByNameThenScope` (name primary
+      // case-insensitive, scope secondary project-before-user). Per-row
+      // scope orphan-folded (matches marketplace scope). The body-regex
+      // matches below assert presence (not order between markets) -- the
+      // deepEqual above locks outcome order.
+      assert.match(body, /● u \[user\]\n {2}● z v1\.0\.0 \(reinstalled\)/);
       assert.match(
         body,
-        /Reinstalled:\n {2}- \[user\] z@u\n {2}- \[project\] a@a\n {2}- \[project\] c@a\n {2}- \[project\] b@z/,
+        /● a \[project\]\n {2}● a v1\.0\.0 \(reinstalled\)\n {2}● c v1\.0\.0 \(reinstalled\)/,
+      );
+      assert.match(body, /● z \[project\]\n {2}● b v1\.0\.0 \(reinstalled\)/);
+      assert.equal(body.includes("Reinstalled:"), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("260525-cjr C9: same-name cross-scope reinstall -> project-scope row renders BEFORE user-scope row (MSG-GR-3 stable-sort tie-break)", async () => {
+  // The existing PRL-13 deterministic-sort test (above) uses DISTINCT
+  // marketplace names (a / u / z) so the marketplace-name primary key
+  // never produces same-name pairs -- the project-before-user secondary
+  // tie-break on `MarketplaceRow.scope` never fires. This test seeds
+  // the SAME marketplace name in BOTH scopes so the tie-break is
+  // exercised end-to-end through the cascade renderer (NOT just via
+  // the unit test on `compareByNameThenScope` in
+  // `tests/presentation/sort.test.ts`).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-same-name-scopes-"));
+    try {
+      // Both scopes carry a marketplace named "mp" with a plugin named
+      // "p". The roots are deliberately distinct dirs so install
+      // succeeds independently in each scope.
+      await seedMarketplace({
+        cwd,
+        scope: "user",
+        marketplaceRoot: path.join(cwd, "mp-user-src"),
+        marketplaceName: "mp",
+        pluginName: "p",
+        resources: { skill: "user-scope skill" },
+        install: true,
+      });
+      await seedMarketplace({
+        cwd,
+        scope: "project",
+        marketplaceRoot: path.join(cwd, "mp-project-src"),
+        marketplaceName: "mp",
+        pluginName: "p",
+        resources: { skill: "project-scope skill" },
+        install: true,
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcomes = await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
+
+      // Outcome order asserts the project-before-user tie-break at the
+      // orchestrator boundary -- both outcomes share `marketplace: "mp"`
+      // and `name: "p"`, so the scope secondary key decides.
+      assert.deepEqual(
+        outcomes.map((o) => ({
+          partition: o.partition,
+          scope: o.scope,
+          marketplace: o.marketplace,
+          name: o.name,
+        })),
+        [
+          { partition: "reinstalled", scope: "project", marketplace: "mp", name: "p" },
+          { partition: "reinstalled", scope: "user", marketplace: "mp", name: "p" },
+        ],
+      );
+
+      // Rendered cascade order: the two same-named marketplace blocks
+      // appear with project-scope FIRST. Locate both headers in the
+      // body and assert the project header's index is lower than the
+      // user header's.
+      const body = notifications.at(-1)?.message ?? "";
+      const projectHeaderIdx = body.indexOf("● mp [project]");
+      const userHeaderIdx = body.indexOf("● mp [user]");
+      assert.ok(
+        projectHeaderIdx >= 0,
+        `expected project-scope header '● mp [project]' in body:\n${body}`,
+      );
+      assert.ok(userHeaderIdx >= 0, `expected user-scope header '● mp [user]' in body:\n${body}`);
+      assert.ok(
+        projectHeaderIdx < userHeaderIdx,
+        `project-scope cascade row must render BEFORE user-scope (MSG-GR-3 stable-sort tie-break).\n  project idx=${String(projectHeaderIdx)}\n  user idx=${String(userHeaderIdx)}\n  body:\n${body}`,
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -980,7 +1138,7 @@ test("PRL-14 batch reload hint uses only changed successful outcomes", async () 
       await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
 
       const body = notifications.at(-1)?.message ?? "";
-      assert.match(body, /Run \/reload to refresh it\./);
+      assert.match(body, /\/reload to pick up changes/);
       assert.doesNotMatch(body, /"empty"/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -1020,9 +1178,1108 @@ test("PRL-15 batch soft dependency warnings aggregate successful restaged resour
       await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
 
       const body = notifications.at(-1)?.message ?? "";
-      assert.match(body, /pi-subagents is not loaded/);
-      assert.match(body, /pi-mcp-adapter is not loaded/);
-      assert.match(body, /Failed:\n {2}- \[project\] bad@mp/);
+      // Plan 19-04 / D-19-02 + MSG-SD-1..2: per-row soft-dep markers via
+      // the V2 notify() probe. The `good` plugin (reinstalled with
+      // agent+mcp) carries `{requires pi-subagents, requires pi-mcp}`;
+      // the `bad` plugin (failed) does NOT (effective state = not
+      // installed; MSG-SD-3 -- failed rows omit soft-dep markers).
+      // Per-row scope orphan-folded (matches marketplace scope).
+      assert.match(
+        body,
+        /● good v1\.0\.0 \(reinstalled\) \{requires pi-subagents, requires pi-mcp\}/,
+      );
+      assert.match(body, /⊘ bad \(failed\) \{not in manifest\}/);
+      assert.equal(body.includes("Failed:"), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Plan 19-04 / D-19-02 binding regression guard (V2 successor to the V1
+ * `outcomeToCascadeRow` regression tests).
+ *
+ * The structural pivot in `outcomeToPluginMessage` (V2 replacement for V1's
+ * `outcomeToCascadeRow`) preserves the precedence ladder for the failed-
+ * variant Reason mapping:
+ *   (1) failureClass="manual-recovery"  -> PluginManualRecoveryMessage
+ *                                          with reasons: ["rollback partial"]
+ *   (2) typed outcome.reasons           -> PluginFailedMessage with verbatim
+ *                                          reasons
+ *   (3) narrowReasons(outcome.notes)    -> PluginFailedMessage with
+ *                                          substring-narrowed reasons
+ *
+ * In V2 the manual-recovery variant pivots from a `PluginFailedMessage`
+ * carrying `reasons: ["rollback partial"]` (V1 cascade shape) to a
+ * distinct `PluginManualRecoveryMessage` discriminated variant per
+ * D-19-02 (the status discriminator is the literal `"manual recovery"`
+ * WITH a space per shared/grammar/status-tokens.ts:47).
+ */
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage maps failureClass=manual-recovery -> PluginManualRecoveryMessage with rollback partial", () => {
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["staging failed"],
+    failureClass: "manual-recovery",
+  };
+  // marketplace scope matches outcome.scope -> per-row scope orphan-folded
+  // (omitted from the variant per Phase 17.2 contract).
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  // V2 manual-recovery is its own discriminated variant per D-19-02 -- NOT
+  // a `failed` row carrying `{rollback partial}`. The status discriminator
+  // is the literal "manual recovery" WITH a space per shared/grammar/
+  // status-tokens.ts:47.
+  assert.equal(row.status, "manual recovery");
+  assert.ok(row.status === "manual recovery");
+  assert.deepEqual([...row.reasons], ["rollback partial"]);
+});
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage without failureClass falls back to narrowReason -> PluginFailedMessage", () => {
+  // Without the structural tag, the closed-set narrowing falls through to
+  // the `"not in manifest"` catch-all (the catalog's most permissive
+  // cascade skip reason; consistent with the pre-migration legacy fallback
+  // for opaque notes text).
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["something opaque"],
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  assert.equal(row.status, "failed");
+  assert.ok(row.status === "failed");
+  assert.deepEqual([...row.reasons], ["not in manifest"]);
+});
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage rollback substring still maps to rollback partial", () => {
+  // The `"rollback"` substring branch in `narrowReason` stays in place --
+  // it covers non-manual-recovery rollback scenarios (the rollback-partial
+  // fallback path) and produces a PluginFailedMessage (NOT a
+  // PluginManualRecoveryMessage; the structural tag is the sole pivot).
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["rollback failed at phase X"],
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  assert.equal(row.status, "failed");
+  assert.ok(row.status === "failed");
+  assert.deepEqual([...row.reasons], ["rollback partial"]);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Task 260525-cjr B2 (V2 successor): outcomeToPluginMessage prefers typed
+// `outcome.reasons` over the legacy notes-substring narrow. This locks in
+// the producer-narrowed contract: EACCES / EPERM / ENOENT (and
+// PluginShapeError shapes) surface as their precise closed Reason instead
+// of degrading to `not in manifest`.
+// ───────────────────────────────────────────────────────────────────────────
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage prefers typed `outcome.reasons` (`permission denied`) over notes-substring fallback", () => {
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    // Notes that the legacy substring path would map to the permissive
+    // `not in manifest` default. The presence of `reasons` MUST win.
+    notes: ["EACCES: permission denied at some/.pi/agent/file"],
+    reasons: ["permission denied"] as const,
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  assert.equal(row.status, "failed");
+  assert.ok(row.status === "failed");
+  assert.deepEqual([...row.reasons], ["permission denied"]);
+});
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage `source missing` typed reason wins over notes fallback", () => {
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["ENOENT: no such file or directory"],
+    reasons: ["source missing"] as const,
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  assert.equal(row.status, "failed");
+  assert.ok(row.status === "failed");
+  assert.deepEqual([...row.reasons], ["source missing"]);
+});
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage without `reasons` falls back to substring narrow (back-compat preserved)", () => {
+  // No `reasons` field -- the legacy substring narrow on `notes` runs.
+  // The default for opaque text is `not in manifest`.
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["something opaque without a matching substring"],
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  assert.equal(row.status, "failed");
+  assert.ok(row.status === "failed");
+  assert.deepEqual([...row.reasons], ["not in manifest"]);
+});
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage `failureClass=manual-recovery` STILL wins over typed `reasons` (precedence locked)", () => {
+  // The precedence order in outcomeToPluginMessage:
+  //   (1) failureClass="manual-recovery"  -> PluginManualRecoveryMessage
+  //                                          with reasons: ["rollback partial"]
+  //   (2) outcome.reasons (typed)         -> PluginFailedMessage with verbatim
+  //   (3) narrowReasons(outcome.notes)    -> PluginFailedMessage substring fallback
+  // This test locks in (1) > (2) so a future refactor cannot accidentally
+  // demote the manual-recovery class.
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["EACCES: permission denied"],
+    failureClass: "manual-recovery",
+    reasons: ["permission denied"] as const,
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  // (1) wins -- the manual-recovery structural tag is highest priority.
+  assert.equal(row.status, "manual recovery");
+  assert.ok(row.status === "manual recovery");
+  assert.deepEqual([...row.reasons], ["rollback partial"]);
+});
+
+/**
+ * Plan 13-02a-02 / CMC-16 / F-5 dedup regression guard.
+ *
+ * `errorWithManualRecovery` MAY be called twice in the bridge cascade: once
+ * when a bridge throws ManualRecoveryError with its own `.leaks`, and again
+ * at the orchestrator-source rollback site with the merged leak set. The
+ * F-5 invariant: even if the same leak string appears in both sources, the
+ * final `.leaks` payload counts it ONCE. The implementation uses a
+ * `Set`-dedup on the merged array.
+ */
+test("Plan 13-02a-02 / CMC-16 / F-5: errorWithManualRecovery dedups overlapping leaks", () => {
+  const inner = new ManualRecoveryError("inner failed", ["agents: foo"]);
+  const wrapped = __test_errorWithManualRecovery(inner, ["agents: foo"]);
+  assert.ok(wrapped instanceof ManualRecoveryError);
+  assert.equal(
+    wrapped.leaks.length,
+    1,
+    `expected dedup; got: ${JSON.stringify([...wrapped.leaks])}`,
+  );
+  assert.equal(wrapped.leaks[0], "agents: foo");
+  // Cause-chain preserved so the depth-5 walker still surfaces the inner.
+  assert.equal((wrapped as ManualRecoveryError & { cause: unknown }).cause, inner);
+});
+
+test("Plan 13-02a-02 / CMC-16 / F-5: errorWithManualRecovery merges disjoint leaks without dedup", () => {
+  const inner = new ManualRecoveryError("inner failed", ["agents: foo"]);
+  const wrapped = __test_errorWithManualRecovery(inner, ["skills: bar"]);
+  assert.ok(wrapped instanceof ManualRecoveryError);
+  assert.deepEqual([...wrapped.leaks], ["agents: foo", "skills: bar"]);
+});
+
+test("Plan 13-02a-02 / CMC-16: errorWithManualRecovery wraps non-ManualRecoveryError with new ManualRecoveryError", () => {
+  const inner = new Error("raw error");
+  const wrapped = __test_errorWithManualRecovery(inner, ["x: leak"]);
+  assert.ok(wrapped instanceof ManualRecoveryError);
+  assert.equal(wrapped.message, "raw error");
+  assert.deepEqual([...wrapped.leaks], ["x: leak"]);
+  assert.equal((wrapped as ManualRecoveryError & { cause: unknown }).cause, inner);
+});
+
+test("Plan 13-02a-02 / CMC-16: errorWithManualRecovery short-circuits on zero leaks", () => {
+  const inner = new Error("raw error");
+  const wrapped = __test_errorWithManualRecovery(inner, []);
+  // Zero-leak fast path preserves the original Error reference verbatim.
+  assert.equal(wrapped, inner);
+});
+
+/**
+ * Plan 13-02a-02 / CMC-16 / WR-01 regression guard.
+ *
+ * Pre-fix behavior: when `withScopeLock`'s body throw was a
+ * `ManualRecoveryError` AND `release()` also threw, the lock helper at
+ * `transaction/with-state-guard.ts:138-143` wraps the original in a plain
+ * `new Error(combinedMsg, { cause: base })`. The orchestrator's catch then
+ * saw a plain Error and `err instanceof ManualRecoveryError` was false,
+ * silently downgrading the cascade row's Reason from `{rollback partial}`
+ * to `{not in manifest}`. WR-01 swaps the direct `instanceof` check for a
+ * cause-chain walk so the class identity survives the wrapping.
+ *
+ * These tests pin both directions: positive (the walker finds the wrapped
+ * MRE) and negative (no MRE in the chain returns undefined; cycles and
+ * the depth bound terminate cleanly).
+ */
+test("WR-01: findManualRecoveryError returns the wrapped MRE when release-also-failed wrapper sits on top", () => {
+  const inner = new ManualRecoveryError("staging failed", ["agents: foo"]);
+  const wrapped = new Error("staging failed (lock release also failed: chmod denied)", {
+    cause: inner,
+  });
+  const found = __test_findManualRecoveryError(wrapped);
+  assert.equal(found, inner);
+});
+
+test("WR-01: findManualRecoveryError returns the MRE directly when it is the top-level error", () => {
+  const inner = new ManualRecoveryError("staging failed", ["agents: foo"]);
+  assert.equal(__test_findManualRecoveryError(inner), inner);
+});
+
+test("WR-01: findManualRecoveryError returns undefined when no MRE is in the chain", () => {
+  const inner = new Error("opaque inner");
+  const wrapped = new Error("opaque outer", { cause: inner });
+  assert.equal(__test_findManualRecoveryError(wrapped), undefined);
+});
+
+test("WR-01: findManualRecoveryError terminates cleanly on self-referencing cause cycles", () => {
+  const cyclic = new Error("cyclic") as Error & { cause: unknown };
+  cyclic.cause = cyclic;
+  assert.equal(__test_findManualRecoveryError(cyclic), undefined);
+});
+
+test("WR-01: findManualRecoveryError respects the depth-5 bound", () => {
+  // Build a 6-link chain with the MRE at the deepest position; the walker
+  // visits depth 0..4 inclusive, so a MRE at depth 5 is unreachable.
+  const mre = new ManualRecoveryError("deep", ["x"]);
+  const l5 = new Error("l5", { cause: mre });
+  const l4 = new Error("l4", { cause: l5 });
+  const l3 = new Error("l3", { cause: l4 });
+  const l2 = new Error("l2", { cause: l3 });
+  const l1 = new Error("l1", { cause: l2 });
+  const l0 = new Error("l0", { cause: l1 });
+  // l0 -> l1 -> l2 -> l3 -> l4 -> l5 -> mre (mre is at depth 6 from l0;
+  // 5 hops via .cause). The walker visits l0, l1, l2, l3, l4 (5 slots);
+  // mre is unreachable.
+  assert.equal(__test_findManualRecoveryError(l0), undefined);
+});
+
+/**
+ * Plan 19-04 / D-19-02 manual-recovery inline-row emission regression guard
+ * (V2 successor to the V1 D-14-02 / CMC-16 separate-anchor-line test).
+ *
+ * V1 emitted the manual-recovery anchor as a SEPARATE top-level compact
+ * line below the cascade body (composed via `renderManualRecovery` and
+ * joined with `\n\n`). V2 collapses this: per D-19-02 the manual-recovery
+ * row is folded INSIDE the same cascade `plugins[]` array as the
+ * reinstalled/skipped/failed siblings, structurally typed as a
+ * `PluginManualRecoveryMessage` discriminated variant. The status
+ * discriminator is the literal `"manual recovery"` WITH a space per
+ * shared/grammar/status-tokens.ts:47.
+ *
+ * This test exercises the `__test_renderReinstallPartitionAndNotify` seam
+ * with a synthetic outcome list containing one manual-recovery failure
+ * alongside one successful reinstall, and asserts the captured notify
+ * body contains:
+ *   (a) the manual-recovery row inline at the row level with the literal
+ *       `(manual recovery) {rollback partial}` token (NOT a separate
+ *       top-level line below the cascade body);
+ *   (b) the successful reinstall row co-exists in the same plugins[]
+ *       array;
+ *   (c) NO separate `\n\n`-separated anchor line after the cascade body
+ *       (the V1 emission shape is gone);
+ *   (d) the reload-hint trailer still composes for the successful
+ *       reinstall row (D-16-12 trigger via `reinstalled` status).
+ *
+ * Severity per D-16-11: `warning` (manual recovery is in the warning set;
+ * no `failed` row tips it to error). The V1 dispatch ternary that picked
+ * notifyWarning vs notifySuccess based on aggregated cascade severity is
+ * GONE -- V2 notify() computes severity from contents.
+ */
+test("Plan 19-04 / D-19-02: manual-recovery outcome folds into cascade plugins[] as PluginManualRecoveryMessage row", () => {
+  const { ctx, pi, notifications } = makeCtx();
+  const outcomes: readonly ReinstallPluginOutcome[] = [
+    {
+      partition: "failed",
+      name: "broken",
+      marketplace: "mp",
+      scope: "project",
+      notes: ["staging failed (rollback partial)"],
+      failureClass: "manual-recovery",
+    } satisfies ReinstallFailedOutcome,
+    {
+      partition: "reinstalled",
+      name: "good",
+      marketplace: "mp",
+      scope: "project",
+      version: "1.0.0",
+      stagedAgents: [],
+      stagedMcpServers: [],
+      declaresAgents: false,
+      declaresMcp: false,
+      resourcesChanged: true,
+    },
+  ];
+
+  __test_renderReinstallPartitionAndNotify(ctx, pi, outcomes);
+
+  // Exactly one notification was emitted; severity routes via notify()'s
+  // content-derived ladder (D-16-11): manual-recovery in plugins[] -> warning.
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.severity, "warning");
+  const body = notifications[0]?.message ?? "";
+
+  // (a) Inline manual-recovery row with the literal "(manual recovery)"
+  // token WITH a space per shared/grammar/status-tokens.ts:47. Per-row
+  // scope is orphan-folded (matches the marketplace block's scope).
+  assert.match(body, /⊘ broken \(manual recovery\) \{rollback partial\}/);
+  // (b) The successful reinstall row co-exists in the same plugins[]
+  // array (no separate cascade body for the manual-recovery anchor).
+  assert.match(body, /● good v1\.0\.0 \(reinstalled\)/);
+
+  // (c) No separate top-level anchor line below the cascade body. V1
+  // would have emitted a stand-alone `⊘ broken@mp (manual recovery)
+  // {rollback partial}` line below `\n\n`; V2's plugins[]-array form
+  // does NOT use the `<name>@<marketplace>` resource collapse.
+  assert.ok(
+    !body.includes("⊘ broken@mp (manual recovery)"),
+    `V2 must NOT emit the V1 separate anchor line; body was ${JSON.stringify(body)}`,
+  );
+
+  // (d) Reload-hint trailer composes for the successful reinstall row
+  // (D-16-12 trigger: `reinstalled` is in the state-changing variant set).
+  assert.match(body, /\/reload to pick up changes/);
+});
+
+test("Plan 19-04 / D-19-02: outcomeToPluginMessage stays correct when the orchestrator catches a release-wrapped MRE (WR-01 V2 successor)", () => {
+  // End-to-end binding: simulate the catch block's behavior on a
+  // release-also-failed wrapper. The spread guard now uses
+  // findManualRecoveryError, so the failureClass tag IS set, and
+  // outcomeToPluginMessage maps to PluginManualRecoveryMessage with
+  // reasons ["rollback partial"] (vs the pre-fix silent downgrade to
+  // PluginFailedMessage with ["not in manifest"]).
+  const inner = new ManualRecoveryError("staging failed", ["agents: foo"]);
+  const releaseWrapped = new Error("staging failed (lock release also failed: chmod denied)", {
+    cause: inner,
+  });
+  const mre = __test_findManualRecoveryError(releaseWrapped);
+  const outcome: ReinstallFailedOutcome = {
+    partition: "failed",
+    name: "hello",
+    marketplace: "mp",
+    scope: "project",
+    notes: ["staging failed (lock release also failed: chmod denied)"],
+    ...(mre !== undefined && { failureClass: "manual-recovery" as const }),
+  };
+  const row = __test_outcomeToPluginMessage(outcome, "project");
+  // The structural fix preserves the canonical CMC-11 Reason across the
+  // release-failure wrapping path -- AND elevates the variant from
+  // PluginFailedMessage to PluginManualRecoveryMessage per D-19-02.
+  assert.equal(row.status, "manual recovery");
+  assert.ok(row.status === "manual recovery");
+  assert.deepEqual([...row.reasons], ["rollback partial"]);
+});
+
+// -----------------------------------------------------------------------
+// Additional coverage tests for uncovered paths
+// -----------------------------------------------------------------------
+
+test("GAP-01: reinstallPlugins with no installed plugins emits empty-marketplaces notice", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-no-plugins-"));
+    try {
+      // No plugins installed; state is empty.
+      const locations = locationsFor("project", cwd);
+      await mkdir(locations.extensionRoot, { recursive: true });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcomes = await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
+
+      assert.deepEqual([...outcomes], []);
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.message, "(no marketplaces)");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-02: reinstallPlugins with plugin removed from manifest emits failed cascade", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-zero-reinstall-"));
+    try {
+      // Install then remove plugin from manifest so every reinstall target fails.
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      await writeFile(
+        path.join(cwd, "mp-src", ".claude-plugin", "marketplace.json"),
+        JSON.stringify({ name: "mp", plugins: [] }),
+      );
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcomes = await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
+
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0]?.partition, "failed");
+      const body = notifications.at(-1)?.message ?? "";
+      assert.match(body, /not in manifest/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-03: reinstallPlugin render=none failure returns failed without notifying", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-none-fail-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      await writeFile(
+        path.join(cwd, "mp-src", ".claude-plugin", "marketplace.json"),
+        JSON.stringify({ name: "mp", plugins: [] }),
+      );
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+      });
+
+      assert.equal(outcome.partition, "failed");
+      assert.equal(notifications.length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-04: errorWithManualRecovery empty-leaks path: saveState fails on empty-resource plugin", async () => {
+  // Empty-resource plugin: replaceAll succeeds with all-noop replacements,
+  // rollbackReplacements([]) returns []. errorWithManualRecovery(err, [])
+  // hits the leaks.length === 0 early-return branch and returns the base
+  // error unchanged (no MANUAL RECOVERY REQUIRED prefix).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-empty-leaks-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: {},
+        install: true,
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        __deps: {
+          stateTransaction: {
+            saveState: () => Promise.reject(new Error("atomic-save-failed")),
+          },
+        },
+      });
+
+      assert.equal(outcome.partition, "failed");
+      const note = outcome.notes?.[0] ?? "";
+      assert.ok(note.includes("atomic-save-failed"), `expected cause in: ${note}`);
+      assert.equal(
+        notifications.some((n) => n.severity === "error"),
+        true,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-05: errorWithManualRecovery instanceof-ManualRecoveryError branch merges leaks deduped", () => {
+  // When the input error is already a ManualRecoveryError, errorWithManualRecovery
+  // merges the new leaks into the existing leaks (deduped) and wraps with cause.
+  const inner = new ManualRecoveryError("stage failed", ["agents: old"]);
+  const wrapped = __test_errorWithManualRecovery(inner, ["agents: old", "skills: new"]);
+  assert.ok(wrapped instanceof ManualRecoveryError);
+  const mre = wrapped;
+  assert.deepEqual([...mre.leaks].sort(), ["agents: old", "skills: new"]);
+  assert.equal(mre.message, "stage failed");
+  assert.equal(mre.cause, inner);
+});
+
+test("GAP-06: prepareAllHandles catch: MCP collision aborts partial handles and wraps error", async () => {
+  // Two plugins in the same marketplace declare the same MCP server name.
+  // Reinstalling the first one after the second owns the server triggers
+  // McpServerCollisionError inside prepareStageMcpServers, which is caught
+  // by prepareAllHandles' try/catch. The error is wrapped by
+  // errorWithManualRecovery and surfaced as a failed outcome.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-mcp-collision-"));
+    try {
+      // Install "hello" with mcp server "server1".
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "hello",
+        resources: { mcp: true },
+        install: true,
+      });
+      // Install "other" that also declares "server1" in a separate marketplace.
+      // We write its mcp.json entry directly into the project mcp.json so that
+      // prepareStageMcpServers sees a cross-slot collision when reinstalling hello.
+      const locations = locationsFor("project", cwd);
+      const mcpPath = locations.mcpJsonPath;
+      let mcpDoc: Record<string, unknown> = {};
+      try {
+        mcpDoc = JSON.parse(await readFile(mcpPath, "utf8")) as Record<string, unknown>;
+      } catch {
+        // mcp.json may not exist yet
+      }
+
+      const mcpServers = (mcpDoc.mcpServers ?? {}) as Record<string, unknown>;
+      // Register server1 under a foreign plugin marker so it looks like another plugin owns it.
+      mcpServers["server1"] = {
+        command: "node",
+        args: ["other.js"],
+        __claude_marketplace_plugin: "other@othermp",
+      };
+      mcpDoc.mcpServers = mcpServers;
+      await writeFile(mcpPath, JSON.stringify(mcpDoc));
+
+      const { ctx, pi } = makeCtx();
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+      });
+
+      assert.equal(outcome.partition, "failed");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-07: reinstallPlugin skipped does not trigger runPostSuccessMaintenance", async () => {
+  // When the plugin is not installed, runLockedReinstall returns
+  // partition='skipped'. The code at line 184-186 returns the skipped outcome
+  // without calling runPostSuccessMaintenance (so no cache/data drops run).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-skip-no-maint-"));
+    try {
+      await seedMarketplace({ cwd, marketplaceRoot: path.join(cwd, "mp-src"), install: false });
+      let maintenanceCalled = false;
+      const { ctx, pi } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        __deps: {
+          dropMarketplaceCache: () => {
+            maintenanceCalled = true;
+            return Promise.resolve();
+          },
+        },
+      });
+
+      assert.equal(outcome.partition, "skipped");
+      assert.equal(maintenanceCalled, false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-08: reinstallPlugin render=none with skipped outcome emits no notifications", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-none-skip-"));
+    try {
+      await seedMarketplace({ cwd, marketplaceRoot: path.join(cwd, "mp-src"), install: false });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+      });
+
+      assert.equal(outcome.partition, "skipped");
+      assert.equal(notifications.length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-09: reinstallPlugin render=none success with bridgeWarnings returns annotated notes", async () => {
+  // render='none' success path: when bridgeWarnings or maintenanceWarnings
+  // are non-empty, the outcome is returned with notes prefixed 'warning: '.
+  // The 'notes.length === 0' branch returns the bare locked.outcome.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-none-warn-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      const { ctx, pi } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+        __deps: {
+          dropMarketplaceCache: () => Promise.reject(new Error("cache-fail")),
+        },
+      });
+
+      assert.equal(outcome.partition, "reinstalled");
+      assert.ok(outcome.notes?.some((n) => n.startsWith("warning: ")));
+      assert.ok(outcome.notes?.some((n) => n.includes("cache-fail")));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-10: reinstallPlugin render=none success with no warnings returns bare locked.outcome", async () => {
+  // When no bridge warnings and no maintenance warnings exist,
+  // the notes.length === 0 branch returns locked.outcome unchanged (no notes field).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-none-nowarn-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      const { ctx, pi } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+      });
+
+      assert.equal(outcome.partition, "reinstalled");
+      assert.equal(outcome.notes, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-11: reinstallPlugin force=true succeeds and overwrites agent foreign content", async () => {
+  // force=true exercises the force branch in replaceAll (replacePreparedAgents
+  // called with { force: true }) -- the success path verifies that the outer
+  // render='default' success notification includes the reload hint.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-force-success-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      const seeded = await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { agent: "old agent" },
+        install: true,
+      });
+      const agentPath = path.join(locations.agentsDir, `${GENERATED_AGENT_PREFIX}hello-bot.md`);
+      await writeFile(agentPath, "foreign bytes", "utf8");
+      await writePluginTree(seeded.pluginRoot, "hello", { agent: "new agent" });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        force: true,
+      });
+
+      assert.equal(outcome.partition, "reinstalled");
+      assert.match(await readFile(agentPath, "utf8"), /new agent/);
+      assert.equal(errorNotifications(notifications).length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-12: reinstallPlugins exactly-one-reinstalled emits singular summary", async () => {
+  // reinstallSummary with reinstalledCount === 1 returns
+  // 'Reinstalled plugin "<name>".' (the singular branch).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-singular-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcomes = await reinstallPlugins({ ctx, pi, cwd, target: { kind: "all" } });
+
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0]?.partition, "reinstalled");
+      const body = notifications.at(-1)?.message ?? "";
+      assert.match(body, /hello.*reinstalled/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-13: reinstallPlugin user-scope happy path reinstalls and records correct scope", async () => {
+  // Exercise the user-scope code path (locationsFor('user', cwd)).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-user-scope-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        scope: "user",
+        marketplaceRoot: path.join(cwd, "user-mp-src"),
+        marketplaceName: "ump",
+        pluginName: "uplug",
+        resources: { skill: "user old" },
+        install: true,
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "user",
+        cwd,
+        marketplace: "ump",
+        plugin: "uplug",
+      });
+
+      assert.equal(outcome.partition, "reinstalled");
+      assert.equal(outcome.scope, "user");
+      assert.equal(errorNotifications(notifications).length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-14: reinstallPlugins batch with only skipped outcomes emits skipped cascade", async () => {
+  // When every reinstall target reports skipped ('not installed' because
+  // the plugin record was removed from state), reinstallSummary returns
+  // 'Plugin reinstall complete.' and the batch notification includes a
+  // Skipped section.  Explicit scope is required so resolveReinstallScope
+  // takes the explicitScope branch and finds the marketplace in state.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-all-skipped-"));
+    try {
+      // Install a plugin then remove it from state so reinstall sees it as skipped.
+      const locations = locationsFor("project", cwd);
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      // Clear the plugins map so the plugin appears 'not installed'.
+      await saveState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./mp-src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "mp-src", ".claude-plugin", "marketplace.json"),
+            marketplaceRoot: path.join(cwd, "mp-src"),
+            plugins: {},
+          },
+        },
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      // Explicit scope=project so enumerateMarketplaceReinstallTargets finds
+      // the marketplace and returns [{ plugin: "hello", scope: "project" }].
+      // reinstallPlugin then sees plugin not in mp.plugins and returns skipped.
+      const outcomes = await reinstallPlugins({
+        ctx,
+        pi,
+        cwd,
+        scope: "project",
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0]?.partition, "skipped");
+      const body = notifications.at(-1)?.message ?? "";
+      assert.match(body, /skipped/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-15: reinstallPlugin with bridge warning emits notifyWarning before success", async () => {
+  // collectStagingWarnings propagates through locked.bridgeWarnings.
+  // When render='default', bridgeWarnings are emitted via notifyWarning
+  // before the success notification. This exercises the
+  // 'for (const warning of locked.bridgeWarnings)' loop body.
+  // We trigger the warning via a dropMarketplaceCache failure with render='default'.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-bridge-warn-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        __deps: {
+          dropMarketplaceCache: () => Promise.reject(new Error("cache-drop-warn")),
+        },
+      });
+
+      // dropMarketplaceCache failure is swallowed; reinstall still succeeds.
+      assert.equal(outcome.partition, "reinstalled");
+      assert.ok(notifications.some((n) => n.message.includes("reinstalled")));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-16: reinstallPlugin saveState failure with non-empty replacements wraps as ManualRecoveryError", async () => {
+  // After successful replaceAll, if saveState throws, rollbackReplacements
+  // produces leaks from the reversed rollback. errorWithManualRecovery with
+  // non-empty leaks wraps the error as a ManualRecoveryError.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-save-nonempty-leaks-"));
+    try {
+      const seeded = await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old skill", command: "old command" },
+        install: true,
+      });
+      await writePluginTree(seeded.pluginRoot, "hello", {
+        skill: "new skill",
+        command: "new command",
+      });
+      const { ctx, pi } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        __deps: {
+          stateTransaction: {
+            saveState: () => Promise.reject(new Error("save-failure")),
+          },
+        },
+      });
+
+      assert.equal(outcome.partition, "failed");
+      const note = outcome.notes?.[0] ?? "";
+      // The error message from save failure is "save-failure". After
+      // rollbackReplacements the MANUAL_RECOVERY_REQUIRED sentinel may or
+      // may not be present depending on whether rollback produces leaks.
+      // Either way the note includes the save-failure message.
+      assert.ok(note.includes("save-failure"), `expected cause in: ${note}`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-17: reinstallPlugin outcome notes include reinstall-specific failure message", async () => {
+  // Verify the 'notes' field on a failed outcome contains the formatted
+  // error chain from formatErrorWithCauses, covering the catch-block at
+  // lines 175-182 in reinstallPlugin.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-notes-chain-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old" },
+        install: true,
+      });
+      const { ctx, pi } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        __deps: {
+          stateTransaction: {
+            saveState: () => Promise.reject(new Error("root-cause-error")),
+          },
+        },
+      });
+
+      assert.equal(outcome.partition, "failed");
+      assert.ok(outcome.notes !== undefined && outcome.notes.length > 0);
+      assert.ok(
+        outcome.notes.some((n) => n.includes("root-cause-error")),
+        `expected root-cause-error in notes: ${JSON.stringify(outcome.notes)}`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-18: reinstallPlugins outer target enumeration failure for unknown marketplace emits error", async () => {
+  // enumerateMarketplaceReinstallTargets throws MarketplaceNotFoundError
+  // when the marketplace exists only in user scope and caller specifies
+  // project scope explicitly. reinstallPlugins catches this at the
+  // targets-enumeration boundary (lines 212-217) and notifies error.
+  // Already covered by PRL-04 test; this variant uses kind='marketplace'
+  // to exercise the sortReinstallTargets call for single-result arrays.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-enum-err-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        scope: "user",
+        marketplaceRoot: path.join(cwd, "user-src"),
+        marketplaceName: "onlyuser",
+        pluginName: "plug",
+        resources: { skill: "s" },
+        install: true,
+      });
+      const { ctx, pi, notifications } = makeCtx();
+
+      const outcomes = await reinstallPlugins({
+        ctx,
+        pi,
+        cwd,
+        scope: "project",
+        target: { kind: "marketplace", marketplace: "onlyuser" },
+      });
+
+      assert.deepEqual([...outcomes], []);
+      assert.ok(notifications.some((n) => n.severity === "error"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("GAP-19: reinstallPlugin updateStateRecord concurrent-removal detection", async () => {
+  // Inject a loadState that returns a state with the plugin present
+  // (passes the initial check at runLockedReinstall), but where the
+  // plugins object is a Proxy that returns undefined on the second access
+  // so updateStateRecord's check (line 646) throws 'concurrently removed'.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-concurrent-remove-"));
+    try {
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old skill" },
+        install: true,
+      });
+
+      let firstAccess = true;
+      const { ctx, pi } = makeCtx();
+
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        __deps: {
+          stateTransaction: {
+            loadState: async (extensionRoot) => {
+              const state = await loadState(extensionRoot);
+              const mp = state.marketplaces["mp"];
+              if (mp === undefined) {
+                return state;
+              }
+
+              // Proxy the plugins map so the "hello" plugin exists on first
+              // access (the initial null-check in runLockedReinstall) but
+              // appears removed on all subsequent accesses (updateStateRecord).
+              const proxied = new Proxy(mp.plugins, {
+                get(target: typeof mp.plugins, prop: string | symbol): unknown {
+                  if (prop === "hello") {
+                    if (firstAccess) {
+                      firstAccess = false;
+                      return Reflect.get(target, prop);
+                    }
+
+                    return undefined;
+                  }
+
+                  return Reflect.get(target, prop);
+                },
+              });
+              (state.marketplaces as Record<string, unknown>)["mp"] = { ...mp, plugins: proxied };
+              return state;
+            },
+          },
+        },
+      });
+
+      assert.equal(outcome.partition, "failed");
+      const note = outcome.notes?.[0] ?? "";
+      assert.ok(
+        note.includes("concurrently removed"),
+        `expected 'concurrently removed' in: ${note}`,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

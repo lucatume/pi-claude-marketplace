@@ -2,38 +2,88 @@
 //
 // MAU-1, MAU-2, MAU-3, MAU-4 + SC-6 + NFR-5.
 //
-// Single orchestrator parameterized by `enable: boolean`. The edge
-// layer (Phase 6) maps `marketplace autoupdate` -> enable=true and
-// `marketplace noautoupdate` -> enable=false.
+// Each orchestration emits a single
+// notify(opts.ctx, opts.pi, { marketplaces: [...] }) call. Outcomes map to
+// the 7-entry MarketplaceStatus grammar (+ optional `reasons?:`):
+//
+//  - enable fresh -> status: "autoupdate enabled"
+//  -> `● <mp> [<scope>] <autoupdate>`
+//  - disable fresh -> status: "autoupdate disabled"
+//  -> `● <mp> [<scope>] <no autoupdate>`
+//  - enable idempotent -> status: "skipped", reasons: ["already autoupdate"]
+//  -> `● <mp> [<scope>] <autoupdate> {already autoupdate}`
+//  severity: "warning"
+//  - disable idempotent -> status: "skipped", reasons: ["already no autoupdate"]
+//  -> `● <mp> [<scope>] <no autoupdate> {already no autoupdate}`
+//  severity: "warning"
+//  - failure (not-found) -> status: "failed"
+//  -> `⊘ <mp> [<scope>] (failed)`
+//  severity: "error"
+//  - empty scopes -> marketplaces: []
+//  -> `(no marketplaces)` sentinel
+//
+// None of these emit the `/reload to pick up changes` trailer:
+// `shouldEmitReloadHint` fires only on a PLUGIN row with a state-changing
+// status (installed/updated/reinstalled/uninstalled), and an autoupdate flip
+// changes a marketplace record, not a Pi-visible resource (SNM-33).
+//
+// UXG-04 / MSG-GR-5 (reverses the Phase 17.1 / D-18-05 status-token design):
+// the marker-as-outcome row form (`● <mp> [<scope>] <autoupdate>` /
+// `<no autoupdate>`) IS NOW the emitted form on the flip surface, for byte-form
+// parity with the marketplace-list surface header. Fresh flips render the bare
+// marker; idempotent flips render the marker + the `{already autoupdate}` /
+// `{already no autoupdate}` brace. The renderer (shared/notify.ts) owns the
+// byte composition; per CLAUDE.md IL-2 all output still flows through notify().
+// Strategy B: the `autoupdate enabled` / `autoupdate disabled` / `skipped`
+// MarketplaceStatus discriminators are UNCHANGED -- only the emitted bytes and
+// the two renamed REASONS members (`already autoupdate` / `already no
+// autoupdate`) differ.
+//
+// Single orchestrator parameterized by `enable: boolean`. The edge layer maps
+// `marketplace autoupdate` -> enable=true and `marketplace noautoupdate` ->
+// enable=false.
 //
 // Flow:
-//   scopes = opts.scope !== undefined ? [opts.scope] : ["user", "project"]   // SC-6
-//   for each scope:
-//     withStateGuard(locations, async (state) => {
-//       result = applyAutoupdateFlipInPlace(state, opts.name, opts.enable)  // MAU-1, MAU-3, MAU-4
-//     })  // saves state.json on no-throw
-//     accumulate result.changed[] and result.unchanged[] across scopes
+//  scopes = opts.scope !== undefined ? [opts.scope] : ["project", "user"] // SC-6
+//  for each scope:
+//  withStateGuard(locations, async (state) => {
+//  result = applyAutoupdateFlipInPlace(state, opts.name, opts.enable) // MAU-1, MAU-3, MAU-4
+//  }) // saves state.json on no-throw
+//  accumulate result.changed[] and result.unchanged[] across scopes
 //
-//   compose user-visible message:
-//     - changed   non-empty: "Enabled autoupdate: <names>." or "Disabled autoupdate: <names>."
-//     - unchanged non-empty: "Already enabled: <names>." or "Already disabled: <names>."   // MAU-3
-//     - both empty (single-name not found in any scope): MarketplaceNotFoundError surfaces from applyAutoupdateFlipInPlace
+//  compose one MarketplaceNotificationMessage per outcome; emit ONE
+//  notify(opts.ctx, opts.pi,...) call. The caller-supplied order is honored
+//  end-to-end; the SC-6 scopes-loop order (project-then-user) is the visible
+//  iteration order. No alphabetic sort -- the renderer does not sort and the
+//  orchestrator must not re-sort.
 //
 // NFR-5: zero git surface -- autoupdate never imports platform/git
 // or DEFAULT_GIT_OPS.
 
 import { locationsFor } from "../../persistence/locations.ts";
-import { errorMessage, MarketplaceNotFoundError } from "../../shared/errors.ts";
-import { notifyError, notifySuccess } from "../../shared/notify.ts";
+import { errorMessage, MarketplaceNotFoundError, StateLockHeldError } from "../../shared/errors.ts";
+import { notify } from "../../shared/notify.ts";
 import { withStateGuard } from "../../transaction/with-state-guard.ts";
 
 import { applyAutoupdateFlipInPlace } from "./shared.ts";
 
-import type { ExtensionContext } from "../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
+import type {
+  MarketplaceNotificationMessage,
+  PluginFailedMessage,
+  Reason,
+} from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
 
 export interface AutoupdateOptions {
   readonly ctx: ExtensionContext;
+  /**
+   * Soft-dep probe target, consumed by the `notify(ctx, pi, message)` calls
+   * below to drive the single per-invocation soft-dep probe -- even though
+   * mp-level rows never inject soft-dep markers, the probe is threaded through
+   * every notify entry for invariant symmetry.
+   */
+  readonly pi: ExtensionAPI;
   /** When undefined, flip every marketplace in target scope(s). */
   readonly name?: string;
   /** true -> autoupdate; false -> noautoupdate. */
@@ -48,28 +98,50 @@ function shouldCollectNotFound(opts: AutoupdateOptions, err: unknown): boolean {
   return opts.name !== undefined && err instanceof MarketplaceNotFoundError;
 }
 
+interface AutoupdateFlipRow {
+  readonly name: string;
+  readonly scope: Scope;
+  readonly alreadyMatching: boolean;
+}
+
 function missingEverywhere(
   opts: AutoupdateOptions,
   result: {
-    readonly changed: readonly string[];
-    readonly unchanged: readonly string[];
+    readonly rows: readonly AutoupdateFlipRow[];
     readonly errors: readonly unknown[];
     readonly scopes: readonly Scope[];
   },
 ): boolean {
   return (
     opts.name !== undefined &&
-    result.changed.length === 0 &&
-    result.unchanged.length === 0 &&
+    result.rows.length === 0 &&
     result.errors.length === result.scopes.length
   );
 }
 
-export async function setMarketplaceAutoupdate(opts: AutoupdateOptions): Promise<void> {
-  const scopes: readonly Scope[] = opts.scope === undefined ? ["user", "project"] : [opts.scope];
+/**
+ * Builds the synthetic failed-plugin child that carries the underlying
+ * autoupdate-flip error to the user. The marketplace header alone cannot
+ * carry a cause (SNM-10), so the child's `cause` drives the renderer's
+ * depth-5 cause-chain trailer. A held state lock narrows to the `lock held`
+ * reason (its message carries the retry hint); anything else falls back to
+ * the permissive `not found`.
+ */
+function autoupdateFailedRow(name: string, err: unknown): PluginFailedMessage {
+  const reasons: readonly Reason[] =
+    err instanceof StateLockHeldError ? (["lock held"] as const) : (["not found"] as const);
+  return {
+    status: "failed",
+    name,
+    reasons,
+    cause: err instanceof Error ? err : new Error(errorMessage(err)),
+  };
+}
 
-  const overallChanged: string[] = [];
-  const overallUnchanged: string[] = [];
+export async function setMarketplaceAutoupdate(opts: AutoupdateOptions): Promise<void> {
+  const scopes: readonly Scope[] = opts.scope === undefined ? ["project", "user"] : [opts.scope];
+
+  const rows: AutoupdateFlipRow[] = [];
   const errors: { scope: Scope; cause: unknown }[] = [];
 
   for (const scope of scopes) {
@@ -80,8 +152,13 @@ export async function setMarketplaceAutoupdate(opts: AutoupdateOptions): Promise
         // plain changed/unchanged arrays. The guard saves on no-throw.
         return applyAutoupdateFlipInPlace(state, opts.name, opts.enable);
       });
-      overallChanged.push(...result.changed);
-      overallUnchanged.push(...result.unchanged);
+      for (const name of result.changed) {
+        rows.push({ name, scope, alreadyMatching: false });
+      }
+
+      for (const name of result.unchanged) {
+        rows.push({ name, scope, alreadyMatching: true });
+      }
     } catch (err) {
       // For single-name flips: applyAutoupdateFlipInPlace throws
       // MarketplaceNotFoundError when the name is absent from THIS
@@ -89,7 +166,24 @@ export async function setMarketplaceAutoupdate(opts: AutoupdateOptions): Promise
       // lives in the OTHER scope; we collect and only surface if BOTH
       // scopes failed AND no flips happened anywhere.
       if (!shouldCollectNotFound(opts, err)) {
-        notifyError(opts.ctx, errorMessage(err), err);
+        // A non-NotFound autoupdate-flip failure renders as the header
+        // `⊘ <name> [<scope>] (failed)`. The MarketplaceNotificationMessage
+        // shape carries no `cause` (SNM-10 confines `cause` to plugin-level
+        // variants), so surface the underlying error -- notably
+        // StateLockHeldError, whose message carries an actionable retry
+        // hint -- via a synthetic failed-plugin child whose `cause` drives
+        // the depth-5 cause-chain trailer the renderer appends.
+        const failureName = opts.name ?? "(unknown)";
+        notify(opts.ctx, opts.pi, {
+          marketplaces: [
+            {
+              name: failureName,
+              scope,
+              status: "failed",
+              plugins: [autoupdateFailedRow(failureName, err)],
+            },
+          ],
+        });
         return;
       }
 
@@ -98,46 +192,66 @@ export async function setMarketplaceAutoupdate(opts: AutoupdateOptions): Promise
   }
 
   // If a single-name flip was requested but the name was missing
-  // from EVERY iterated scope (no changed/unchanged accumulated and
-  // every scope errored), surface as a single error.
-  if (
-    missingEverywhere(opts, {
-      changed: overallChanged,
-      unchanged: overallUnchanged,
-      errors,
-      scopes,
-    })
-  ) {
+  // from EVERY iterated scope (no row accumulated and every scope
+  // errored), surface as a single failure marketplace row.
+  if (missingEverywhere(opts, { rows, errors, scopes })) {
     const first = errors[0];
     if (first !== undefined) {
-      notifyError(opts.ctx, errorMessage(first.cause), first.cause);
+      // Failure path: emit a single failed marketplace row for the scope
+      // where the first not-found was observed.
+      const failureName = opts.name ?? "(unknown)";
+      notify(opts.ctx, opts.pi, {
+        marketplaces: [
+          {
+            name: failureName,
+            scope: first.scope,
+            status: "failed",
+            plugins: [],
+          },
+        ],
+      });
     }
 
     return;
   }
 
-  // Compose success message. MAU-3 idempotent reporting.
-  const verbDone = opts.enable ? "Enabled" : "Disabled";
-  const verbAlready = opts.enable ? "enabled" : "disabled";
-
-  const lines: string[] = [];
-  if (overallChanged.length > 0) {
-    // Sort for deterministic output (Open Question 2: alphabetical).
-    const sorted = [...overallChanged].sort((a, b) => a.localeCompare(b));
-    lines.push(`${verbDone} autoupdate: ${sorted.join(", ")}.`);
-  }
-
-  if (overallUnchanged.length > 0) {
-    const sorted = [...overallUnchanged].sort((a, b) => a.localeCompare(b));
-    lines.push(`Already ${verbAlready}: ${sorted.join(", ")}.`);
-  }
-
-  // Bare form across both empty scopes: parallel to MU-1 silent
-  // succeed semantics.
-  if (lines.length === 0) {
-    notifySuccess(opts.ctx, "No marketplaces configured.");
+  // Empty marketplaces[] -> notify emits the `(no marketplaces)` sentinel
+  // verbatim. No orchestrator-side composition.
+  if (rows.length === 0) {
+    notify(opts.ctx, opts.pi, { marketplaces: [] });
     return;
   }
 
-  notifySuccess(opts.ctx, lines.join("\n"));
+  // NotificationMessage construction recipe:
+  // - One MarketplaceNotificationMessage per outcome, emitted via ONE
+  //   notify(opts.ctx, opts.pi, ...) call; `plugins: []` is required.
+  // - Discriminator: mp.status drawn from { "autoupdate enabled",
+  //   "autoupdate disabled", "skipped" }; idempotent flips additionally carry
+  //   `reasons: ["already autoupdate" | "already no autoupdate"]`.
+  // - Severity (info / warning) and `/reload to pick up changes` are computed
+  //   by notify(); callers MUST NOT compose.
+  // - Caller order is honored end-to-end -- the SC-6 scopes-loop order is the
+  //   visible iteration order. NO alphabetic sort here.
+  // - Reference: catalog UAT fixtures `enable-fresh`, `disable-fresh`,
+  //   `enable-idempotent`, `disable-idempotent`.
+  const marketplaces: MarketplaceNotificationMessage[] = rows.map((row) => {
+    if (row.alreadyMatching) {
+      return {
+        name: row.name,
+        scope: row.scope,
+        status: "skipped",
+        reasons: [opts.enable ? "already autoupdate" : "already no autoupdate"],
+        plugins: [],
+      };
+    }
+
+    return {
+      name: row.name,
+      scope: row.scope,
+      status: opts.enable ? "autoupdate enabled" : "autoupdate disabled",
+      plugins: [],
+    };
+  });
+
+  notify(opts.ctx, opts.pi, { marketplaces });
 }

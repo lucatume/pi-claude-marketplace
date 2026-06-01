@@ -5,8 +5,14 @@ import path from "node:path";
 import test from "node:test";
 
 import { pathSource } from "../../../extensions/pi-claude-marketplace/domain/source.ts";
-import { removeMarketplace } from "../../../extensions/pi-claude-marketplace/orchestrators/marketplace/remove.ts";
-import { cascadeUnstagePlugin } from "../../../extensions/pi-claude-marketplace/orchestrators/marketplace/shared.ts";
+import {
+  __test_narrowCascadeFailure,
+  removeMarketplace,
+} from "../../../extensions/pi-claude-marketplace/orchestrators/marketplace/remove.ts";
+import {
+  AgentsUnstageFailureError,
+  cascadeUnstagePlugin,
+} from "../../../extensions/pi-claude-marketplace/orchestrators/marketplace/shared.ts";
 import { locationsFor } from "../../../extensions/pi-claude-marketplace/persistence/locations.ts";
 import {
   loadState,
@@ -144,10 +150,11 @@ test("MR-1: same name in both scopes without --scope removes project-scope recor
       const projAfter = await loadState(projLoc.extensionRoot);
       assert.ok("dup-name" in userAfter.marketplaces, "user-scope record untouched");
       assert.ok(!("dup-name" in projAfter.marketplaces), "project-scope record removed");
-      assert.match(
-        notifications[0]?.message ?? "",
-        /Removed marketplace "dup-name" from project scope/,
-      );
+      // SNM-33 / D-22-01 / D-22-02: an EMPTY marketplace remove (no plugins
+      // staged) carries no `(uninstalled)` rows, so the body is header-only
+      // with NO `/reload` trailer (G-MIL-02). The trailer fires only when at
+      // least one plugin row carries a state-change token.
+      assert.equal(notifications[0]?.message, "● dup-name [project] (removed)");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -179,10 +186,8 @@ test("MR-1: name only in user scope without --scope removes user-scope record", 
 
       const userAfter = await loadState(userLoc.extensionRoot);
       assert.ok(!("user-only" in userAfter.marketplaces), "user-scope record removed");
-      assert.match(
-        notifications[0]?.message ?? "",
-        /Removed marketplace "user-only" from user scope/,
-      );
+      // SNM-33 / D-22-01: empty remove (no plugins) is header-only, no trailer.
+      assert.equal(notifications[0]?.message, "● user-only [user] (removed)");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -227,7 +232,7 @@ test("MR-1: same name in both scopes WITH --scope=user removes only user-scope r
 
 // MR-2 + MR-8 (RH-1) -----------------------------------------------
 
-test("MR-2 + MR-8 (RH-1): empty marketplace removed cleanly emits success WITHOUT reload hint", async () => {
+test("MR-2 + SNM-33 / D-22-02: empty marketplace removed cleanly emits success with NO reload-hint (G-MIL-02)", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "mp-remove-"));
     try {
@@ -254,17 +259,21 @@ test("MR-2 + MR-8 (RH-1): empty marketplace removed cleanly emits success WITHOU
       assert.equal("empty" in after.marketplaces, false);
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]!.severity, undefined); // success, default severity
-      assert.equal(notifications[0]!.message.includes("Run /reload to "), false);
-      assert.match(notifications[0]!.message, /Removed marketplace "empty" from project scope\./);
+      // SNM-33 / D-22-02 (G-MIL-02): an empty marketplace remove carries no
+      // `(uninstalled)` rows, so the body is header-only with NO trailer. The
+      // trailer is reserved for true Pi-visible state changes (plugin rows).
+      assert.equal(notifications[0]!.message.includes("/reload to pick up changes"), false);
+      // SNM-33 / D-22-02 clean form: bare `● <mp> [<scope>] (removed)` header.
+      assert.equal(notifications[0]!.message, "● empty [project] (removed)");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 });
 
-// MR-8 + RH-2 -------------------------------------------------------
+// MR-8 + MSG-RH-1 ---------------------------------------------------
 
-test("MR-8 + RH-2: plugin whose skill is staged emits reload hint with alphabetical names", async () => {
+test("MR-8 + MSG-RH-1: plugin whose skill is staged emits the canonical reload hint trailer", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "mp-remove-"));
     try {
@@ -300,8 +309,8 @@ test("MR-8 + RH-2: plugin whose skill is staged emits reload hint with alphabeti
       await removeMarketplace({ ctx, pi, name: "mp", scope: "project", cwd });
 
       assert.equal(notifications.length, 1);
-      // Alphabetical: alpha first, then hello.
-      assert.match(notifications[0]!.message, /Run \/reload to drop "alpha", "hello"\.$/);
+      // MSG-RH-1: the canonical trailer no longer interpolates names.
+      assert.match(notifications[0]!.message, /\/reload to pick up changes$/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -324,9 +333,9 @@ test("NFR-5: remove for a path-source marketplace makes no network calls", async
   assert.equal(src.includes("gitOps"), false);
 });
 
-// MR-4 (single aggregated warning, canonical trailer) --------------
+// MR-4 (single V2 cascade notification, severity=error) ------------
 
-test("MR-4: cascade failure produces ONE aggregated warning ending with the canonical trailer", async () => {
+test("MR-4: cascade failure produces ONE V2 notification with severity=error (D-16-11)", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "remove-mr4-"));
     try {
@@ -379,14 +388,12 @@ test("MR-4: cascade failure produces ONE aggregated warning ending with the cano
         cascade: stubCascade,
       });
 
-      // Exactly ONE notification, severity 'warning', ending with the canonical trailer.
-      assert.equal(notifications.length, 1, "exactly one aggregated notification");
-      assert.equal(notifications[0]!.severity, "warning", "severity must be warning");
-      assert.match(
-        notifications[0]!.message,
-        /Fix the underlying issue and retry\.?$/,
-        "must end with canonical trailer",
-      );
+      // Exactly ONE V2 notification, severity=error (any plugin/mp failed
+      // routes to error per D-16-11; the V1 free-text retry-anchor
+      // ("Fix the underlying issue and retry.") is DROPPED per D-17-09 /
+      // D-18-03 -- it has no V2 catalog representation).
+      assert.equal(notifications.length, 1, "exactly one V2 notification");
+      assert.equal(notifications[0]!.severity, "error", "severity must be error");
 
       // MR-7: record retained when any plugin failed.
       const after = await loadState(locations.extensionRoot);
@@ -597,4 +604,46 @@ test("D-03-INV :: remove unlinks the plugin cache file and invalidates marketpla
       await rm(cwd, { recursive: true, force: true });
     }
   });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Quick task 260525-aub: discriminated-dispatch regression guards on the
+// per-plugin cascade-failure narrowing. Locks in the typed dispatch
+// (`instanceof AgentsUnstageFailureError` + `NodeJS.ErrnoException.code`)
+// so a future refactor cannot regress to message-text substring matching.
+// ───────────────────────────────────────────────────────────────────────────
+
+test("narrowCascadeFailure: NodeJS.ErrnoException code=EACCES -> {permission denied}", () => {
+  // Phase 13 Wave 3 plan 13-03-01 added `permission denied` to the closed
+  // REASONS set; this typed dispatch produces it without substring matching
+  // English error text (which varies across Node versions per NFR-4).
+  const errnoLike = Object.assign(new Error("permission denied: /agents/foo.md"), {
+    code: "EACCES",
+  });
+  assert.equal(__test_narrowCascadeFailure(errnoLike), "permission denied");
+});
+
+test("narrowCascadeFailure: NodeJS.ErrnoException code=ENOENT -> {source missing}", () => {
+  const errnoLike = Object.assign(new Error("no such file"), { code: "ENOENT" });
+  assert.equal(__test_narrowCascadeFailure(errnoLike), "source missing");
+});
+
+test("narrowCascadeFailure: AgentsUnstageFailureError -> {not in manifest} (documented fallback)", () => {
+  const err = new AgentsUnstageFailureError("agents leak", [
+    { generatedName: "foo", targetPath: "/agents/foo.md", reason: "EACCES" },
+  ]);
+  assert.equal(__test_narrowCascadeFailure(err), "not in manifest");
+});
+
+test("narrowCascadeFailure: arbitrary bare Error with 'unreadable' substring -> {unreadable} (defensive textual fallback)", () => {
+  // The textual fallback is retained ONLY as a defense-in-depth last
+  // resort for bridges that throw bare `Error`. Documented as transitional
+  // in the implementation comment.
+  const err = new Error("manifest file is unreadable");
+  assert.equal(__test_narrowCascadeFailure(err), "unreadable");
+});
+
+test("narrowCascadeFailure: arbitrary bare Error with no recognizable text -> {not in manifest} (permissive default)", () => {
+  const err = new Error("something else");
+  assert.equal(__test_narrowCascadeFailure(err), "not in manifest");
 });

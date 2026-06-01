@@ -7,9 +7,8 @@ import {
 } from "../../orchestrators/plugin/install.ts";
 import { locationsFor } from "../../persistence/locations.ts";
 import { loadState as defaultLoadState, type ExtensionState } from "../../persistence/state-io.ts";
-import { appendReloadHint, reloadHint } from "../../presentation/reload-hint.ts";
-import { errorMessage } from "../../shared/errors.ts";
-import { notifyError, notifySuccess, notifyWarning } from "../../shared/notify.ts";
+import { ConcurrentInstallError, errorMessage, PluginShapeError } from "../../shared/errors.ts";
+import { compareByNameThenScope, notify } from "../../shared/notify.ts";
 
 import { buildClaudeImportPlan } from "./marketplaces.ts";
 import { loadMergedClaudeSettingsForScope as defaultLoadSettings } from "./settings.ts";
@@ -22,6 +21,17 @@ import type {
 } from "./types.ts";
 import type { AddMarketplaceOptions } from "../../orchestrators/marketplace/add.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
+import type {
+  Dependency,
+  MarketplaceNotificationMessage,
+  MarketplaceStatus,
+  PluginFailedMessage,
+  PluginInstalledMessage,
+  PluginNotificationMessage,
+  PluginSkippedMessage,
+  PluginUnavailableMessage,
+  Reason,
+} from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
 
 export interface MarketplaceAddedOutcome {
@@ -46,6 +56,14 @@ export interface PluginInstalledOutcome {
   readonly ref: string;
   readonly reason: "installed";
   readonly resourcesChanged: boolean;
+  /**
+   * CMC-13 / MSG-SD-1..3: per-row soft-dep predicate inputs propagated
+   * from `InstallPluginOutcome.installed`. REQUIRED (mirrors D-01) so the
+   * cascade-row build site cannot read `undefined` and silently render the
+   * marker as `false` (NFR-7).
+   */
+  readonly declaresAgents: boolean;
+  readonly declaresMcp: boolean;
 }
 
 export interface PluginSkipOutcome {
@@ -233,20 +251,6 @@ function pluginsForMarketplace(
   return plugins.filter((plugin) => plugin.ref.marketplace === marketplace);
 }
 
-function hasWarnings(result: ClaudeImportExecutionResult): boolean {
-  return (
-    result.warnings.length > 0 ||
-    result.marketplaceFailures.length > 0 ||
-    result.sourceMismatches.length > 0 ||
-    result.unexpectedPluginFailures.length > 0 ||
-    result.diagnostics.length > 0
-  );
-}
-
-function anyChanges(result: ClaudeImportExecutionResult): boolean {
-  return result.addedMarketplaces.length > 0 || result.installedPlugins.length > 0;
-}
-
 function pushPluginWarning(
   result: MutableImportResult,
   plugin: PlannedPluginImport,
@@ -280,68 +284,194 @@ function pushDiagnostic(
   });
 }
 
-function appendOutcomeLines(lines: string[], title: string, items: readonly string[]): void {
-  if (items.length === 0) {
-    return;
+// Advisory warnings (marketplace-failed / unmappable-marketplace-source /
+// orphan diagnostics) are dropped: the marketplace status row already
+// carries the structural signal. notify() owns severity, reload-hint,
+// and soft-dep markers.
+
+interface MarketplaceBlock {
+  readonly key: string;
+  readonly name: string;
+  readonly scope: Scope;
+  status?: MarketplaceStatus;
+  reasons?: readonly Reason[];
+  plugins: PluginNotificationMessage[];
+}
+
+function ensureMarketplaceBlock(
+  byMp: Map<string, MarketplaceBlock>,
+  scope: Scope,
+  marketplaceName: string,
+): MarketplaceBlock {
+  const key = `${scope}:${marketplaceName}`;
+  const existing = byMp.get(key);
+  if (existing !== undefined) {
+    return existing;
   }
 
-  lines.push(`${title}:`);
-  for (const item of items) {
-    lines.push(`- ${item}`);
+  const block: MarketplaceBlock = {
+    key,
+    name: marketplaceName,
+    scope,
+    plugins: [],
+  };
+  byMp.set(key, block);
+  return block;
+}
+
+function importWarningReason(reason: ImportWarningOutcome["reason"]): Reason {
+  switch (reason) {
+    case "unavailable":
+    case "uninstallable":
+      return "no longer installable";
+    case "marketplace-failed":
+      return "not found";
+    case "unmappable-marketplace-source":
+      return "unsupported source";
   }
 }
 
-function causeSuffix(cause: string | undefined): string {
-  return cause === undefined ? "" : ` - ${cause}`;
+function dependenciesFromInstalled(o: PluginInstalledOutcome): readonly Dependency[] {
+  const deps: Dependency[] = [];
+  if (o.declaresAgents) {
+    deps.push("agents");
+  }
+
+  if (o.declaresMcp) {
+    deps.push("mcp");
+  }
+
+  // defense-in-depth: typed readonly + runtime freeze (codebase convention)
+  return Object.freeze(deps);
 }
 
-export function formatClaudeImportSummary(result: ClaudeImportExecutionResult): string {
-  const lines = ["Claude plugin import summary"];
+/**
+ * Converts a `ClaudeImportExecutionResult` into the
+ * `MarketplaceNotificationMessage[]` payload for `notify()`.
+ *
+ * Outcome mapping: added -> "added"; already-present -> "updated";
+ * marketplace failure or source mismatch -> "failed"; installed plugin ->
+ * PluginInstalledMessage; already-installed plugin -> PluginSkippedMessage
+ * with "already installed"; failed/unavailable plugin -> PluginFailedMessage
+ * or PluginUnavailableMessage. Advisory-only warnings and orphan diagnostics
+ * are silently dropped (the marketplace status row already carries the
+ * structural signal).
+ *
+ * Iteration order: `compareByNameThenScope` (name primary
+ * case-insensitive, scope secondary project-before-user). Per-plugin
+ * `scope?` is omitted -- every row's scope matches its marketplace's scope
+ * by construction, so `notify()` orphan-folds the bracket.
+ */
+function buildImportNotificationMarketplaces(
+  result: ClaudeImportExecutionResult,
+): readonly MarketplaceNotificationMessage[] {
+  const byMp = new Map<string, MarketplaceBlock>();
 
-  if (!anyChanges(result) && !hasWarnings(result)) {
-    lines.push("Import already up to date.");
+  // Marketplace-level outcomes: set status on the (scope, marketplace) tuple.
+  for (const o of result.addedMarketplaces) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    block.status = "added";
   }
 
-  appendOutcomeLines(
-    lines,
-    "Added marketplaces",
-    result.addedMarketplaces.map((o) => `${o.scope}: ${o.marketplace}`),
-  );
-  appendOutcomeLines(
-    lines,
-    "Installed plugins",
-    result.installedPlugins.map((o) => `${o.scope}: ${o.ref}`),
-  );
-  appendOutcomeLines(lines, "Skipped existing items", [
-    ...result.skippedExistingMarketplaces.map((o) => `${o.scope}: ${o.marketplace} (${o.reason})`),
-    ...result.skippedExistingPlugins.map((o) => `${o.scope}: ${o.ref} (${o.reason})`),
-  ]);
-  appendOutcomeLines(lines, "Warnings", [
-    ...result.diagnostics.map((d) => {
-      const subject = d.ref ?? d.marketplace ?? d.path ?? d.code;
-      return `${d.scope}: ${subject} (${d.code}) - ${d.message}`;
-    }),
-    ...result.warnings.map((o) => `${o.scope}: ${o.ref} (${o.reason})${causeSuffix(o.cause)}`),
-    ...result.marketplaceFailures.map(
-      (o) => `${o.scope}: ${o.marketplace} (${o.reason}) - ${o.cause}`,
-    ),
-    ...result.sourceMismatches.map((o) => `${o.scope}: ${o.ref} (${o.reason}) - ${o.cause}`),
-    ...result.unexpectedPluginFailures.map(
-      (o) => `${o.scope}: ${o.ref} (${o.reason}) - ${o.cause}`,
-    ),
-  ]);
-
-  const body = lines.join("\n");
-  if (!result.changedResources) {
-    return body;
+  for (const o of result.skippedExistingMarketplaces) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    block.status = "updated";
   }
 
-  return appendReloadHint(
-    body,
-    reloadHint(
-      "load",
-      result.installedPlugins.filter((o) => o.resourcesChanged).map((o) => o.plugin),
-    ),
+  for (const o of result.marketplaceFailures) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    block.status = "failed";
+  }
+
+  // Source-mismatch supersedes any prior status (the import for that
+  // marketplace effectively failed); dependent plugin rows accumulate as
+  // PluginFailedMessage children under the (failed) header.
+  for (const o of result.sourceMismatches) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    block.status = "failed";
+    block.reasons = ["source mismatch"] as const;
+  }
+
+  // Plugin rows -- orphan-fold contract: per-row `scope?` is OMITTED
+  // because the row's scope matches its marketplace's scope by
+  // construction (the import cascade groups outcomes by their owning scope).
+  for (const o of result.installedPlugins) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    const row: PluginInstalledMessage = {
+      status: "installed",
+      name: o.plugin,
+      dependencies: dependenciesFromInstalled(o),
+    };
+    block.plugins.push(row);
+  }
+
+  for (const o of result.skippedExistingPlugins) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    const row: PluginSkippedMessage = {
+      status: "skipped",
+      name: o.plugin,
+      reasons: ["already installed"] as const,
+    };
+    block.plugins.push(row);
+  }
+
+  for (const o of result.sourceMismatches) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    const row: PluginFailedMessage = {
+      status: "failed",
+      name: o.plugin,
+      reasons: ["source mismatch"] as const,
+    };
+    block.plugins.push(row);
+  }
+
+  for (const o of result.unexpectedPluginFailures) {
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    const row: PluginFailedMessage = {
+      status: "failed",
+      name: o.plugin,
+      reasons: ["not in manifest"] as const,
+    };
+    block.plugins.push(row);
+  }
+
+  for (const o of result.warnings) {
+    // A1 DROP: marketplace-failed / unmappable-marketplace-source warnings
+    // have no V2 representation (the failing marketplace's own status: "failed"
+    // carries the structural signal; advisory-only warnings are silenced).
+    if (o.reason === "marketplace-failed" || o.reason === "unmappable-marketplace-source") {
+      continue;
+    }
+
+    const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+    const row: PluginUnavailableMessage = {
+      status: "unavailable",
+      name: o.plugin,
+      reasons: [importWarningReason(o.reason)],
+    };
+    block.plugins.push(row);
+  }
+
+  // A2 DROP: result.diagnostics (orphan + per-marketplace) have no V2
+  // representation. The in-memory record stays on the returned result;
+  // Pi runtime debug logs preserve diagnostic visibility.
+
+  // : orchestrator owns iteration order; notify does NOT sort.
+  // Project-before-user tie-break per MSG-GR-3 via compareByNameThenScope.
+  // defense-in-depth: typed readonly + runtime freeze (codebase convention)
+  return Object.freeze(
+    [...byMp.values()]
+      .sort((a, b) => compareByNameThenScope(a, b))
+      .map(
+        (block): MarketplaceNotificationMessage => ({
+          name: block.name,
+          scope: block.scope,
+          ...(block.status !== undefined && { status: block.status }),
+          ...(block.reasons !== undefined && { reasons: block.reasons }),
+          // defense-in-depth: typed readonly + runtime freeze (codebase convention)
+          plugins: Object.freeze(block.plugins),
+        }),
+      ),
   );
 }
 
@@ -420,6 +550,7 @@ async function executeScopedPlan(
     try {
       await addMarketplace({
         ctx: opts.ctx,
+        pi: opts.pi,
         scope: marketplace.scope,
         cwd: opts.cwd,
         rawSource: marketplace.source,
@@ -477,15 +608,33 @@ async function executeScopedPlan(
       continue;
     }
 
-    const outcome = await installPlugin({
-      ctx: opts.ctx,
-      pi: opts.pi,
-      scope: plugin.scope,
-      cwd: opts.cwd,
-      marketplace: plugin.ref.marketplace,
-      plugin: plugin.ref.plugin,
-      notifications: { mode: "orchestrated" },
-    });
+    // WR-02 (gap closure, Plan 20-05): catch unexpected installPlugin throws
+    // and route them to result.unexpectedPluginFailures matching
+    // dispatchFailedOutcome's shape; per-scope loop continues and the final
+    // notify() at the end of importClaudeSettings still fires.
+    let outcome: InstallPluginOutcome;
+    try {
+      outcome = await installPlugin({
+        ctx: opts.ctx,
+        pi: opts.pi,
+        scope: plugin.scope,
+        cwd: opts.cwd,
+        marketplace: plugin.ref.marketplace,
+        plugin: plugin.ref.plugin,
+        notifications: { mode: "orchestrated" },
+      });
+    } catch (err) {
+      result.unexpectedPluginFailures.push({
+        kind: "plugin-failure",
+        scope: plugin.scope,
+        plugin: plugin.ref.plugin,
+        marketplace: plugin.ref.marketplace,
+        ref: refLabel(plugin),
+        reason: "unexpected-failure",
+        cause: errorMessage(err),
+      });
+      continue;
+    }
 
     switch (outcome.status) {
       case "installed":
@@ -497,6 +646,8 @@ async function executeScopedPlan(
           ref: refLabel(plugin),
           reason: "installed",
           resourcesChanged: outcome.resourcesChanged,
+          declaresAgents: outcome.declaresAgents,
+          declaresMcp: outcome.declaresMcp,
         });
         result.changedResources ||= outcome.resourcesChanged;
         // Surface any post-commit warnings collected in orchestrated mode.
@@ -507,6 +658,46 @@ async function executeScopedPlan(
         }
 
         break;
+      case "failed":
+        // Collapsed `status: "failed"` carries the typed Error directly.
+        // Narrow on `instanceof PluginShapeError` + `.kind` to recover
+        // the specific failure class; everything else falls through to
+        // the unexpected-failure bucket.
+        dispatchFailedOutcome(result, plugin, outcome.error, outcome.cause);
+        break;
+    }
+  }
+}
+
+/**
+ * Recover the semantic dispatch from the typed `Error` in the collapsed
+ * `status: "failed"` outcome. `PluginShapeError.kind === "already-installed"`
+ * and `ConcurrentInstallError` both route to the skip bucket;
+ * `not-in-manifest` and `(no-)not-installable` route to the
+ * unavailable / uninstallable warnings; everything else lands in
+ * `unexpectedPluginFailures`.
+ */
+function dispatchFailedOutcome(
+  result: MutableImportResult,
+  plugin: PlannedPluginImport,
+  error: Error,
+  cause: string,
+): void {
+  if (error instanceof ConcurrentInstallError) {
+    result.skippedExistingPlugins.push({
+      kind: "plugin-skip",
+      scope: plugin.scope,
+      plugin: plugin.ref.plugin,
+      marketplace: plugin.ref.marketplace,
+      ref: refLabel(plugin),
+      reason: "already-installed",
+    });
+    return;
+  }
+
+  if (error instanceof PluginShapeError) {
+    // Switch on `error.shape.kind` for compile-time exhaustiveness.
+    switch (error.shape.kind) {
       case "already-installed":
         result.skippedExistingPlugins.push({
           kind: "plugin-skip",
@@ -516,66 +707,62 @@ async function executeScopedPlan(
           ref: refLabel(plugin),
           reason: "already-installed",
         });
-        break;
-      case "unavailable":
-        pushPluginWarning(result, plugin, "unavailable", outcome.cause);
-        break;
-      case "uninstallable":
-        pushPluginWarning(result, plugin, "uninstallable", outcome.cause);
-        break;
-      case "unexpected-failure":
-        result.unexpectedPluginFailures.push({
-          kind: "plugin-failure",
-          scope: plugin.scope,
-          plugin: plugin.ref.plugin,
-          marketplace: plugin.ref.marketplace,
-          ref: refLabel(plugin),
-          reason: "unexpected-failure",
-          cause: outcome.cause,
-        });
-        break;
+        return;
+      case "not-in-manifest":
+        pushPluginWarning(result, plugin, "unavailable", cause);
+        return;
+      case "not-installable":
+      case "no-longer-installable":
+        pushPluginWarning(result, plugin, "uninstallable", cause);
+        return;
     }
   }
+
+  result.unexpectedPluginFailures.push({
+    kind: "plugin-failure",
+    scope: plugin.scope,
+    plugin: plugin.ref.plugin,
+    marketplace: plugin.ref.marketplace,
+    ref: refLabel(plugin),
+    reason: "unexpected-failure",
+    cause,
+  });
 }
 
 export async function importClaudeSettings(
   opts: ImportClaudeSettingsOptions,
 ): Promise<ClaudeImportExecutionResult> {
   const result = emptyResult();
-  try {
-    const loadSettings = settingsLoader(opts.deps);
-    const settingsResults = await Promise.all(
-      opts.selectedScopes.map(async (scope) => ({
-        scope,
-        loaded: await loadSettings(scope, { cwd: opts.cwd }),
-      })),
-    );
+  const loadSettings = settingsLoader(opts.deps);
+  const settingsResults = await Promise.all(
+    opts.selectedScopes.map(async (scope) => ({
+      scope,
+      loaded: await loadSettings(scope, { cwd: opts.cwd }),
+    })),
+  );
 
-    for (const loaded of settingsResults) {
-      result.diagnostics.push(...loaded.loaded.diagnostics);
-    }
-
-    const plan = buildClaudeImportPlan(
-      settingsResults.map((entry) => ({ scope: entry.scope, settings: entry.loaded.settings })),
-    );
-    result.diagnostics.push(...plan.diagnostics);
-
-    for (const scopePlan of plan.scopes) {
-      await executeScopedPlan(opts, result, scopePlan);
-    }
-  } catch (err) {
-    notifyError(opts.ctx, `Import failed: ${errorMessage(err)}`, err);
-    return result;
+  for (const loaded of settingsResults) {
+    result.diagnostics.push(...loaded.loaded.diagnostics);
   }
 
-  const summary = formatClaudeImportSummary(result);
-  if (result.unexpectedPluginFailures.length > 0) {
-    notifyError(opts.ctx, summary);
-  } else if (hasWarnings(result)) {
-    notifyWarning(opts.ctx, summary);
-  } else {
-    notifySuccess(opts.ctx, summary);
+  const plan = buildClaudeImportPlan(
+    settingsResults.map((entry) => ({ scope: entry.scope, settings: entry.loaded.settings })),
+  );
+  result.diagnostics.push(...plan.diagnostics);
+
+  for (const scopePlan of plan.scopes) {
+    await executeScopedPlan(opts, result, scopePlan);
   }
+
+  // Plan 20-02 / D-20-02 (strict D-19-02 mirror): V2 cascade construction
+  // mirrors the Plan 19-04 reinstall.ts recipe at
+  // orchestrators/plugin/reinstall.ts; execute.ts substitutes the
+  // import-cascade variant set (added / updated / failed marketplaces
+  // Truly catastrophic throws bubble to Pi runtime -- better for debugging
+  // than a polished error message that masks the bug. The inner
+  // executeScopedPlan try/catch covers expected loadState failures.
+  const marketplaces = buildImportNotificationMarketplaces(result);
+  notify(opts.ctx, opts.pi, { marketplaces });
 
   return result;
 }

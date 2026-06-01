@@ -1,14 +1,22 @@
 // Quick 260516-02r: bootstrap orchestrator tests.
 //
+// Phase 13 Plan 13-02c-01 migration: the legacy sentence-form
+// assertions (`Added marketplace ...`, `Enabled autoupdate: ...`,
+// `Already enabled: ...`) have been migrated to the compact-line
+// MarketplaceRow forms per CMC-28 / CMC-30 / CMC-33.
+//
 // Covers:
 //   a. First run, clean state: addMarketplace + setMarketplaceAutoupdate
-//      compose into TWO notifications and a fully recorded marketplace.
+//      compose into TWO notifications: `● <mp> [user] <autoupdate>
+//      (added)` followed by the marker-as-outcome `● <mp> [user]
+//      <autoupdate>`.
 //   b. Second run, fully idempotent: marketplace already present AND
 //      autoupdate true. The duplicate-name path is swallowed so
 //      addMarketplace does NOT emit; setMarketplaceAutoupdate emits
-//      the single "Already enabled: ..." line.
+//      the single `● <mp> [user] <autoupdate> {already autoupdate}` row
+//      (UXG-04 marker-as-outcome + idempotence brace).
 //   c. Half-bootstrapped (autoupdate off): autoupdate flips to true,
-//      emits ONE "Enabled autoupdate: ..." notification.
+//      emits ONE marker-as-outcome row.
 //   d. User scope only: project-scope state file is never created.
 //   e. Non-duplicate error from clone propagates and the autoupdate
 //      step is NEVER reached.
@@ -41,24 +49,27 @@ import {
 import { makeMockGitOps } from "../../helpers/git-mock.ts";
 
 import type { ExtensionState } from "../../../extensions/pi-claude-marketplace/persistence/state-io.ts";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 interface NotifyRecord {
   message: string;
   severity?: string;
 }
 
-function makeCtx(): { ctx: ExtensionContext; notifications: NotifyRecord[] } {
+function makeCtx(): { ctx: ExtensionContext; pi: ExtensionAPI; notifications: NotifyRecord[] } {
   const notifications: NotifyRecord[] = [];
+  // Plan 18-00: `pi` required on BootstrapOptions (mirroring the composed
+  // marketplace orchestrators); mirror production wiring shape.
+  const pi = { getAllTools: (): unknown[] => [] } as unknown as ExtensionAPI;
   const ctx = {
     ui: {
       notify: (m: string, s?: string): void => {
         notifications.push(s === undefined ? { message: m } : { message: m, severity: s });
       },
     },
-    pi: { getAllTools: (): unknown[] => [] },
+    pi,
   } as unknown as ExtensionContext;
-  return { ctx, notifications };
+  return { ctx, pi, notifications };
 }
 
 async function withHermeticHome<T>(
@@ -115,12 +126,12 @@ function fixtureClaudePluginsOfficial(): string {
 
 test("bootstrap (clean state): adds marketplace + enables autoupdate; two notifications", async () => {
   await withHermeticHome(async ({ cwd }) => {
-    const { ctx, notifications } = makeCtx();
+    const { ctx, pi, notifications } = makeCtx();
     const { gitOps, state: gitState } = makeMockGitOps({
       fixtureSourceDir: fixtureClaudePluginsOfficial(),
     });
 
-    await bootstrapClaudePlugin({ ctx, cwd, gitOps });
+    await bootstrapClaudePlugin({ ctx, pi, cwd, gitOps });
 
     // State has the marketplace recorded under user scope with autoupdate=true.
     const userLocations = locationsFor("user", cwd);
@@ -131,13 +142,15 @@ test("bootstrap (clean state): adds marketplace + enables autoupdate; two notifi
     assert.equal(recorded.scope, "user");
     assert.equal(recorded.autoupdate, true);
 
-    // Exactly two notifications in order.
+    // Exactly two notifications in order. SNM-33 / D-22-01 / D-22-03:
+    // both are marketplace-status-only blocks (no plugin rows), so NEITHER
+    // carries the `/reload` trailer -- a marketplace record (and its
+    // autoupdate flag) is not a Pi-visible resource. `addMarketplace` and
+    // `setMarketplaceAutoupdate` both inherit the collapsed reload-hint rule.
     assert.equal(notifications.length, 2);
-    assert.equal(
-      notifications[0]?.message,
-      'Added marketplace "claude-plugins-official" in user scope.',
-    );
-    assert.equal(notifications[1]?.message, "Enabled autoupdate: claude-plugins-official.");
+    assert.equal(notifications[0]?.message, "● claude-plugins-official [user] (added)");
+    // UXG-04: fresh autoupdate enable renders the `<autoupdate>` marker-as-outcome.
+    assert.equal(notifications[1]?.message, "● claude-plugins-official [user] <autoupdate>");
     // Clone happened exactly once on the clean path.
     assert.equal(gitState.cloneCalls.length, 1);
     assert.equal(
@@ -161,23 +174,31 @@ test("bootstrap (already bootstrapped): swallows duplicate-name, reports idempot
     await saveState(userLocations.extensionRoot, seeded);
     const before = await loadState(userLocations.extensionRoot);
 
-    const { ctx, notifications } = makeCtx();
+    const { ctx, pi, notifications } = makeCtx();
     const { gitOps } = makeMockGitOps({
       fixtureSourceDir: fixtureClaudePluginsOfficial(),
     });
 
-    await bootstrapClaudePlugin({ ctx, cwd, gitOps });
+    await bootstrapClaudePlugin({ ctx, pi, cwd, gitOps });
 
     // State unchanged (deep-equal, modulo the autoupdate field which was
     // already true; setMarketplaceAutoupdate hits the unchanged path).
     const after = await loadState(userLocations.extensionRoot);
     assert.deepEqual(after, before);
     // Exactly one notification: the idempotent autoupdate report.
+    // UXG-04 catalog form -- the `<autoupdate>` marker-as-outcome + the
+    // `{already autoupdate}` idempotence brace (no `(skipped)` token).
+    // The benign reason `already autoupdate` (in BENIGN_REASONS) routes
+    // severity to info per UXG-02 / D-28-06/07 (no severity arg).
     assert.equal(notifications.length, 1);
-    assert.equal(notifications[0]?.message, "Already enabled: claude-plugins-official.");
-    // No "Added marketplace" in this run.
     assert.equal(
-      notifications.some((n) => n.message.startsWith("Added marketplace")),
+      notifications[0]?.message,
+      "● claude-plugins-official [user] <autoupdate> {already autoupdate}",
+    );
+    assert.equal(notifications[0]?.severity, undefined);
+    // No `(added)` row in this run.
+    assert.equal(
+      notifications.some((n) => n.message.includes("(added)")),
       false,
     );
   });
@@ -194,20 +215,23 @@ test("bootstrap (half-configured: autoupdate off): swallows duplicate-name, flip
       },
     });
 
-    const { ctx, notifications } = makeCtx();
+    const { ctx, pi, notifications } = makeCtx();
     const { gitOps } = makeMockGitOps({
       fixtureSourceDir: fixtureClaudePluginsOfficial(),
     });
 
-    await bootstrapClaudePlugin({ ctx, cwd, gitOps });
+    await bootstrapClaudePlugin({ ctx, pi, cwd, gitOps });
 
     const after = await loadState(userLocations.extensionRoot);
     assert.equal(after.marketplaces["claude-plugins-official"]?.autoupdate, true);
     assert.equal(notifications.length, 1);
-    assert.equal(notifications[0]?.message, "Enabled autoupdate: claude-plugins-official.");
-    // No "Added marketplace" in this run.
+    // SNM-33 / D-22-03: UXG-04 `<autoupdate>` marker-as-outcome header-only
+    // block, NO `/reload` trailer (the autoupdate flag is not a Pi-visible
+    // resource).
+    assert.equal(notifications[0]?.message, "● claude-plugins-official [user] <autoupdate>");
+    // No `(added)` row in this run.
     assert.equal(
-      notifications.some((n) => n.message.startsWith("Added marketplace")),
+      notifications.some((n) => n.message.includes("(added)")),
       false,
     );
   });
@@ -215,12 +239,12 @@ test("bootstrap (half-configured: autoupdate off): swallows duplicate-name, flip
 
 test("bootstrap touches ONLY user scope: project-scope state file is never created", async () => {
   await withHermeticHome(async ({ cwd }) => {
-    const { ctx } = makeCtx();
+    const { ctx, pi } = makeCtx();
     const { gitOps } = makeMockGitOps({
       fixtureSourceDir: fixtureClaudePluginsOfficial(),
     });
 
-    await bootstrapClaudePlugin({ ctx, cwd, gitOps });
+    await bootstrapClaudePlugin({ ctx, pi, cwd, gitOps });
 
     // Project scope must remain empty (loadState on missing dir returns
     // DEFAULT_STATE per persistence/state-io.ts).
@@ -237,7 +261,7 @@ test("bootstrap touches ONLY user scope: project-scope state file is never creat
 
 test("bootstrap (non-duplicate clone error): propagates and autoupdate step is NOT reached", async () => {
   await withHermeticHome(async ({ cwd }) => {
-    const { ctx, notifications } = makeCtx();
+    const { ctx, pi, notifications } = makeCtx();
     const cloneFailure = new Error("network down");
     const { gitOps, state: gitState } = makeMockGitOps({
       fixtureSourceDir: fixtureClaudePluginsOfficial(),
@@ -245,16 +269,16 @@ test("bootstrap (non-duplicate clone error): propagates and autoupdate step is N
     });
 
     await assert.rejects(
-      bootstrapClaudePlugin({ ctx, cwd, gitOps }),
+      bootstrapClaudePlugin({ ctx, pi, cwd, gitOps }),
       (err: unknown): err is Error => err instanceof Error && err.message.includes("network down"),
     );
 
     // Clone was attempted exactly once.
     assert.equal(gitState.cloneCalls.length, 1);
 
-    // No "Added marketplace" emitted (add failed before its notify).
+    // No `(added)` row emitted (add failed before its notify).
     assert.equal(
-      notifications.some((n) => n.message.startsWith("Added marketplace")),
+      notifications.some((n) => n.message.includes("(added)")),
       false,
     );
 

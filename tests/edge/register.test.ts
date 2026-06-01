@@ -79,7 +79,14 @@ function makeMockPi(): MockPi {
 
 function makeDeps(overrides: Partial<EdgeDeps> = {}): EdgeDeps {
   const pluginUpdate: PluginUpdateFn = (plugin) =>
-    Promise.resolve<PluginUpdateOutcome>({ partition: "unchanged", name: plugin });
+    Promise.resolve<PluginUpdateOutcome>({
+      partition: "unchanged",
+      name: plugin,
+      fromVersion: "0.0.0",
+      toVersion: "0.0.0",
+      declaresAgents: false,
+      declaresMcp: false,
+    });
 
   const gitOps = {
     clone: () => Promise.resolve(),
@@ -192,7 +199,10 @@ test("D-04 :: registered command routes reinstall through makeReinstallHandler",
 
     assert.equal(notifications.length, 1);
     assert.equal(notifications[0]?.severity, undefined);
-    assert.match(notifications[0]?.message ?? "", /No plugins installed\./);
+    // Plan 19-04 / D-19-02 byte change: V2 empty-targets renders as the
+    // `(no marketplaces)` sentinel via `{ marketplaces: [] }`. V1's
+    // `(no plugins)` empty-row form is RETIRED.
+    assert.equal(notifications[0]?.message ?? "", "(no marketplaces)");
   });
 });
 

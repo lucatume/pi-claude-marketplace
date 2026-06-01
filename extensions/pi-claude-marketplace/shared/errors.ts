@@ -14,6 +14,95 @@ export function assertNever(x: never): never {
 }
 
 /**
+ * MSG-CC-1 (CMC-18): depth-5 Error.cause walker rendered as
+ * `cause: <l1> -> <l2> -> ... [(truncated)]`. Returns `""` when `err` is
+ * `undefined` or `null` so callers can compose `body + (trailer === "" ? "" :
+ * "\n\n" + trailer)` without extra guards.
+ *
+ * Walker contract (relocated from orchestrators/marketplace/shared.ts's
+ * legacy depth-5 walker):
+ *   - Depth bound 5 prevents pathological cycles (T-13-04 DoS mitigation).
+ *   - Cycle detection: `current.cause !== current` -- an Error whose own
+ *     `.cause` is itself terminates the walk at depth 1.
+ *   - Non-Error fallback: `string` causes render verbatim; any other
+ *     `unknown` cause renders via `Object.prototype.toString.call(c)` (so a
+ *     `{x: 1}` cause renders as `[object Object]`, never `[object Object]`
+ *     with `String()` coercion that the ESLint rule
+ *     `@typescript-eslint/no-base-to-string` forbids on unknown-with-toString).
+ *   - When the loop exits at the depth bound AND the chain continues
+ *     (`current` is still non-null/undefined and would have walked further),
+ *     append ` (truncated)` to the LAST link.
+ *
+ * NFR-9: surfaces only `Error.message` (or `String`/
+ * `Object.prototype.toString` fallback for non-Error). No `.stack`, no
+ * absolute paths. `shared/notify.ts` consumes this walker via
+ * `renderIndentedCauseChain` so the trailer lands automatically below every
+ * failed / manual-recovery plugin row.
+ *
+ * Single canonical implementation in `shared/errors.ts` (D-11 layering).
+ */
+export function causeChainTrailer(err: unknown): string {
+  if (err === undefined || err === null) {
+    return "";
+  }
+
+  const PREFIX = "cause: ";
+  const JOINER = " -> ";
+  const MAX_DEPTH = 5;
+  const links: string[] = [];
+  let current: unknown = err;
+  let truncated = false;
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    links.push(linkMessage(current));
+    if (current instanceof Error && current.cause !== undefined && current.cause !== current) {
+      current = current.cause;
+      if (depth === MAX_DEPTH - 1) {
+        // We just consumed the depth-bound slot but `current` still has more
+        // chain to walk. Mark the rendered output truncated.
+        truncated = true;
+      }
+    } else {
+      break;
+    }
+  }
+
+  if (truncated) {
+    links[links.length - 1] = `${links.at(-1)} (truncated)`;
+  }
+
+  return `${PREFIX}${links.join(JOINER)}`;
+}
+
+function linkMessage(c: unknown): string {
+  if (c instanceof Error) {
+    return c.message;
+  }
+
+  if (typeof c === "string") {
+    return c;
+  }
+
+  return Object.prototype.toString.call(c);
+}
+
+/**
+ * Compose `errorMessage(err) [\n\n${causeChainTrailer(err)}]` for outcome
+ * `notes` aggregated outside the notify path. The `notify` renderer trails
+ * the cause chain automatically below the plugin row; this helper exists for
+ * outcome-aggregation callsites (orchestrators/marketplace/update.ts,
+ * orchestrators/plugin/reinstall.ts, orchestrators/plugin/update.ts) that
+ * need the same text without going through the notify channel.
+ *
+ * Single canonical implementation here is the source of truth -- if the
+ * cause-chain trailer contract changes (depth bound, separator, trimming
+ * rule), the change lands once.
+ */
+export function composeErrorWithCauseChain(err: unknown): string {
+  const trailer = causeChainTrailer(err);
+  return trailer === "" ? errorMessage(err) : `${errorMessage(err)}\n\n${trailer}`;
+}
+
+/**
  * If `leak` is non-undefined, return a new Error that names both `err` and
  * the leak so the user sees the original cause AND the manual-cleanup hint
  * in the same notification.
@@ -113,7 +202,9 @@ export class CrossPluginConflictError extends Error {
  * orchestrators/plugin/install.ts when a re-read of state shows the plugin
  * record already exists (another process beat us to the commit). The outer
  * `runPhases` result unwinds the staged resources via the ledger's
- * `undo` chain; `formatRollbackError` composes the final user message.
+ * `undo` chain; `formatRollbackError` returns the structured rollback
+ * result and the orchestrator composes the final user message via the
+ * V2 `notify(ctx, NotificationMessage)` path (`shared/notify.ts`).
  */
 export class ConcurrentInstallError extends Error {
   readonly plugin: string;
@@ -173,7 +264,7 @@ export class StateLockHeldError extends Error {
  * constructor's `message` argument typically embeds the
  * RECOVERY_PLUGIN_REINSTALL_PREFIX-composed recovery hint; the
  * `Error.cause` (passed via the options bag) carries the chained
- * originating error for `formatErrorWithCauses` depth-5 walk.
+ * originating error for the depth-5 `causeChainTrailer` walk.
  */
 export interface Phase3Failure {
   readonly phase: "skills" | "commands" | "agents" | "mcp";
@@ -187,6 +278,135 @@ export class PluginUpdatePhase3Error extends Error {
     super(message, options);
     this.name = "PluginUpdatePhase3Error";
     this.failures = failures;
+  }
+}
+
+/**
+ * CMC-16: structured manual-recovery signal for the bridge-replacement
+ * leak path.
+ *
+ * Bridges (`bridges/{skills,commands,agents}/stage.ts`) throw this
+ * when a rollback of a partially-completed `replace*Internal` swap
+ * leaks files / directories the caller must clean up by hand. The
+ * manual-recovery anchor is NOT embedded in `.message` -- per
+ * MSG-MR-1 / MSG-MR-2 the manual-recovery row is composed at the notify
+ * boundary in `shared/notify.ts`. Bridges produce STRUCTURED data
+ * (`.leaks`); the orchestrator (`orchestrators/plugin/reinstall.ts` reason
+ * narrowing and the cascade-row mapper) type-checks the Error instead of
+ * substring-matching the message text. `shared/notify.ts` reads `.leaks`
+ * directly to name the leaked paths on the rendered row (AS-7).
+ *
+ * `Error.cause` is set via the standard `ErrorOptions` bag (mirrors the
+ * `PluginUpdatePhase3Error` precedent above) so the depth-5
+ * `causeChainTrailer` walker surfaces the originating bridge error to the
+ * user below the manual-recovery row.
+ */
+export class ManualRecoveryError extends Error {
+  readonly leaks: readonly string[];
+  constructor(message: string, leaks: readonly string[], options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ManualRecoveryError";
+    this.leaks = leaks;
+  }
+}
+
+/**
+ * Discriminated typed error replacing the free-text `Error.message`
+ * parsing previously used in install / update / remove / reinstall catch
+ * sites. Closes the systemic v1.3 pattern hole that the
+ * `ManualRecoveryError` refactor missed in additional catch sites beyond
+ * install, and eliminates the SonarCloud `typescript:S5852` ReDoS hotspot
+ * at the legacy regex (previously `/is not installable:\s*(.+)$/`) that
+ * has since been removed.
+ *
+ * Discriminated by `kind`:
+ *   - `"not-in-manifest"`     -- PI-3, thrown from `installPlugin`
+ *   - `"already-installed"`   -- PI-5, thrown from `installPlugin`
+ *   - `"not-installable"`     -- PR-6, thrown from `requireInstallable`
+ *                                with `op = "install"`
+ *   - `"no-longer-installable"` -- PR-6, thrown from `requireInstallable`
+ *                                with `op = "update"`
+ * The downstream consumer is `classifyEntityShapeError` (install.ts).
+ *
+ * The constructor is the SINGLE SOURCE OF TRUTH for the `.message` text. The
+ * exact byte-equal forms (preserved so existing
+ * `err.message.includes("is not installable")` / regex assertions stay green):
+ *
+ *   not-in-manifest:        `Plugin "<plugin>" not found in marketplace "<marketplace>".`
+ *   already-installed:      `Plugin "<plugin>" is already installed in marketplace "<marketplace>".`
+ *   not-installable:        `Plugin "<plugin>" is not installable: <reasons.join("; ")>`
+ *   no-longer-installable:  `Plugin "<plugin>" is no longer installable: <reasons.join("; ")>`
+ *
+ * `reasons` on the (not-)installable variants is `readonly string[]` and
+ * NOT `readonly Reason[]`. The resolver populates `r.notes` with free-form
+ * strings (`"contains hooks"`, `"source dir does not exist"`,
+ * `"declares dependencies that must be installed manually"`, etc.) -- the
+ * closed `Reason` set lives one layer up at the renderer boundary. The
+ * `classifyEntityShapeError` consumer in `orchestrators/plugin/install.ts`
+ * narrows these strings to closed-set `Reason` members. Carrying the raw
+ * strings here preserves byte-equal `.message` text (the resolver's notes
+ * are joined verbatim) and removes the regex re-parse path entirely.
+ *
+ * `Error.cause` flows through `ErrorOptions` (mirrors `ManualRecoveryError`
+ * / `PluginUpdatePhase3Error` precedents) so the depth-5
+ * `causeChainTrailer` walker still surfaces the originating error.
+ */
+export type PluginShapeErrorShape =
+  | { readonly kind: "not-in-manifest"; readonly plugin: string; readonly marketplace: string }
+  | { readonly kind: "already-installed"; readonly plugin: string; readonly marketplace: string }
+  | {
+      readonly kind: "not-installable";
+      readonly plugin: string;
+      readonly reasons: readonly string[];
+    }
+  | {
+      readonly kind: "no-longer-installable";
+      readonly plugin: string;
+      readonly reasons: readonly string[];
+    };
+
+export type PluginShapeErrorKind = PluginShapeErrorShape["kind"];
+
+export class PluginShapeError extends Error {
+  /**
+   * The full discriminated shape is exposed as a single `readonly` field
+   * so consumers narrow on `e.shape.kind` without non-null assertions.
+   * The shape
+   * itself was discarded). The pre-C4 mirror fields are retired.
+   *
+   * Reading `e.shape` returns the same object the constructor received,
+   * including the discriminator and every shape-specific field
+   * (`marketplace` / `reasons`) without optionality. Consumers narrow
+   * on `e.shape.kind` to recover the variant.
+   */
+  readonly shape: PluginShapeErrorShape;
+  readonly kind: PluginShapeErrorKind;
+  readonly plugin: string;
+
+  constructor(shape: PluginShapeErrorShape, options?: ErrorOptions) {
+    super(buildPluginShapeMessage(shape), options);
+    this.name = "PluginShapeError";
+    this.shape = shape;
+    // `kind` and `plugin` are kept as convenience top-level shortcuts
+    // because they appear on EVERY shape variant; the
+    // shape-specific fields (marketplace / reasons) are NOT mirrored.
+    this.kind = shape.kind;
+    this.plugin = shape.plugin;
+  }
+}
+
+function buildPluginShapeMessage(shape: PluginShapeErrorShape): string {
+  switch (shape.kind) {
+    case "not-in-manifest":
+      return `Plugin "${shape.plugin}" not found in marketplace "${shape.marketplace}".`;
+    case "already-installed":
+      return `Plugin "${shape.plugin}" is already installed in marketplace "${shape.marketplace}".`;
+    case "not-installable":
+      return `Plugin "${shape.plugin}" is not installable: ${shape.reasons.join("; ")}`;
+    case "no-longer-installable":
+      return `Plugin "${shape.plugin}" is no longer installable: ${shape.reasons.join("; ")}`;
+    default:
+      return assertNever(shape);
   }
 }
 

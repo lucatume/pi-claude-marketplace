@@ -30,6 +30,7 @@
 // register.ts (Plan 06-05) from persistence/ + domain/ surfaces and threaded
 // through this dispatcher. Tests inject a hermetic mock resolver.
 
+import { SCOPES } from "../../shared/types.ts";
 import { MARKETPLACE_SUBCOMMANDS, TOP_LEVEL_SUBCOMMANDS } from "../router.ts";
 
 import {
@@ -67,9 +68,12 @@ function topLevelCompletions(current: string): AutocompleteItem[] {
 }
 
 function scopeValueCompletions(current: string, headPrefix: string): AutocompleteItem[] {
-  return ["user", "project"]
-    .filter((v) => v.startsWith(current))
-    .map((v) => ({ label: v, value: `${headPrefix}${v} ` }));
+  // Enumerate via the canonical `SCOPES` constant; the architecture drift
+  // guard (scope-order-drift.test.ts) enforces import-and-reuse here.
+  return SCOPES.filter((v) => v.startsWith(current)).map((v) => ({
+    label: v,
+    value: `${headPrefix}${v} `,
+  }));
 }
 
 function flagCompletions(

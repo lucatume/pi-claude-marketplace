@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -34,7 +35,18 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 //   PUP-7: phase-3 abort cleans staging, no mask of original error.
 //   PUP-8: reload hint when >=1 plugin updated; suppressed when 0 updated.
 //   PUP-9: cascade vs direct routing (updateSinglePlugin never throws;
-//          updatePlugins fires notifyError on phase-2-or-earlier throws).
+//          updatePlugins surfaces phase-2-or-earlier throws via V2
+//          notify() with a synthetic PluginFailedMessage carrying cause).
+//
+// Phase 19 / Plan 19-05: byte-exact assertions match the V2 catalog forms
+// at docs/output-catalog.md:489-568 (plugin update). The V1 `[<scope>]`
+// plugin-row bracket is suppressed by Phase 17.2 orphan-fold (plugin.scope
+// === mp.scope -> renderScopeBracket returns ""). Empty-targets renders
+// `(no marketplaces)` via notify({ marketplaces: [] }) per the Wave 1
+// precedent (orchestrators/marketplace/update.ts:230). Direct-path
+// failures (enumerate / syncClone / runThreePhaseUpdate / phase-3
+// aggregate) surface as synthetic PluginFailedMessage rows with cause
+// threaded for the 4-space cause-chain trailer per D-16-08.
 
 interface NotifyRecord {
   message: string;
@@ -227,7 +239,7 @@ async function rewriteManifest(
 
 // ─── PUP-1: empty target ───────────────────────────────────────────────────────
 
-test("PUP-1: bare form against empty state -> 'No plugins installed.' silent success", async () => {
+test("PUP-1: bare form against empty state -> '(no marketplaces)' silent success", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "update-pup1-empty-"));
     try {
@@ -235,7 +247,13 @@ test("PUP-1: bare form against empty state -> 'No plugins installed.' silent suc
       await updatePlugins({ ctx, pi, scope: "project", cwd, target: { kind: "all" } });
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]?.severity, undefined);
-      assert.equal(notifications[0]?.message, "No plugins installed.");
+      // Phase 19 / Plan 19-05: V2 empty-targets shape mirrors the Wave 1
+      // precedent at orchestrators/marketplace/update.ts:230 --
+      // notify({ marketplaces: [] }) renders the renderer's
+      // `(no marketplaces)` sentinel per D-16-17. The legacy
+      // EmptyToken "(no plugins)" rendering retires alongside the V1
+      // renderRow / compact-line composer.
+      assert.equal(notifications[0]?.message, "(no marketplaces)");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -273,12 +291,24 @@ test("PUP-3: version equality -> outcome.partition='unchanged'; no bridge state 
       const after = await readFile(stateJsonPath, "utf8");
       assert.equal(before, after, "state.json must NOT be rewritten on unchanged path");
 
-      // No "Updated:" rendering; "Unchanged:" present.
+      // Phase 19 / Plan 19-05: V2 byte form mirrors catalog
+      // `all-up-to-date-noop` (docs/output-catalog.md). The
+      // `unchanged` partition maps to a `(skipped) {up-to-date}` row.
+      // The benign `up-to-date` reason (in BENIGN_REASONS) routes
+      // severity to info per UXG-02 / D-28-06. Plugin-row `[<scope>]`
+      // bracket is suppressed by Phase 17.2 orphan-fold (plugin.scope ===
+      // mp.scope -> renderScopeBracket returns ""). No reload-hint when
+      // no plugin row is in the state-changing variant set per D-16-12.
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]?.severity, undefined);
       const body = notifications[0]?.message ?? "";
-      assert.match(body, /Unchanged:/);
-      assert.equal(body.includes("Run /reload to "), false, "no reload hint when 0 updated");
+      assert.equal(body, "● mp [project]\n  ⊘ hello (skipped) {up-to-date}");
+      assert.equal(body.includes("Unchanged:"), false);
+      assert.equal(
+        body.includes("/reload to pick up changes"),
+        false,
+        "no reload hint when 0 updated",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -313,8 +343,16 @@ test("PUP-4: source overridden to github-flavored URL -> outcome.partition='skip
 
       assert.equal(notifications.length, 1);
       const body = notifications[0]?.message ?? "";
-      assert.match(body, /Skipped:/);
-      assert.match(body, /is no longer installable/);
+      // Phase 19 / Plan 19-05: V2 byte form. `(skipped) {no longer
+      // installable}` row with the optional `v<fromVersion>` token from
+      // the installed record (PUP-4 carries `fromVersion: "1.0.0"`).
+      // Plugin-row `[<scope>]` bracket suppressed by orphan-fold per
+      // Phase 17.2. Severity routes via warning per D-16-11.
+      assert.equal(
+        body,
+        "1 plugin operation skipped.\n\n● mp [project]\n  ⊘ hello v1.0.0 (skipped) {no longer installable}",
+      );
+      assert.equal(notifications[0]?.severity, "warning");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -349,8 +387,14 @@ test("PUP-5: refreshed manifest no longer lists entry -> outcome.partition='skip
 
       assert.equal(notifications.length, 1);
       const body = notifications[0]?.message ?? "";
-      assert.match(body, /Skipped:/);
-      assert.match(body, /not in manifest/);
+      // Phase 19 / Plan 19-05: V2 byte form. `(skipped) {not in manifest}`
+      // row with the optional `v<fromVersion>` token from the installed
+      // record. Plugin-row `[<scope>]` bracket suppressed by orphan-fold.
+      assert.equal(
+        body,
+        "1 plugin operation skipped.\n\n● mp [project]\n  ⊘ hello v1.0.0 (skipped) {not in manifest}",
+      );
+      assert.equal(notifications[0]?.severity, "warning");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -403,13 +447,27 @@ test("PUP-6 happy: version bump triggers 3-phase swap; state reflects new versio
       const skillTarget = path.join(locations.skillsTargetDir, "hello-tool", "SKILL.md");
       assert.ok((await readFile(skillTarget, "utf8")).length > 0, "skill must exist on disk");
 
-      // RH-1 + RH-2 reload hint with verb 'refresh'.
+      // Phase 19 / Plan 19-05: V2 byte form mirrors catalog
+      // `single-mp-mixed` (docs/output-catalog.md:495-504) version-arrow
+      // discipline: `v<from> → v<to>` with `v` prefix on both sides --
+      // the renderer's composeVersionArrow owns
+      // the formatting per D-15-04 / D-16-04. Plugin-row `[<scope>]`
+      // bracket suppressed by orphan-fold. Soft-dep markers emit because
+      // the plugin declares agents + mcp but the host's `getAllTools()`
+      // returns [] (probe sees both companions unloaded). Reload-hint
+      // appended by notify() per D-16-12 from the `updated` variant.
       const errs = notifications.filter((n) => n.severity === "error");
       assert.equal(errs.length, 0, `unexpected errors: ${JSON.stringify(errs)}`);
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, undefined);
       const body = notifications[0]?.message ?? "";
-      assert.match(body, /Updated:/);
-      assert.match(body, /hello \(1\.0\.0 → 1\.0\.1\)/);
-      assert.match(body, /Run \/reload to refresh it\.$/);
+      assert.equal(
+        body,
+        "● mp [project]\n" +
+          "  ● hello v1.0.0 → v1.0.1 (updated) {requires pi-subagents, requires pi-mcp}\n" +
+          "\n" +
+          "/reload to pick up changes",
+      );
 
       // Ensure we referenced the seeded marketplaceRoot (compile-time use of `seeded`).
       assert.ok(seeded.marketplaceRoot.length > 0);
@@ -544,13 +602,29 @@ test("PUP-1 @mp form: enumerates all installed plugins in the marketplace, parti
       });
 
       const body = notifications[0]?.message ?? "";
-      // MU-7 ordering: Updated first, then Unchanged.
-      const idxUpdated = body.indexOf("Updated:");
-      const idxUnchanged = body.indexOf("Unchanged:");
-      assert.ok(idxUpdated >= 0 && idxUnchanged > idxUpdated, `partition order broken:\n${body}`);
-      assert.match(body, /alpha \(1\.0\.0 → 1\.0\.1\)/);
-      // PUP-8: hint emitted for the one updated plugin.
-      assert.match(body, /Run \/reload to refresh it\.$/);
+      // Phase 19 / Plan 19-05: V2 byte form combines `single-mp-mixed`
+      // catalog shape (docs/output-catalog.md:495-504): alpha (updated)
+      // + beta (skipped {up-to-date}) under one marketplace header in
+      // caller-order (D-16-06 -- orchestrator iterates in the
+      // enumerateTargets order; notify() does not sort plugin rows).
+      // Plugin-row `[<scope>]` brackets suppressed by orphan-fold. The
+      // (updated) row has no soft-dep markers (plugin declares no agents
+      // / no mcp; PUP-1 @mp fixture sets only `hasSkill: true`).
+      assert.equal(
+        body,
+        "● mp [project]\n" +
+          "  ● alpha v1.0.0 → v1.0.1 (updated)\n" +
+          "  ⊘ beta (skipped) {up-to-date}\n" +
+          "\n" +
+          "/reload to pick up changes",
+      );
+      // Severity routes to `error` if any failed; here no failed and no
+      // manual-recovery. The only skip row is benign (`beta` skipped
+      // `up-to-date`, in BENIGN_REASONS) and the `alpha (updated)` row is a
+      // success, so per UXG-02 / D-28-06 the whole cascade computes info (no
+      // severity arg). (Previously routed to warning under the old
+      // any-skip-is-warning ladder.)
+      assert.equal(notifications[0]?.severity, undefined);
       assert.ok(seeded.marketplaceRoot.length > 0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -582,7 +656,11 @@ test("PUP-8: no plugin updated -> no reload hint", async () => {
       });
 
       const body = notifications[0]?.message ?? "";
-      assert.equal(body.includes("Run /reload to "), false, "no reload hint when 0 updated");
+      assert.equal(
+        body.includes("/reload to pick up changes"),
+        false,
+        "no reload hint when 0 updated",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -706,14 +784,27 @@ test("PUP-6 phase-3 failure: bridge commit throws -> aggregate error carries 'pl
         target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
       });
 
-      // Look for the recovery hint marker anywhere in the notifications.
-      // Either notifyError fired (phase-3a aggregate) or the body's
-      // Failed: section names the recovery hint.
-      const allText = notifications.map((n) => n.message).join("\n");
+      // CR-01: phase-3a aggregate failure must fire EXACTLY ONE
+      // notification. Previously this test joined all notifications via
+      // `.join("\n")` before regex-matching, which silently masked the
+      // duplicate emission (one from the inline `notifyDirectFailure`
+      // inside `runThreePhaseUpdate`, a second from the cascade
+      // `renderUpdateCascadeAndNotify` walk after the outcome fell through
+      // to `outcomes[]`). The fix in `update.ts::updatePlugins` early-
+      // returns when the outcome carries `phaseFailures`, so a regression
+      // would surface here as `notifications.length === 2`.
+      assert.equal(
+        notifications.length,
+        1,
+        `expected exactly one notification for phase-3a aggregate failure, got ${notifications.length.toString()}: ${notifications.map((n) => n.message).join("\n---\n")}`,
+      );
+      // The recovery hint marker is carried by the inline
+      // `notifyDirectFailure` emission's `aggregate` cause text.
+      const allText = notifications[0]?.message ?? "";
       assert.match(
         allText,
         /plugin-uninstall \+ plugin-install for "hello"\./,
-        `expected RECOVERY_PLUGIN_REINSTALL_PREFIX hint somewhere in:\n${allText}`,
+        `expected RECOVERY_PLUGIN_REINSTALL_PREFIX hint in notification:\n${allText}`,
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -783,17 +874,65 @@ test("PUP-1 pl@mp: targeting a plugin not in state -> partition='skipped' (not i
       });
 
       const body = notifications[0]?.message ?? "";
-      assert.match(body, /Skipped:/);
-      assert.match(body, /not installed/);
+      // Phase 19 / Plan 19-05: V2 byte form. Plugin-row `[<scope>]`
+      // bracket suppressed by orphan-fold. Skipped severity per D-16-11.
+      assert.equal(
+        body,
+        "1 plugin operation skipped.\n\n● mp [project]\n  ⊘ hello (skipped) {not installed}",
+      );
+      assert.equal(notifications[0]?.severity, "warning");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 });
 
-// ─── PUP-1 missing marketplace -> notifyError (direct path) ────────────────────
+// ─── PUP-1 pl@mp: not in state AND not in manifest -> partition='failed' ───────
 
-test("PUP-1: targeting an unknown marketplace -> notifyError 'not found in <scope> scope'", async () => {
+// UXG-08 / D-29-08: `update <plugin>@<mp>` where the plugin is absent from both
+// local state AND the marketplace manifest now classifies as `(failed) {not in
+// manifest}` (matching `install`), not the prior `(skipped) {not installed}`.
+// `preflightUpdate` consults the manifest BEFORE concluding "not installed", so
+// a typo / nonexistent plugin name is distinguished from a real-but-uninstalled
+// plugin.
+test("PUP-1 pl@mp: targeting a plugin not in state AND not in manifest -> partition='failed' (not in manifest)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-pup1-pl-nomanifest-"));
+    try {
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        // Empty manifest: no entry for "hello", and hello is not installed
+        // (no installedVersions). The manifest check must fire before the
+        // "not installed" guard.
+        manifestPlugins: {},
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      const body = notifications[0]?.message ?? "";
+      assert.equal(
+        body,
+        "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello (failed) {not in manifest}",
+      );
+      assert.equal(notifications[0]?.severity, "error");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── PUP-1 missing marketplace -> direct-path V2 notify (PluginFailedMessage) ─
+
+test("PUP-1: targeting an unknown marketplace -> direct-path V2 notify (PluginFailedMessage with cause)", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "update-pup1-nomp-"));
     try {
@@ -806,9 +945,31 @@ test("PUP-1: targeting an unknown marketplace -> notifyError 'not found in <scop
         target: { kind: "marketplace", marketplace: "ghost-mp" },
       });
 
+      // Phase 19 / Plan 19-05: V2 direct-path failure (Option B) -- the
+      // enumerate-targets throw surfaces via a single notify(ctx, pi,
+      // { marketplaces: [{ name, scope, plugins: [PluginFailedMessage] }] })
+      // call. The synthetic failed-row identity is the marketplace name
+      // wrapped in parens (WR-01: a bare marketplace name in the plugin-row
+      // slot would render as `⊘ <marketplace> (failed) ...` directly under
+      // a marketplace block ALSO named `<marketplace>` -- a redundant /
+      // confusing row; the parens-wrapped form `⊘ (<marketplace>) (failed)
+      // ...` mirrors the SYNTHETIC_UPDATE_PLACEHOLDER_NAME = "(update)"
+      // bare-form precedent and is visually distinguishable from the mp
+      // header). The renderer composes the 4-space cause-chain trailer per
+      // D-16-08 from PluginFailedMessage.cause, preserving the V1
+      // error-text `Marketplace "ghost-mp" not found in project scope.`.
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]?.severity, "error");
+      // Cause-chain trailer text preserves the V1 error message.
       assert.match(notifications[0]?.message ?? "", /not found in project scope/);
+      // V2 byte form -- bare marketplace header + a synthetic failed plugin
+      // row carrying the parens-wrapped marketplace name (WR-01).
+      assert.equal(
+        notifications[0]?.message,
+        "1 plugin operation failed.\n\n● ghost-mp [project]\n" +
+          "  ⊘ (ghost-mp) (failed) {not found}\n" +
+          '    cause: Marketplace "ghost-mp" not found in project scope.',
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -841,8 +1002,692 @@ test("PUP-1 pl@mp: no explicit scope + plugin absent -> marketplace-fallback res
       });
 
       const body = notifications[0]?.message ?? "";
-      assert.match(body, /Skipped:/);
-      assert.match(body, /not installed/);
+      // Phase 19 / Plan 19-05: V2 byte form mirrors the pl@mp
+      // not-installed shape (PUP-1 above). Plugin-row `[<scope>]` bracket
+      // suppressed by orphan-fold.
+      assert.equal(
+        body,
+        "1 plugin operation skipped.\n\n● mp [project]\n  ⊘ hello (skipped) {not installed}",
+      );
+      assert.equal(notifications[0]?.severity, "warning");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── syncCloneOnce fetch failure -> notifyError (lines 207-213) ───────────────
+
+test("syncClone-fail: gitOps.fetch throws -> notifyError fired and updatePlugins returns early", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-syncfail-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await mkdir(locations.extensionRoot, { recursive: true });
+      const cloneDir = await locations.sourceCloneDir("official");
+      await cp(fixtureMarketplaceDir("valid-marketplace"), cloneDir, { recursive: true });
+
+      await saveState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          official: {
+            name: "official",
+            scope: "project",
+            source: githubSource("https://github.com/test/repo#main"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cloneDir, ".claude-plugin", "marketplace.json"),
+            marketplaceRoot: cloneDir,
+            plugins: {
+              hello: makePluginRecord("1.0.0"),
+            },
+          },
+        },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      // fetchThrows causes refreshGitHubClone -> gitOps.fetch to throw,
+      // which propagates through syncCloneOnce and is caught at lines 207-213.
+      const { gitOps } = makeMockGitOps({
+        fetchThrows: new Error("network: connection refused"),
+        remoteRefs: { "refs/remotes/origin/main": "abcdef0000000000000000000000000000000001" },
+      });
+
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "official" },
+        gitOps,
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.match(notifications[0]?.message ?? "", /network/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── invalid manifest -> loadMarketplaceManifest throws (covers preflightUpdate
+//     path where manifest load fails; lines 374-379 PLUGIN_ENTRY_VALIDATOR.Check
+//     is structurally unreachable because MARKETPLACE_VALIDATOR embeds the same
+//     PLUGIN_ENTRY_SCHEMA -- the outer check always catches it first) ───────────
+
+test("manifest-load-fail: manifest with invalid entry name type -> notifyError on direct path", async () => {
+  // When loadMarketplaceManifest throws (MARKETPLACE_VALIDATOR rejects an
+  // entry with name=number), the error propagates out of preflightUpdate
+  // and is caught by the direct path's catch at lines 232-239 -> notifyError.
+  // Lines 374-379 (PLUGIN_ENTRY_VALIDATOR.Check) are structurally
+  // unreachable: MARKETPLACE_VALIDATOR uses the same PLUGIN_ENTRY_SCHEMA, so
+  // any entry that passes MARKETPLACE_VALIDATOR also passes PLUGIN_ENTRY_VALIDATOR.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-manifest-fail-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      // Overwrite the manifest with an entry where `name` is a number.
+      // MARKETPLACE_VALIDATOR.Check fails -> loadMarketplaceManifest throws.
+      // This propagates through preflightUpdate -> runThreePhaseUpdate -> direct
+      // path catch -> notifyError.
+      await writeFile(
+        seeded.manifestPath,
+        JSON.stringify({
+          name: "mp",
+          plugins: [{ name: 42, source: "./plugins/hello", version: "1.0.1" }],
+        }),
+      );
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      // The direct path fires notifyError (not a skipped outcome, because
+      // loadMarketplaceManifest threw before PLUGIN_ENTRY_VALIDATOR.Check).
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.match(notifications[0]?.message ?? "", /schema invalid/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── prepareUpdateHandles catch + abortPartialHandles (lines 461-486) ─────────
+
+test("prepare-handles-fail: MCP collision in prepareStageMcpServers -> abortPartialHandles fires, outcome=failed", async () => {
+  // prepareStageMcpServers is the LAST bridge called inside prepareUpdateHandles.
+  // When it throws (McpServerCollisionError from assertNoMcpCollisions), the
+  // catch at lines 461-462 fires: abortPartialHandles is called with all
+  // three already-populated handles (skills, commands, agents), exercising
+  // the abortPartialHandles body (lines 467-486). The throw propagates to
+  // runThreePhaseUpdate -> updateSinglePlugin cascade catch -> partition='failed'.
+  //
+  // Setup: seed <cwd>/.pi/mcp.json with "server1" owned by a DIFFERENT plugin
+  // ("other-plugin"). Then seed hello@mp with version 1.0.1 declaring "server1".
+  // discoverGeneratedNames does NOT check MCP collisions (it only discovers
+  // skills/commands/agents), so it succeeds. prepareStageMcpServers then reads
+  // the scoped mcp.json, finds "server1" in `theirs` (owned by other-plugin),
+  // and throws McpServerCollisionError.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-prepare-mcp-fail-"));
+    try {
+      const marketplaceRoot = path.join(cwd, "mp-src");
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot,
+        marketplaceName: "mp",
+        manifestPlugins: {
+          hello: { version: "1.0.1", hasSkill: true, hasMcp: true },
+        },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      // Pre-populate the project-scope mcp.json with "server1" owned by
+      // "other-plugin". This puts "server1" into `theirs` when prepareStageMcpServers
+      // calls partitionExistingServers for the "hello" update.
+      // The hello plugin's .mcp.json (created by hasMcp: true) also declares
+      // "server1"; the collision fires because other-plugin already owns it.
+      const locations = locationsFor("project", cwd);
+      await mkdir(path.dirname(locations.mcpJsonPath), { recursive: true });
+      await writeFile(
+        locations.mcpJsonPath,
+        JSON.stringify({
+          mcpServers: {
+            server1: {
+              command: "node",
+              args: ["other.js"],
+              _piClaudeMarketplace: { plugin: "other-plugin", marketplace: "mp" },
+            },
+          },
+        }),
+      );
+
+      // Cascade path: updateSinglePlugin must return failed (not throw).
+      const prevCwd = process.cwd();
+      process.chdir(cwd);
+      try {
+        const outcome = await updateSinglePlugin("hello", "mp", "project");
+        assert.equal(outcome.partition, "failed", `expected failed, got ${outcome.partition}`);
+        assert.equal(outcome.name, "hello");
+        assert.ok((outcome.notes ?? []).length > 0, "failed outcome must carry error notes");
+      } finally {
+        process.chdir(prevCwd);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── bare form: enumerates both user and project scopes (lines 816-819) ───────
+
+test("bare-form both-scopes: plugins in user + project scopes both appear in update cascade", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-bare-both-"));
+    try {
+      // Seed project scope with plugin alpha.
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-proj"),
+        marketplaceName: "mp-proj",
+        manifestPlugins: { alpha: { version: "1.0.0", hasSkill: true } },
+        installedVersions: { alpha: "1.0.0" },
+      });
+
+      // Seed user scope (HOME-based) with plugin beta.
+      // locationsFor("user", ...) uses HOME to find the Pi agent dir.
+      const userLocations = locationsFor("user", cwd);
+      await mkdir(userLocations.extensionRoot, { recursive: true });
+      const userMarketplaceRoot = path.join(process.env.HOME ?? tmpdir(), "mp-user");
+      await mkdir(userMarketplaceRoot, { recursive: true });
+      await mkdir(path.join(userMarketplaceRoot, ".claude-plugin"), { recursive: true });
+
+      const betaPluginRoot = path.join(userMarketplaceRoot, "plugins", "beta");
+      await mkdir(betaPluginRoot, { recursive: true });
+      await mkdir(path.join(betaPluginRoot, ".claude-plugin"), { recursive: true });
+      await writeFile(
+        path.join(betaPluginRoot, ".claude-plugin", "plugin.json"),
+        JSON.stringify({ name: "beta", version: "1.0.0" }),
+      );
+      const betaSkillDir = path.join(betaPluginRoot, "skills", "tool");
+      await mkdir(betaSkillDir, { recursive: true });
+      await writeFile(path.join(betaSkillDir, "SKILL.md"), "---\nname: tool\n---\nBody.\n");
+
+      const userManifestPath = path.join(userMarketplaceRoot, ".claude-plugin", "marketplace.json");
+      await writeFile(
+        userManifestPath,
+        JSON.stringify({
+          name: "mp-user",
+          plugins: [{ name: "beta", source: "./plugins/beta", version: "1.0.0" }],
+        }),
+      );
+
+      await saveState(userLocations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          "mp-user": {
+            name: "mp-user",
+            scope: "user",
+            source: pathSource("./mp-user"),
+            addedFromCwd: cwd,
+            manifestPath: userManifestPath,
+            marketplaceRoot: userMarketplaceRoot,
+            plugins: {
+              beta: makePluginRecord("1.0.0"),
+            },
+          },
+        },
+      });
+
+      // bare form with no explicit scope -> enumerates both scopes (lines 816-819)
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        cwd,
+        target: { kind: "all" },
+        // No scope -> bare form enumerates both user and project scopes
+      });
+
+      // Both scopes should be enumerated. Both plugins are up-to-date
+      // (same version in manifest as in state), so we expect an "unchanged"
+      // notification that mentions both alpha and beta.
+      assert.equal(notifications.length, 1);
+      const body = notifications[0]?.message ?? "";
+      // Both plugins are up-to-date -> skipped cascade, info severity
+      assert.match(body, /up-to-date/);
+      assert.match(body, /alpha/);
+      assert.match(body, /beta/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── dropPluginCompletionCache catch -> notifyWarning (lines 690-696) ─────────
+
+test("dropCache-fail: cache path is a directory -> notifyWarning emitted after successful update", async () => {
+  // After a successful 3-phase update, dropPluginCompletionCache calls
+  // dropMarketplaceCache which calls unlink(pluginCachePath). If the path is
+  // a DIRECTORY, unlink throws EISDIR (not ENOENT), which is re-thrown by
+  // dropMarketplaceCache. The catch block in dropPluginCompletionCache fires
+  // and calls notifyWarning (lines 690-696), only for the direct path
+  // (isDirectUpdate === true, args.ctx !== undefined).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-dropcache-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      // Pre-create the plugin cache path as a DIRECTORY so that
+      // unlink(pluginCachePath) throws EISDIR instead of succeeding.
+      const cacheFile = await locations.pluginCacheFile("mp");
+      await mkdir(cacheFile, { recursive: true });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      // The update itself should succeed (partition='updated' -> reload hint)
+      // AND a warning notification for the cache drop failure should appear.
+      const errs = notifications.filter((n) => n.severity === "error");
+      assert.equal(errs.length, 0, `unexpected errors: ${JSON.stringify(errs)}`);
+
+      // Cache drop errors are swallowed in V2; update still succeeds.
+      const successes = notifications.filter((n) => n.severity === undefined);
+      assert.ok(successes.length >= 1, "expected success notification for the update");
+      assert.match(successes[0]?.message ?? "", /updated/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── swapStateRecord: marketplace removed between sync and preflight ───────────
+
+test("swapState-mp-gone: marketplace removed via gitOps.fetch side-effect -> graceful skipped outcome", async () => {
+  // Uses a github-source marketplace with a custom gitOps. The gitOps.fetch
+  // synchronously writes a modified state.json that removes the marketplace
+  // entry. The modification happens INSIDE syncCloneOnce's github-source
+  // branch (after syncCloneOnce's loadState found the marketplace) but is
+  // written to disk, so subsequent loadState calls (preflightUpdate and
+  // withStateGuard) read the modified state.
+  //
+  // preflightUpdate reads the now-modified state where the marketplace is
+  // absent -> returns partition='skipped' (notes: marketplace not found).
+  // No unhandled throw; no error notification.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-swap-mp-gone-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await mkdir(locations.extensionRoot, { recursive: true });
+      const cloneDir = await locations.sourceCloneDir("official");
+      await cp(fixtureMarketplaceDir("valid-marketplace"), cloneDir, { recursive: true });
+
+      await saveState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          official: {
+            name: "official",
+            scope: "project",
+            source: githubSource("https://github.com/test/repo#main"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cloneDir, ".claude-plugin", "marketplace.json"),
+            marketplaceRoot: cloneDir,
+            plugins: {
+              hello: makePluginRecord("0.0.9"),
+            },
+          },
+        },
+      });
+
+      const stateJsonPath = locations.stateJsonPath;
+
+      const { gitOps } = makeMockGitOps({
+        remoteRefs: { "refs/remotes/origin/main": "abcdef0000000000000000000000000000000001" },
+      });
+      const originalFetch = gitOps.fetch.bind(gitOps);
+      const mutatingGitOps = {
+        ...gitOps,
+        fetch: async (opts: Parameters<typeof gitOps.fetch>[0]): Promise<void> => {
+          await originalFetch(opts);
+          // Synchronously remove the marketplace from state.json so that
+          // subsequent loadState calls (preflightUpdate) find no marketplace.
+          writeFileSync(stateJsonPath, JSON.stringify({ schemaVersion: 1, marketplaces: {} }));
+        },
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "official" },
+        gitOps: mutatingGitOps,
+      });
+
+      // enumerateTargets ran with original state (hello in official).
+      // syncCloneOnce ran, modified state.json to remove official.
+      // preflightUpdate reads modified state -> marketplace not found ->
+      // returns skipped. The notification reflects a skipped outcome.
+      assert.ok(notifications.length >= 1, "expected at least one notification");
+      const errs = notifications.filter((n) => n.severity === "error");
+      assert.equal(errs.length, 0, "no error notification expected");
+      const body = notifications[0]?.message ?? "";
+      assert.match(body, /skipped/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── swapStateRecord: plugin concurrently uninstalled (lines 511-514) ─────────
+
+test("swapState-plugin-gone: plugin removed from state between enumerateTargets and preflight -> skipped", async () => {
+  // gitOps.fetch removes the plugin record from state.json after
+  // enumerateTargets has already collected "hello" as a target. When
+  // preflightUpdate runs, loadState finds no "hello" in the marketplace
+  // plugins -> returns partition='skipped' (notes: "not installed").
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-swap-plugin-gone-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await mkdir(locations.extensionRoot, { recursive: true });
+      const cloneDir = await locations.sourceCloneDir("official");
+      await cp(fixtureMarketplaceDir("valid-marketplace"), cloneDir, { recursive: true });
+
+      await saveState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          official: {
+            name: "official",
+            scope: "project",
+            source: githubSource("https://github.com/test/repo#main"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cloneDir, ".claude-plugin", "marketplace.json"),
+            marketplaceRoot: cloneDir,
+            plugins: {
+              hello: makePluginRecord("0.0.9"),
+            },
+          },
+        },
+      });
+
+      const stateJsonPath = locations.stateJsonPath;
+
+      const { gitOps } = makeMockGitOps({
+        remoteRefs: { "refs/remotes/origin/main": "abcdef0000000000000000000000000000000001" },
+      });
+      const originalFetch = gitOps.fetch.bind(gitOps);
+      const mutatingGitOps = {
+        ...gitOps,
+        fetch: async (opts: Parameters<typeof gitOps.fetch>[0]): Promise<void> => {
+          await originalFetch(opts);
+          // Remove only the "hello" plugin record, keep marketplace intact.
+          writeFileSync(
+            stateJsonPath,
+            JSON.stringify({
+              schemaVersion: 1,
+              marketplaces: {
+                official: {
+                  name: "official",
+                  scope: "project",
+                  source: { kind: "github", raw: "https://github.com/test/repo#main" },
+                  addedFromCwd: cwd,
+                  manifestPath: path.join(cloneDir, ".claude-plugin", "marketplace.json"),
+                  marketplaceRoot: cloneDir,
+                  plugins: {},
+                },
+              },
+            }),
+          );
+        },
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "official" },
+        gitOps: mutatingGitOps,
+      });
+
+      // preflightUpdate reads modified state -> "hello" not in plugins ->
+      // returns skipped (not installed). Graceful path, no error.
+      assert.ok(notifications.length >= 1, "expected at least one notification");
+      const errs = notifications.filter((n) => n.severity === "error");
+      assert.equal(errs.length, 0, "no error notification expected");
+      const body = notifications[0]?.message ?? "";
+      assert.match(body, /skipped/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── concurrent version bump via gitOps.fetch side-effect ─────────────────────
+
+test("swapState-version-advanced: version advanced during fetch -> update runs against newer fromVersion", async () => {
+  // gitOps.fetch advances hello's version from 0.0.9 to 0.0.10 in state.json.
+  // preflightUpdate reads 0.0.10 as fromVersion. The manifest fixture has
+  // hello at 1.0.0, which is different -> preflight returns PluginPreflight.
+  // withStateGuard then reads state (still 0.0.10) and the guard
+  // fromVersion==0.0.10 matches state.version==0.0.10 -> no ST-9 error.
+  // The update proceeds successfully.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-swap-ver-advanced-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await mkdir(locations.extensionRoot, { recursive: true });
+      const cloneDir = await locations.sourceCloneDir("official");
+      await cp(fixtureMarketplaceDir("valid-marketplace"), cloneDir, { recursive: true });
+
+      await saveState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          official: {
+            name: "official",
+            scope: "project",
+            source: githubSource("https://github.com/test/repo#main"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cloneDir, ".claude-plugin", "marketplace.json"),
+            marketplaceRoot: cloneDir,
+            plugins: {
+              hello: makePluginRecord("0.0.9"),
+            },
+          },
+        },
+      });
+
+      const stateJsonPath = locations.stateJsonPath;
+
+      const { gitOps } = makeMockGitOps({
+        remoteRefs: { "refs/remotes/origin/main": "abcdef0000000000000000000000000000000001" },
+      });
+      const originalFetch = gitOps.fetch.bind(gitOps);
+      const mutatingGitOps = {
+        ...gitOps,
+        fetch: async (opts: Parameters<typeof gitOps.fetch>[0]): Promise<void> => {
+          await originalFetch(opts);
+          // Advance hello's version to 0.0.10.
+          writeFileSync(
+            stateJsonPath,
+            JSON.stringify({
+              schemaVersion: 1,
+              marketplaces: {
+                official: {
+                  name: "official",
+                  scope: "project",
+                  source: { kind: "github", raw: "https://github.com/test/repo#main" },
+                  addedFromCwd: cwd,
+                  manifestPath: path.join(cloneDir, ".claude-plugin", "marketplace.json"),
+                  marketplaceRoot: cloneDir,
+                  plugins: { hello: makePluginRecord("0.0.10") },
+                },
+              },
+            }),
+          );
+        },
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "official" },
+        gitOps: mutatingGitOps,
+      });
+
+      // No error: version advanced from 0.0.9 to 0.0.10, manifest has 1.0.0.
+      // preflightUpdate uses 0.0.10 as fromVersion; withStateGuard finds 0.0.10
+      // -> they match -> update proceeds.
+      assert.ok(notifications.length >= 1, "expected at least one notification");
+      const errs = notifications.filter((n) => n.severity === "error");
+      assert.equal(errs.length, 0, `unexpected error: ${JSON.stringify(errs)}`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── phase 3a commands commit failure (lines 618-619) ─────────────────────────
+
+test("phase3a-commands-fail: command target occupied by directory -> phase3aFailures includes commands", async () => {
+  // commitPreparedCommands calls rename(stagedFile.md, targetFile.md).
+  // On Linux, rename(regular_file, existing_directory) fails with EISDIR.
+  // Pre-creating the command target path as a DIRECTORY forces this error.
+  // This exercises lines 618-619 in runThreePhaseUpdate's phase 3a aggregation.
+  //
+  // We also pre-create the skills target as a FILE (as in the PUP-6 test) to
+  // force skills commit failure too, ensuring the phase3aFailures array has
+  // multiple entries and the recovery hint includes the command failure.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-phase3a-cmd-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: {
+          hello: { version: "1.0.1", hasSkill: true, hasCommand: true },
+        },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      // Obstacle 1: pre-create skills target as a FILE so commitPreparedSkills throws.
+      await mkdir(locations.skillsTargetDir, { recursive: true });
+      await writeFile(path.join(locations.skillsTargetDir, "hello-tool"), "obstacle");
+
+      // Obstacle 2: pre-create the command target path as a DIRECTORY so
+      // commitPreparedCommands rename(file -> dir) fails with EISDIR.
+      await mkdir(locations.promptsTargetDir, { recursive: true });
+      await mkdir(path.join(locations.promptsTargetDir, "hello:deploy.md"), { recursive: true });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      // Both skills and commands commit should fail; the aggregate recovery
+      // hint should appear in the notifications.
+      const allText = notifications.map((n) => n.message).join("\n");
+      assert.match(
+        allText,
+        /plugin-uninstall \+ plugin-install for "hello"\./,
+        `expected RECOVERY_PLUGIN_REINSTALL_PREFIX hint somewhere in:\n${allText}`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── phase 3a agents commit failure (lines 631-632) ──────────────────────────
+
+test("phase3a-agents-fail: agent target path is a directory -> commitPreparedAgents throws", async () => {
+  // commitPreparedAgents calls rename(stagedFile.md, targetFile.md) for each
+  // agent. On Linux, rename(regular_file, existing_directory) fails with
+  // EISDIR. Pre-creating the agent target path as a DIRECTORY forces this.
+  // This exercises lines 631-632 in runThreePhaseUpdate's phase 3a aggregation.
+  //
+  // Also pre-create the skills obstacle so the test also verifies that
+  // phase 3a continues across multiple bridge failures (D-03 discipline).
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-phase3a-agents-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: {
+          hello: { version: "1.0.1", hasSkill: true, hasAgent: true },
+        },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      // Pre-create the skills target as a FILE to force skills commit failure.
+      await mkdir(locations.skillsTargetDir, { recursive: true });
+      await writeFile(path.join(locations.skillsTargetDir, "hello-tool"), "obstacle");
+
+      // Pre-create the agent target path as a DIRECTORY to force agents commit
+      // failure. The generated agent name for "bot" in plugin "hello" is
+      // GENERATED_AGENT_PREFIX + "hello-bot".
+      await mkdir(locations.agentsDir, { recursive: true });
+      await mkdir(path.join(locations.agentsDir, `${GENERATED_AGENT_PREFIX}hello-bot.md`), {
+        recursive: true,
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      // Both skills and agents commit should fail; recovery hint appears.
+      const allText = notifications.map((n) => n.message).join("\n");
+      assert.match(
+        allText,
+        /plugin-uninstall \+ plugin-install for "hello"\./,
+        `expected RECOVERY_PLUGIN_REINSTALL_PREFIX hint somewhere in:\n${allText}`,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

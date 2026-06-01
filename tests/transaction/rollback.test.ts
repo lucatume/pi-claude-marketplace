@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ROLLBACK_PARTIAL } from "../../extensions/pi-claude-marketplace/shared/markers.ts";
 import {
   PathContainmentError,
   SymlinkRefusedError,
@@ -11,17 +10,33 @@ import { formatRollbackError } from "../../extensions/pi-claude-marketplace/tran
 import type { RunPhasesResult } from "../../extensions/pi-claude-marketplace/transaction/phase-ledger.ts";
 
 /**
- * D-03 / AS-4 / ES-4 -- formatRollbackError marker assembly.
+ * D-03 / AS-4 / ES-4 / D-14-04 -- formatRollbackError structured result.
  *
- * formatRollbackError is the single chokepoint for the ES-5 user-contract
- * marker prefix. Tests verify (a) zero-partial fast path returns the
- * original error instance unchanged, (b) the assembled marker uses the
- * imported ROLLBACK_PARTIAL constant verbatim (D-03 single-chokepoint
- * discipline -- no inline literal), (c) ES-4 cause chain is set so
- * downstream notifyError can traverse to the original.
+ * Plan 14-06 refactor (orchestrator-owns-rendering per RESEARCH.md
+ * Pitfall 6): formatRollbackError no longer composes the user-visible
+ * body. It returns a structured `RollbackErrorResult` -- the original
+ * (or cause-wrapped) Error PLUS the raw `RollbackPartial[]` data so the
+ * orchestrator can render via the V2 `notify` path.
+ *
+ * The pre-Plan-14-06 hand-composed `(failed) {rollback partial}` body
+ * is gone from the transaction-layer code.
+ *
+ * Tests verify (a) zero-partial fast path returns the original Error
+ * instance unwrapped with an empty partials array, (b) the cause-wrapped
+ * Error preserves the original .message and sets .cause, (c) the raw
+ * `rollbackPartials` array is forwarded verbatim, (d) PathContainmentError
+ * / SymlinkRefusedError bypass returns the original instance verbatim
+ * with an empty partials array.
+ *
+ * The byte-equivalent rendering of the children block was historically
+ * tested here against the V1 `composeRollbackPartialChildren` helper
+ * (Plan 14-06); Phase 21 deletes that helper alongside the rest of the
+ * V1 rendering surface, and the V2 byte form is enforced by
+ * `tests/architecture/catalog-uat.test.ts` against the renderer in
+ * `shared/notify.ts`.
  */
 
-test("D-03 formatRollbackError: empty partials returns original error unchanged", () => {
+test("D-03 formatRollbackError: empty partials returns original error unchanged + empty partials array", () => {
   const original = new Error("staging failed");
   const result: RunPhasesResult = {
     ok: false,
@@ -30,33 +45,45 @@ test("D-03 formatRollbackError: empty partials returns original error unchanged"
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  assert.strictEqual(got, original, "no partials -> same Error instance");
+  assert.strictEqual(got.error, original, "no partials -> same Error instance");
+  assert.deepEqual(got.rollbackPartials, [], "no partials -> empty array");
 });
 
-test("D-03 / AS-4 formatRollbackError: 2 partials emit ES-5 marker exactly", () => {
+test("D-03 / AS-4 formatRollbackError: 2 partials return cause-wrapped Error + raw RollbackPartial[] data", () => {
   const original = new Error("staging failed");
+  const partials = [
+    { phase: "skills/prompts", msg: "rm failed" },
+    { phase: "agents", msg: "index unreadable" },
+  ] as const;
   const result: RunPhasesResult = {
     ok: false,
     error: original,
-    rollbackPartials: [
-      { phase: "skills/prompts", msg: "rm failed" },
-      { phase: "agents", msg: "index unreadable" },
-    ],
+    rollbackPartials: partials,
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  const expectedMarker = `${ROLLBACK_PARTIAL}[skills/prompts] rm failed; [agents] index unreadable)`;
-  assert.ok(
-    got.message.includes(expectedMarker),
-    `expected message to contain "${expectedMarker}"; got: "${got.message}"`,
+  // Original message preserved on the wrapper Error (D-14-04: rendering
+  // moves to orchestrator; transaction layer just preserves the message).
+  assert.equal(
+    got.error.message,
+    "staging failed",
+    `expected original message preserved on wrapper Error; got: "${got.error.message}"`,
   );
-  assert.ok(
-    got.message.startsWith("staging failed"),
-    `expected original message at start; got: "${got.message}"`,
+  // ES-4 cause chain set so notifyError can traverse to the original.
+  assert.strictEqual(
+    got.error.cause,
+    original,
+    "expected cause-wrapped Error to retain reference to originalError",
   );
+  // Raw partials forwarded verbatim -- the V2 notify renderer consumes
+  // this array to render the children block via composeRollbackPartialLines
+  // in shared/notify.ts.
+  assert.equal(got.rollbackPartials.length, 2);
+  assert.equal(got.rollbackPartials[0]?.phase, "skills/prompts");
+  assert.equal(got.rollbackPartials[1]?.phase, "agents");
 });
 
-test("D-03 formatRollbackError: 1 partial produces single-element marker (no trailing semicolon)", () => {
+test("D-03 formatRollbackError: 1 partial returns cause-wrapped Error + single-element array", () => {
   const original = new Error("base");
   const result: RunPhasesResult = {
     ok: false,
@@ -65,12 +92,21 @@ test("D-03 formatRollbackError: 1 partial produces single-element marker (no tra
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  const expected = `${ROLLBACK_PARTIAL}[p1] reason)`;
-  assert.ok(got.message.includes(expected), `got: "${got.message}"`);
-  assert.ok(!got.message.includes(";"), "single partial should have no semicolon");
+  assert.equal(got.error.message, "base");
+  assert.strictEqual(got.error.cause, original);
+  assert.equal(got.rollbackPartials.length, 1);
+  assert.equal(got.rollbackPartials[0]?.phase, "p1");
+  // F-4 (case-insensitive guard): no legacy free-text prose with a
+  // colon-prefixed marker form (retired ES-5 shape) seeps back into the
+  // wrapper Error's message. The token vocabulary is the closed CMC-11
+  // set composed on the orchestrator side, not in the wrapper.
+  assert.ok(
+    !got.error.message.toLowerCase().includes("reason"),
+    `legacy "reason:" prose detected on wrapper Error; got: "${got.error.message}"`,
+  );
 });
 
-test("ES-4 formatRollbackError: new Error has cause set to originalError", () => {
+test("ES-4 formatRollbackError: cause-wrapped Error retains originalError reference", () => {
   const original = new Error("base");
   const result: RunPhasesResult = {
     ok: false,
@@ -79,10 +115,13 @@ test("ES-4 formatRollbackError: new Error has cause set to originalError", () =>
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  assert.strictEqual(got.cause, original);
+  assert.strictEqual(got.error.cause, original);
+  // Identity check: the returned Error is a fresh wrapper (NOT the
+  // originalError reference) because a partial occurred.
+  assert.notStrictEqual(got.error, original);
 });
 
-test("D-03 single-chokepoint: marker prefix is the imported ROLLBACK_PARTIAL constant", () => {
+test("D-14-04 orchestrator-owns-rendering: transaction layer no longer composes the user-visible body", () => {
   const original = new Error("x");
   const result: RunPhasesResult = {
     ok: false,
@@ -91,10 +130,16 @@ test("D-03 single-chokepoint: marker prefix is the imported ROLLBACK_PARTIAL con
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  // The marker prefix in the message must be exactly the imported constant.
+  // The transaction-layer chokepoint MUST NOT include the parent token
+  // or child rendering -- those are the orchestrator's responsibility
+  // (Plan 14-06 / RESEARCH.md Pitfall 6).
   assert.ok(
-    got.message.includes(ROLLBACK_PARTIAL),
-    `marker prefix drift: got "${got.message}", expected to contain "${ROLLBACK_PARTIAL}"`,
+    !got.error.message.includes("(failed) {rollback partial}"),
+    `parent token leaked into transaction-layer wrapper Error: "${got.error.message}"`,
+  );
+  assert.ok(
+    !got.error.message.includes("(rollback failed)"),
+    `child token leaked into transaction-layer wrapper Error: "${got.error.message}"`,
   );
 });
 
@@ -102,13 +147,15 @@ test("D-03 single-chokepoint: marker prefix is the imported ROLLBACK_PARTIAL con
  * D-02 / PI-14 -- formatRollbackError MUST short-circuit when the
  * originalError is a PathContainmentError (or its SymlinkRefusedError
  * subclass per Phase 1 D-17). The violation surfaces verbatim instead
- * of being folded into the (rollback partial: ...) marker, so every
- * mutating orchestrator (install / update / uninstall) inherits PI-14
- * compliance from this single chokepoint.
+ * of being folded into the rollback-partial body, so every mutating
+ * orchestrator (install / update / uninstall) inherits PI-14 compliance
+ * from this single chokepoint.
  *
  * These tests deliberately pass a non-empty `rollbackPartials` array so
- * the pre-D-02 code path would compose the marker; the bypass MUST
- * suppress it and return the originalError reference unchanged.
+ * the pre-D-02 code path would compose the body; the bypass MUST
+ * suppress it -- in the D-14-04 refactor, suppression means returning
+ * the originalError reference + an EMPTY partials array so the
+ * orchestrator skips rendering entirely.
  */
 test("PI-14 / D-02: PathContainmentError originalError bypasses rollback-partial wrapping", () => {
   const original = new PathContainmentError("/scope-root", "/escaped/path", "test");
@@ -119,21 +166,18 @@ test("PI-14 / D-02: PathContainmentError originalError bypasses rollback-partial
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  // Verbatim return -- NOT wrapped.
-  assert.strictEqual(got, original, "expected the original PathContainmentError reference");
-  // ES-5 marker MUST NOT be composed onto the message.
-  assert.equal(
-    got.message.includes(ROLLBACK_PARTIAL),
-    false,
-    `marker leaked into PathContainmentError message: "${got.message}"`,
+  // Verbatim return -- NOT cause-wrapped.
+  assert.strictEqual(got.error, original, "expected the original PathContainmentError reference");
+  // Empty partials array -- orchestrator MUST skip the children block.
+  assert.deepEqual(
+    got.rollbackPartials,
+    [],
+    "expected empty partials array under PathContainmentError bypass",
   );
   // Type discrimination preserved (name + instanceof) so downstream
   // notifyError can still identify a containment violation.
-  assert.equal(got.name, "PathContainmentError");
-  assert.ok(got instanceof PathContainmentError);
-  // Cause chain intact: returned error IS the original (strict-equal),
-  // so any wrapper above can still traverse `.cause` on errors farther
-  // up the stack without losing the containment violation identity.
+  assert.equal(got.error.name, "PathContainmentError");
+  assert.ok(got.error instanceof PathContainmentError);
 });
 
 test("PI-14 / D-02: SymlinkRefusedError (subclass) bypasses rollback-partial wrapping", () => {
@@ -151,18 +195,22 @@ test("PI-14 / D-02: SymlinkRefusedError (subclass) bypasses rollback-partial wra
     leaks: [],
   };
   const got = formatRollbackError(result, original);
-  assert.strictEqual(got, original, "expected the original SymlinkRefusedError reference");
-  assert.equal(
-    got.message.includes(ROLLBACK_PARTIAL),
-    false,
-    `marker leaked into SymlinkRefusedError message: "${got.message}"`,
-  );
-  assert.equal(got.name, "SymlinkRefusedError");
+  assert.strictEqual(got.error, original, "expected the original SymlinkRefusedError reference");
+  assert.deepEqual(got.rollbackPartials, [], "expected empty partials array under bypass");
+  assert.equal(got.error.name, "SymlinkRefusedError");
   // Subclass relationship intact -- one instanceof at the chokepoint
   // catches both (Phase 1 D-17 contract).
   assert.ok(
-    got instanceof PathContainmentError,
+    got.error instanceof PathContainmentError,
     "SymlinkRefusedError must remain an instance of PathContainmentError",
   );
-  assert.ok(got instanceof SymlinkRefusedError);
+  assert.ok(got.error instanceof SymlinkRefusedError);
 });
+
+// Plan 14-06's V1 byte-equivalence tests for the rollback children block
+// previously lived here, invoking `composeRollbackPartialChildren` from
+// the retired `presentation/rollback-partial.ts`. Phase 21 (D-21-02) deletes
+// that V1 helper alongside the rest of the V1 rendering layer; the V2
+// `composeRollbackPartialLines` in `shared/notify.ts` now owns the
+// children-block grammar, and `tests/architecture/catalog-uat.test.ts`
+// asserts byte-equality against the v1.4 catalog fixtures.

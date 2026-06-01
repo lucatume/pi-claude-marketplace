@@ -28,18 +28,34 @@ import type { AgentsIndex } from "../../../extensions/pi-claude-marketplace/pers
 import type { ExtensionState } from "../../../extensions/pi-claude-marketplace/persistence/state-io.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// PU-1..8 + AS-6 (post-commit cleanup leaks warning-severity) + NFR-5 (no network).
+// PU-1..8 + AS-6 (post-commit cleanup leaks) + NFR-5 (no network).
+//
+// Phase 19 / Plan 19-01 V2 migration: every notification assertion is now
+// byte-exact against the V2 catalog forms at docs/output-catalog.md:336-378.
+// Per D-19-01 the V1 post-state-commit `notifyWarning` sites at uninstall.ts
+// lines 179 (cache-refresh failure) and 200 (data-dir cleanup-leak) are
+// DROPPED entirely -- the surrounding try/catch retains the side-effecting
+// rm() / dropMarketplaceCache calls; only the user-facing warning surface
+// is gone. Test consequences:
+//   - PU-2+PU-4 still asserts state-record removal under a cleanup leak,
+//     but the second-notification warning assertion is gone; the only
+//     notification is the V2 success row.
+//   - PU-8 (b) flips: V2 reload-hint is per-variant (uninstalled is
+//     state-changing per D-16-12) and no longer gated on cascade-resource
+//     drop count.
 //
 // Test taxonomy (PRD §5.2.2 PU-1..8):
 //   PU-1: order skills -> commands -> agents -> mcp (covered by end-state assertion;
 //         the order is encoded inside cascadeUnstagePlugin per Phase 4 D-03 corollary)
-//   PU-2: state commit BEFORE pluginDataDir cleanup
+//   PU-2: state commit BEFORE pluginDataDir cleanup (state mutation still asserted;
+//         the V1 warning surface is dropped per D-19-01)
 //   PU-3: failures earlier than data-dir cleanup abort the state commit
-//   PU-4: data-dir cleanup leaks surface as warning-severity with the leaked path named
+//   PU-4: (DROPPED per D-19-01) -- data-dir cleanup leak is no longer a user surface;
+//         the rm() call still runs.
 //   PU-5: silent converge -- record already absent -> no notification
 //   PU-6: legacy state migration (resources.agents / resources.mcpServers absent) -> normalized to []
 //   PU-7: foreign-content propagation; agents-index row retained
-//   PU-8: reload hint gated on >=1 dropped resource
+//   PU-8: reload hint per D-16-12 (always emitted on uninstalled variant)
 
 interface NotifyRecord {
   message: string;
@@ -230,23 +246,30 @@ test("PU-1: cascade order observable end-state -- all four bridges' resources re
       const after = await loadState(locations.extensionRoot);
       assert.equal("hello" in (after.marketplaces["mp"]?.plugins ?? {}), false);
 
-      // PU-8: reload hint emitted (verb 'drop'); single dropped name -> "it" form.
+      // Phase 19 / Plan 19-01: V2 byte form per docs/output-catalog.md:344-348
+      // (catalog-state `success`). The marketplace header is a bare label
+      // row (status omitted -- plugin-uninstall surface uses SUB-BRANCH A
+      // of renderMpHeader). Plugin row uses ICON_AVAILABLE (`○`) per
+      // D-16-11 effective-state rule. Reload-hint is emitted by notify()
+      // per D-16-12 (uninstalled is in the state-changing variant set).
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]?.severity, undefined); // success
-      assert.match(
-        notifications[0]?.message ?? "",
-        /Uninstalled plugin "hello" from marketplace "mp"\./,
+      assert.equal(
+        notifications[0]?.message,
+        "● mp [project]\n  ○ hello v0.0.1 (uninstalled)\n\n/reload to pick up changes",
       );
-      assert.match(notifications[0]?.message ?? "", /Run \/reload to drop it\.$/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 });
 
-// PU-2 + PU-4 (state commit BEFORE data-dir cleanup; cleanup leaks -> warning) -----
+// PU-2 (state commit BEFORE data-dir cleanup; cleanup leaks SWALLOWED in V2
+// per D-19-01 -- the rm() still runs; only the user-visible warning surface
+// is gone). The pre-19 PU-4 warning assertion is removed; PU-2's state-record
+// removal under a cleanup leak is still the binding behavior.
 
-test("PU-2 + PU-4: pluginDataDir rm failure leaves state record removed and warns with leaked path", async () => {
+test("PU-2: pluginDataDir rm failure leaves state record removed; cleanup leak SWALLOWED per D-19-01", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-pu2-"));
     try {
@@ -292,17 +315,22 @@ test("PU-2 + PU-4: pluginDataDir rm failure leaves state record removed and warn
       const after = await loadState(locations.extensionRoot);
       assert.equal("hello" in (after.marketplaces["mp"]?.plugins ?? {}), false);
 
-      // PU-4: warning surfaces with leaked dataDir path named.
+      // D-19-01: V2 emits EXACTLY one notification -- the success row. The
+      // cleanup leak still occurred (the parent dir is chmod 0o555 so rm
+      // failed) but the warning surface is gone; the rm() call inside
+      // uninstall.ts's try/catch swallowed the error silently.
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, "warning");
-      assert.match(
-        notifications[0]?.message ?? "",
-        /cleanup partial/i,
-        "must mention partial cleanup",
+      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(
+        notifications[0]?.message,
+        "● mp [project]\n  ○ hello v0.0.1 (uninstalled)\n\n/reload to pick up changes",
       );
-      assert.ok(
+      // Defense-in-depth: the dropped V1 warning content (the leaked
+      // dataDir path) MUST NOT appear in any V2 notification.
+      assert.equal(
         (notifications[0]?.message ?? "").includes(dataDir),
-        `must name the leaked dataDir path: got "${notifications[0]?.message ?? ""}"`,
+        false,
+        `D-19-01: dropped warning must not surface the leaked path; got "${notifications[0]?.message ?? ""}"`,
       );
     } finally {
       // Tmpdir teardown handles the rest.
@@ -313,7 +341,7 @@ test("PU-2 + PU-4: pluginDataDir rm failure leaves state record removed and warn
 
 // PU-3 + PU-7 (foreign content -> cascade fails -> state retained, index retained) ---
 
-test("PU-3 + PU-7: foreign agent content -> notifyError + state record retained + agents-index row retained", async () => {
+test("PU-3 + PU-7: foreign agent content -> V2 PluginFailedMessage + state record retained + agents-index row retained", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-pu7-"));
     try {
@@ -387,10 +415,34 @@ test("PU-3 + PU-7: foreign agent content -> notifyError + state record retained 
       assert.equal(loadedIdx.agents.length, 1, "agents-index row retained");
       assert.equal(loadedIdx.agents[0]?.generatedName, agentName);
 
-      // notifyError fires.
+      // Phase 19 / Plan 19-01: V2 byte form per docs/output-catalog.md:370-374
+      // (catalog-state `failure-permission-denied` shape -- the closed-set
+      // Reason here is `"not in manifest"` because the cause is an
+      // AgentsUnstageFailureError, which narrowCascadeFailure() maps to
+      // that Reason per the marketplace/remove.ts precedent).
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]?.severity, "error");
+      // Phase 29 / UXG-07 (D-29-02/03): the "1 plugin operation failed."
+      // summary line is prepended before the cascade body (1 failed plugin,
+      // mp glyph `●` so the marketplace did not fail).
+      assert.equal(
+        (notifications[0]?.message ?? "").startsWith(
+          "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello v0.0.1 (failed) {not in manifest}\n",
+        ),
+        true,
+        `V2 failure row prefix mismatch: got "${notifications[0]?.message ?? ""}"`,
+      );
+      // The 4-space-indent `cause:` trailer surfaces the AgentsUnstageFailureError
+      // message verbatim per D-16-08; the regex below confirms the underlying
+      // bridge text is still present after the V2 rendering layer change.
       assert.match(notifications[0]?.message ?? "", /Failed to remove .* agent/i);
+      // No reload-hint on failure -- a failed uninstall did not remove
+      // anything per docs/output-catalog.md:376.
+      assert.equal(
+        (notifications[0]?.message ?? "").includes("/reload to pick up changes"),
+        false,
+        "failed uninstall must not emit reload-hint trailer",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -528,9 +580,9 @@ test("PU-6: legacy state record missing resources.agents/mcpServers loads + unin
   });
 });
 
-// PU-8 reload-hint gating ------------------------------------------
+// PU-8 reload-hint gating (V2: per-variant trigger ladder per D-16-12) ----------
 
-test("PU-8 (a): >=1 resource dropped -> reload hint present (verb 'drop', 'it' form)", async () => {
+test("PU-8 (a): uninstalled variant -> reload-hint always emitted by notify() per D-16-12", async () => {
   // Already covered by PU-1 test above; this assertion is the explicit gate.
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-pu8a-"));
@@ -569,14 +621,17 @@ test("PU-8 (a): >=1 resource dropped -> reload hint present (verb 'drop', 'it' f
       });
 
       assert.equal(notifications.length, 1);
-      assert.match(notifications[0]?.message ?? "", /Run \/reload to drop it\.$/);
+      assert.equal(
+        notifications[0]?.message,
+        "● mp [project]\n  ○ lonely v0.0.1 (uninstalled)\n\n/reload to pick up changes",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 });
 
-test("PU-8 (b): zero dropped resources -> NO reload hint (cascade injection seam)", async () => {
+test("PU-8 (b): V2 per-variant reload-hint -- emitted on uninstalled even with zero dropped (cascade stub)", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-pu8b-"));
     try {
@@ -618,11 +673,13 @@ test("PU-8 (b): zero dropped resources -> NO reload hint (cascade injection seam
 
       assert.equal(notifications.length, 1);
       assert.equal(notifications[0]?.severity, undefined);
-      // PU-8 inverse: NO trailing "Run /reload" line.
+      // V2 contract per D-16-12: reload-hint trigger is per-variant
+      // (uninstalled is state-changing) NOT per-cascade-resource-count.
+      // The V1 "zero dropped suppresses hint" gate is gone -- V2 emits
+      // the hint structurally from the PluginUninstalledMessage status.
       assert.equal(
-        (notifications[0]?.message ?? "").includes("Run /reload"),
-        false,
-        "reload hint must be suppressed when nothing dropped",
+        notifications[0]?.message,
+        "● mp [project]\n  ○ empty v0.0.1 (uninstalled)\n\n/reload to pick up changes",
       );
       // Plugin record still removed.
       const after = await loadState(locations.extensionRoot);
@@ -633,16 +690,22 @@ test("PU-8 (b): zero dropped resources -> NO reload hint (cascade injection seam
   });
 });
 
-// RH-5 soft-dep warnings (companion-extension unloaded) -------------
+// MSG-SD-3 -- soft-dep markers structurally absent from (uninstalled) rows
 
-test("RH-5: dropped agents while pi-subagents unloaded -> subagent warning appended", async () => {
+test("MSG-SD-3: uninstall NEVER emits soft-dep markers (structural via V2 PluginUninstalledMessage)", async () => {
   await withHermeticHome(async () => {
-    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-rh5-"));
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-sd3-"));
     try {
       const locations = locationsFor("project", cwd);
       await seedFullPlugin(locations, "mp", "hello", cwd);
 
-      // ctx + pi without the "subagent" tool -> hasLoadedPiSubagents=false.
+      // ctx + pi without the "subagent" or "mcp" tools -> companion deps
+      // both unloaded. In the install / reinstall / update path this would
+      // trigger per-row `{requires pi-subagents}` + `{requires pi-mcp}`
+      // markers; on the uninstall path the marker is structurally
+      // impossible because PluginUninstalledMessage has no `dependencies`
+      // field (D-15-02 / MSG-SD-3) so renderPluginRow's
+      // composeReasons call passes (false, false) for both declares-flags.
       const { ctx, pi, notifications } = makeCtx({ getAllTools: () => [] });
       await uninstallPlugin({
         ctx,
@@ -654,15 +717,16 @@ test("RH-5: dropped agents while pi-subagents unloaded -> subagent warning appen
       });
 
       assert.equal(notifications.length, 1);
-      assert.match(
-        notifications[0]?.message ?? "",
-        /pi-subagents is not loaded/,
-        "must include pi-subagents warning when agents dropped + companion unloaded",
+      const message = notifications[0]?.message ?? "";
+      assert.equal(
+        message.includes("{requires pi-subagents"),
+        false,
+        "MSG-SD-3: per-row {requires pi-subagents} marker must NOT appear on (uninstalled) rows",
       );
-      assert.match(
-        notifications[0]?.message ?? "",
-        /pi-mcp-adapter is not loaded/,
-        "must include pi-mcp-adapter warning when mcp servers dropped + companion unloaded",
+      assert.equal(
+        message.includes("{requires pi-mcp"),
+        false,
+        "MSG-SD-3: per-row {requires pi-mcp} marker must NOT appear on (uninstalled) rows",
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -729,6 +793,373 @@ test("D-03-INV :: uninstall invalidates plugin cache for the target marketplace"
         return Promise.resolve([{ name: "hello", status: "available" }]);
       });
       assert.equal(rebuildCount, 2, "post-invalidation read re-invokes rebuild");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// narrowCascadeFailure errno branches (lines 111-121) -----------------
+// Exercises the EACCES/EPERM -> "permission denied", ENOENT ->
+// "source missing", unknown-errno default -> "not in manifest", and
+// plain-Error (no .code) -> "not in manifest" paths by injecting
+// cascade stubs that return ok:false with the target error as cause.
+
+test("narrowCascadeFailure: EACCES maps to 'permission denied' in PluginFailedMessage", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-ncf-eacces-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "marketplace.json"),
+            marketplaceRoot: cwd,
+            plugins: { hello: makePluginRecord() },
+          },
+        },
+      });
+
+      const stubCascade: typeof cascadeUnstagePlugin = () => {
+        const err = Object.assign(new Error("EACCES: permission denied, unlink '/path/to/file'"), {
+          code: "EACCES",
+        });
+        return Promise.resolve({
+          ok: false,
+          dropped: { skills: [], commands: [], agents: [], mcpServers: [] },
+          cause: err,
+        });
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await uninstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        cascade: stubCascade,
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.ok(
+        (notifications[0]?.message ?? "").startsWith(
+          "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello v0.0.1 (failed) {permission denied}\n",
+        ),
+        `expected 'permission denied' reason; got: "${notifications[0]?.message ?? ""}"`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("narrowCascadeFailure: EPERM maps to 'permission denied' in PluginFailedMessage", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-ncf-eperm-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "marketplace.json"),
+            marketplaceRoot: cwd,
+            plugins: { hello: makePluginRecord() },
+          },
+        },
+      });
+
+      const stubCascade: typeof cascadeUnstagePlugin = () => {
+        const err = Object.assign(
+          new Error("EPERM: operation not permitted, unlink '/path/to/file'"),
+          {
+            code: "EPERM",
+          },
+        );
+        return Promise.resolve({
+          ok: false,
+          dropped: { skills: [], commands: [], agents: [], mcpServers: [] },
+          cause: err,
+        });
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await uninstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        cascade: stubCascade,
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.ok(
+        (notifications[0]?.message ?? "").startsWith(
+          "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello v0.0.1 (failed) {permission denied}\n",
+        ),
+        `expected 'permission denied' reason; got: "${notifications[0]?.message ?? ""}"`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("narrowCascadeFailure: ENOENT maps to 'source missing' in PluginFailedMessage", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-ncf-enoent-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "marketplace.json"),
+            marketplaceRoot: cwd,
+            plugins: { hello: makePluginRecord() },
+          },
+        },
+      });
+
+      const stubCascade: typeof cascadeUnstagePlugin = () => {
+        const err = Object.assign(
+          new Error("ENOENT: no such file or directory, unlink '/path/to/file'"),
+          {
+            code: "ENOENT",
+          },
+        );
+        return Promise.resolve({
+          ok: false,
+          dropped: { skills: [], commands: [], agents: [], mcpServers: [] },
+          cause: err,
+        });
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await uninstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        cascade: stubCascade,
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.ok(
+        (notifications[0]?.message ?? "").startsWith(
+          "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello v0.0.1 (failed) {source missing}\n",
+        ),
+        `expected 'source missing' reason; got: "${notifications[0]?.message ?? ""}"`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("narrowCascadeFailure: unknown errno (ETIMEDOUT default branch) maps to 'not in manifest'", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-ncf-etimedout-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "marketplace.json"),
+            marketplaceRoot: cwd,
+            plugins: { hello: makePluginRecord() },
+          },
+        },
+      });
+
+      const stubCascade: typeof cascadeUnstagePlugin = () => {
+        const err = Object.assign(new Error("ETIMEDOUT: connection timed out"), {
+          code: "ETIMEDOUT",
+        });
+        return Promise.resolve({
+          ok: false,
+          dropped: { skills: [], commands: [], agents: [], mcpServers: [] },
+          cause: err,
+        });
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await uninstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        cascade: stubCascade,
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      // The switch default break falls through to the final `return "not in
+      // manifest"` at line 121 of uninstall.ts.
+      assert.ok(
+        (notifications[0]?.message ?? "").startsWith(
+          "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello v0.0.1 (failed) {not in manifest}\n",
+        ),
+        `expected 'not in manifest' reason; got: "${notifications[0]?.message ?? ""}"`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("narrowCascadeFailure: plain Error (no .code) maps to 'not in manifest' via isErrnoException=false", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-ncf-plain-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "marketplace.json"),
+            marketplaceRoot: cwd,
+            plugins: { hello: makePluginRecord() },
+          },
+        },
+      });
+
+      const stubCascade: typeof cascadeUnstagePlugin = () => {
+        // Plain Error -- no .code property. isErrnoException() returns false
+        // so the switch is skipped entirely; narrowCascadeFailure returns
+        // "not in manifest" via the final fallthrough at uninstall.ts:121.
+        return Promise.resolve({
+          ok: false,
+          dropped: { skills: [], commands: [], agents: [], mcpServers: [] },
+          cause: new Error("plain failure"),
+        });
+      };
+
+      const { ctx, pi, notifications } = makeCtx();
+      await uninstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        cascade: stubCascade,
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.ok(
+        (notifications[0]?.message ?? "").startsWith(
+          "1 plugin operation failed.\n\n● mp [project]\n  ⊘ hello v0.0.1 (failed) {not in manifest}\n",
+        ),
+        `expected 'not in manifest' reason; got: "${notifications[0]?.message ?? ""}"`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// Lines 264-270: silent catch after dropMarketplaceCache ---------------
+// Exercises the swallowed EISDIR when the plugin cache path is a
+// directory. The underlying unlink() throws (EISDIR != ENOENT so
+// dropMarketplaceCache re-throws), the catch at line 264 swallows it,
+// and the success notification is still emitted.
+
+test("cache-drop EISDIR swallowed: success notification still emitted, plugin record removed", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "uninstall-cache-eisdir-"));
+    try {
+      __resetCacheForTests();
+      const locations = locationsFor("project", cwd);
+      await seedState(locations.extensionRoot, {
+        schemaVersion: 1,
+        marketplaces: {
+          mp: {
+            name: "mp",
+            scope: "project",
+            source: pathSource("./src"),
+            addedFromCwd: cwd,
+            manifestPath: path.join(cwd, "marketplace.json"),
+            marketplaceRoot: cwd,
+            plugins: { hello: makePluginRecord() },
+          },
+        },
+      });
+
+      // Pre-create the cache file path as a DIRECTORY so unlink() throws
+      // EISDIR (not ENOENT), causing dropMarketplaceCache to re-throw and
+      // hit the catch at uninstall.ts:264 which swallows it silently.
+      const pluginCachePath = await locations.pluginCacheFile("mp");
+      await mkdir(pluginCachePath, { recursive: true });
+
+      const stubCascade: typeof cascadeUnstagePlugin = () =>
+        Promise.resolve({
+          ok: true,
+          dropped: { skills: [], commands: [], agents: [], mcpServers: [] },
+        });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await uninstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        cascade: stubCascade,
+      });
+
+      // (1) Exactly one notification with undefined severity (success row).
+      assert.equal(notifications.length, 1, "exactly one notification on cache-drop failure");
+      assert.equal(notifications[0]?.severity, undefined, "notification must be success severity");
+      // (2) Plugin record removed from state.
+      const after = await loadState(locations.extensionRoot);
+      assert.equal(
+        "hello" in (after.marketplaces["mp"]?.plugins ?? {}),
+        false,
+        "plugin record must be removed even when cache drop threw",
+      );
+      // (3) No error notification surfaced.
+      const errNotifications = notifications.filter((n) => n.severity === "error");
+      assert.equal(
+        errNotifications.length,
+        0,
+        "cache-drop EISDIR must be swallowed silently -- no error notification",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

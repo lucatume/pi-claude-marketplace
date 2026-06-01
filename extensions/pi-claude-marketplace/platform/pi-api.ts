@@ -4,10 +4,13 @@
 // imports from `@earendil-works/pi-coding-agent`; all other extension modules
 // import Pi API types from here so peer-version bumps are auditable.
 //
-// The soft-dependency helpers live here because they probe `pi.getAllTools()`,
-// which belongs to the external Pi API surface.
-
-import { PI_MCP_ADAPTER_NOT_LOADED, PI_SUBAGENTS_NOT_LOADED } from "../shared/markers.ts";
+// The soft-dependency probes (`hasLoadedPiSubagents` /
+// `hasLoadedPiMcpAdapter` / `softDepStatus`) live here because they
+// inspect `pi.getAllTools()`, which belongs to the external Pi API
+// surface. `softDepStatus(pi)` returns a `SoftDepStatus` snapshot that
+// `shared/notify.ts` reads once per render to decide whether to append the
+// `requires pi-subagents` / `requires pi-mcp` markers to a plugin row whose
+// `dependencies` declare the kind.
 
 export { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -78,36 +81,4 @@ export function softDepStatus(pi: ExtensionAPI): SoftDepStatus {
     piSubagentsLoaded: hasLoadedPiSubagents(pi),
     piMcpAdapterLoaded: hasLoadedPiMcpAdapter(pi),
   };
-}
-
-/**
- * RH-5: compose the canonical pi-subagents warning when agents were staged
- * and the dep is unloaded. Returns "" otherwise.
- */
-export function subagentWarningIfNeeded(pi: ExtensionAPI, agentsStaged: readonly string[]): string {
-  if (agentsStaged.length === 0) {
-    return "";
-  }
-
-  if (hasLoadedPiSubagents(pi)) {
-    return "";
-  }
-
-  return `${PI_SUBAGENTS_NOT_LOADED}install it with \`pi install npm:pi-subagents\`, then run \`/reload\`.`;
-}
-
-/**
- * RH-5: compose the canonical pi-mcp-adapter warning when MCP servers were
- * staged and the dep is unloaded. Returns "" otherwise.
- */
-export function mcpAdapterWarningIfNeeded(pi: ExtensionAPI, mcpStaged: readonly string[]): string {
-  if (mcpStaged.length === 0) {
-    return "";
-  }
-
-  if (hasLoadedPiMcpAdapter(pi)) {
-    return "";
-  }
-
-  return `${PI_MCP_ADAPTER_NOT_LOADED}install it with \`pi install npm:pi-mcp-adapter\`, then run \`/reload\`.`;
 }

@@ -2,91 +2,118 @@
 //
 // MU-1, MU-4, MU-5, MU-6, MU-7, MU-8, MU-9 + RH-1/RH-2/RH-5 + SC-6 + NFR-5.
 //
-// MU-2 and MU-3 are SUPERSEDED by Phase 4 D-14 ("follow upstream
-// blindly" -- the local marketplace clone is read-only by contract;
-// V1's pull --ff-only choreography and non-fast-forward divergence
-// detection no longer apply). The supersession is recorded in
-// REQUIREMENTS.md and PROJECT.md by Plan 04-10.
+// Each orchestration emits exactly one `notify(ctx, pi,...)` call with a
+// discriminated `NotificationMessage` payload. Severity, reload-hint,
+// soft-dep marker, and per-row glyph dispatch are owned by the renderer in
+// `shared/notify.ts`.
+//
+// Outcomes -> NotificationMessage payloads:
+//  - autoupdate OFF (manifest-only refresh): UXG-05 distinguishes a no-op from
+//  a real change via a manifest-CONTENT compare (pre/post validated
+//  marketplace.json content; NOT lastUpdatedAt, NOT git SHA). No change ->
+//  `{ marketplaces: [{ name, scope, status: "skipped", reasons:
+//  ["up-to-date"], plugins: [] }] }` (catalog UAT state `update-no-op-skipped`,
+//  warning). Changed -> `{ marketplaces: [{ name, scope, status: "updated",
+//  plugins: [] }] }` (catalog UAT state `manifest-refresh-changed`). NEITHER
+//  fires the reload-hint: `shouldEmitReloadHint` triggers only on a PLUGIN row
+//  with a state-changing status, never on a marketplace status, and these
+//  payloads have no plugin rows.
+//  - autoupdate ON (cascade): `{ marketplaces: [{ name, scope, status:
+//  "updated", plugins: outcomes.map(outcomeToCascadePluginMessage) }] }`.
+//  The per-plugin cause chain rides on `PluginFailedMessage.cause`;
+//  `unchanged` renders as `⊘... (skipped) {up-to-date}`. Catalog UAT
+//  fixture `mixed-outcomes`.
+//  - mp-level failure (clone/manifest unreachable): the failed marketplace
+//  header plus a synthetic `PluginFailedMessage` child carrying
+//  `cause: err` so the underlying MarketplaceUpdateError reaches the user
+//  (`err.retryHint` remains on the error for programmatic inspection).
+//  - empty targets (no marketplaces configured): `{ marketplaces: [] }`
+//  renders the `(no marketplaces)` sentinel.
+//  - post-success cache cleanup: a `rm` runs to drop the stale completion
+//  cache; a cleanup leak there is intentionally NOT surfaced (PU-4 / AS-6).
+//
+// Per-row soft-dep markers are driven by the per-plugin
+// `dependencies: Dependency[]` field on `PluginUpdatedMessage` /
+// `PluginInstalledMessage` / `PluginReinstalledMessage`, threaded through the
+// notify-time `softDepStatus(pi)` probe.
+//
+// MU-2 and MU-3 are SUPERSEDED by the "follow upstream blindly" contract --
+// the local marketplace clone is read-only, so the pull --ff-only
+// choreography and non-fast-forward divergence detection no longer apply.
+// The supersession is recorded in REQUIREMENTS.md and PROJECT.md.
 //
 // Flow:
-//   1. Resolve scope(s):
-//      - opts.name === undefined → bare form (MU-1, SC-6)
-//      - opts.name + opts.scope === undefined → resolveScopeFromState
-//      - opts.name + opts.scope set → use it directly
+//  1. Resolve scope(s):
+//  - opts.name === undefined → bare form (MU-1, SC-6)
+//  - opts.name + opts.scope === undefined → resolveScopeFromState
+//  - opts.name + opts.scope set → use it directly
 //
-//   2. For each (scope, marketplaceName) pair:
-//      a. OUTER GUARD (D-04 + D-08 -- wraps refresh + persist, NOT cascade):
-//           withStateGuard(locations, async (state) => {
-//             record = state.marketplaces[name]
-//             if (record.source.kind === "github"):
-//               cloneAdvanced = false
-//               try {
-//                 refreshGitHubClone(cloneDir, record.source.ref, gitOps,
-//                                    () => { cloneAdvanced = true; });
-//                 // CR-05 / MU-5: the onFetchSucceeded callback flips
-//                 // cloneAdvanced to true ONLY after gitOps.fetch returns.
-//                 // Pre-fetch throws (DNS/network/auth) leave cloneAdvanced
-//                 // at false so the "Retry the command." hint is suppressed.
-//                 // Any later D-14 step throw (forceUpdateRef/checkout) or
-//                 // manifest re-read throw still produces the retry hint.
-//                 manifest = read+validate <marketplaceRoot>/.claude-plugin/marketplace.json
-//                 record.lastUpdatedAt = now
-//               } catch (err) {
-//                 throw new MarketplaceUpdateError(..., { cause, retryHint: cloneAdvanced ? "Retry the command." : "" })
-//               }
-//             else if path:
-//               refreshPathManifest(record)  // NO gitOps; NFR-5
-//             // capture snapshot for cascade-outside-guard:
-//             snapshot = { autoupdate: record.autoupdate ?? false, plugins: Object.keys(record.plugins) }
-//             return snapshot
-//           })
+//  2. For each (scope, marketplaceName) pair:
+//  a. OUTER GUARD (+ -- wraps refresh + persist, NOT cascade):
+//  withStateGuard(locations, async (state) => {
+//  record = state.marketplaces[name]
+//  if (record.source.kind === "github"):
+//  cloneAdvanced = false
+//  try {
+//  refreshGitHubClone(cloneDir, record.source.ref, gitOps,
+//  => { cloneAdvanced = true; });
+// MU-5: the onFetchSucceeded callback flips
+//  // cloneAdvanced to true ONLY after gitOps.fetch returns.
+//  // Pre-fetch throws (DNS/network/auth) leave cloneAdvanced
+//  // at false so the "Retry the command." hint is suppressed.
+//  // Any later step throw (forceUpdateRef/checkout) or
+//  // manifest re-read throw still produces the retry hint.
+//  manifest = read+validate <marketplaceRoot>/.claude-plugin/marketplace.json
+//  record.lastUpdatedAt = now
+//  } catch (err) {
+//  throw new MarketplaceUpdateError(..., { cause, retryHint: cloneAdvanced ? "Retry the command." : "" })
+//  }
+//  else if path:
+//  refreshPathManifest(record) // NO gitOps; NFR-5
+//  // capture snapshot for cascade-outside-guard:
+//  snapshot = { autoupdate: record.autoupdate ?? false, plugins: Object.keys(record.plugins) }
+//  return snapshot
+//  })
 //
-//      b. CASCADE OUTSIDE GUARD (D-08 honors MU-4 literal "persisted before cascade"):
-//           if (snapshot.autoupdate === true && pluginUpdate is provided):
-//             for each plugin in snapshot.plugins:
-//               outcome = await pluginUpdate(plugin, name, scope);
-//               partition[outcome.partition].push(outcome)
-//           // MU-7: render in order updated → unchanged → skipped → failed
+//  b. CASCADE OUTSIDE GUARD (honors MU-4 literal "persisted before cascade"):
+//  if (snapshot.autoupdate === true && pluginUpdate is provided):
+//  for each plugin in snapshot.plugins:
+//  outcome = await pluginUpdate(plugin, name, scope);
+//  partition[outcome.partition].push(outcome)
+//  // MU-7: per-plugin outcomes feed outcomeToCascadePluginMessage construction
 //
-//   3. Compose user-visible output:
-//      - failures (entire-marketplace error): notifyError with chained cause + (if MU-5) retry hint
-//      - success: notifySuccess body + RH-5 soft-dep warnings + RH-1/RH-2 reload hint (verb 'refresh')
+//  3. Compose user-visible output via a single notify(ctx, pi,...)
+//  call per orchestration (see header comment above for
+//  the catalog UAT fixtures bound to each shape). Empty targets,
+//  mp-level failure, autoupdate-OFF success, and autoupdate-ON
+//  cascade each map to a distinct NotificationMessage shape;
+//  severity and reload-hint are renderer-computed (
+// ) and MUST NOT be composed by callers.
 //
-// D-14 sequence (Pattern 3, RESEARCH §3): fetch + (symbolic HEAD)
+//  sequence : fetch + (symbolic HEAD)
 // forceUpdateRef + checkout, OR (detached HEAD) checkout directly.
-// NO `pull` (D-13).
-//
-// API parameter shape note: `pi.getAllTools()` lives on `ExtensionAPI`
-// (the factory `pi` parameter), NOT on `ExtensionContext`. The
-// soft-dep warning composers (Plan 04-03) take `pi: ExtensionAPI`. The
-// orchestrator therefore accepts an OPTIONAL `pi: ExtensionAPI` field
-// in its options bag; when omitted (e.g. tests that don't exercise
-// soft-dep composition), the warning composers are simply not called.
-// Phase 7's index.ts wiring supplies the real `pi` reference at
-// command-registration time. (Rule 3 deviation from PLAN.md snippet
-// which mistakenly wrote `subagentWarningIfNeeded(ctx, ...)`.)
+// NO `pull`.
 
 import path from "node:path";
 
 import { loadMarketplaceManifest } from "../../domain/manifest.ts";
 import { locationsFor } from "../../persistence/locations.ts";
 import { loadState } from "../../persistence/state-io.ts";
-import { appendReloadHint, reloadHint } from "../../presentation/reload-hint.ts";
-import { mcpAdapterWarningIfNeeded, subagentWarningIfNeeded } from "../../presentation/soft-dep.ts";
 import { dropMarketplaceCache } from "../../shared/completion-cache.ts";
 import {
   MarketplaceNotFoundError,
   MarketplaceUpdateError,
+  PluginShapeError,
+  assertNever,
+  composeErrorWithCauseChain,
   errorMessage,
 } from "../../shared/errors.ts";
-import { notifyError, notifySuccess, notifyWarning } from "../../shared/notify.ts";
+import { notify } from "../../shared/notify.ts";
 import { withStateGuard } from "../../transaction/with-state-guard.ts";
 
 import {
   DEFAULT_GIT_OPS,
-  formatErrorWithCauses,
   refreshGitHubClone,
-  renderPartition,
   resolveScopeFromState,
   type GitOps,
 } from "./shared.ts";
@@ -95,8 +122,18 @@ import type { ParsedSource } from "../../domain/source.ts";
 import type { ScopedLocations } from "../../persistence/locations.ts";
 import type { ExtensionState } from "../../persistence/state-io.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
+import type {
+  PluginFailedMessage,
+  PluginNotificationMessage,
+  Reason,
+} from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
-import type { PluginUpdateFn, PluginUpdateOutcome } from "../types.ts";
+import type {
+  PluginUpdateFailedOutcome,
+  PluginUpdateFn,
+  PluginUpdateOutcome,
+  PluginUpdateSkippedOutcome,
+} from "../types.ts";
 
 export interface UpdateMarketplaceOptions {
   readonly ctx: ExtensionContext;
@@ -106,17 +143,17 @@ export interface UpdateMarketplaceOptions {
   readonly cwd: string;
   readonly gitOps?: GitOps;
   /**
-   * D-05 injection seam. When omitted, autoupdate cascade is a NO-OP
-   * (Phase 4 ships marketplace update without Phase 5 wiring; tests
-   * inject a mock).
+   * Autoupdate-cascade injection seam. When omitted, the autoupdate cascade
+   * is a NO-OP (tests inject a mock).
    */
   readonly pluginUpdate?: PluginUpdateFn;
   /**
-   * Soft-dep probe target. `pi.getAllTools()` is the source of truth
-   * for whether `pi-subagents` / `pi-mcp-adapter` are loaded. Optional
-   * because tests that don't care about RH-5 can omit it.
+   * Soft-dep probe target. `pi.getAllTools` is the source of truth for
+   * whether `pi-subagents` / `pi-mcp-adapter` are loaded. Required (not
+   * optional) so every `notify(ctx, pi, ...)` call has a non-null reference;
+   * the renderer threads `softDepStatus(pi)` internally at notify-time.
    */
-  readonly pi?: ExtensionAPI;
+  readonly pi: ExtensionAPI;
 }
 
 export interface UpdateAllMarketplacesOptions {
@@ -125,7 +162,8 @@ export interface UpdateAllMarketplacesOptions {
   readonly cwd: string;
   readonly gitOps?: GitOps;
   readonly pluginUpdate?: PluginUpdateFn;
-  readonly pi?: ExtensionAPI;
+  /** See `UpdateMarketplaceOptions.pi`. */
+  readonly pi: ExtensionAPI;
 }
 
 /** MU-1 single-name form. */
@@ -143,12 +181,12 @@ export async function updateMarketplace(opts: UpdateMarketplaceOptions): Promise
 
   await refreshOneMarketplace({
     ctx: opts.ctx,
+    pi: opts.pi,
     name: opts.name,
     scope: resolved.scope,
     locations: resolved.locations,
     gitOps,
     ...(opts.pluginUpdate !== undefined && { pluginUpdate: opts.pluginUpdate }),
-    ...(opts.pi !== undefined && { pi: opts.pi }),
   });
 }
 
@@ -158,7 +196,9 @@ export async function updateMarketplace(opts: UpdateMarketplaceOptions): Promise
  */
 export async function updateAllMarketplaces(opts: UpdateAllMarketplacesOptions): Promise<void> {
   const gitOps = opts.gitOps ?? DEFAULT_GIT_OPS;
-  const scopes: readonly Scope[] = opts.scope === undefined ? ["user", "project"] : [opts.scope];
+  // Iteration order is project-first per MSG-GR-3 / compareByNameThenScope
+  // so same-name cross-scope stable-sort ties render project-before-user.
+  const scopes: readonly Scope[] = opts.scope === undefined ? ["project", "user"] : [opts.scope];
 
   // Collect (scope, marketplaceName) pairs from a single fresh state read per scope.
   const targets: { scope: Scope; locations: ScopedLocations; name: string }[] = [];
@@ -170,9 +210,11 @@ export async function updateAllMarketplaces(opts: UpdateAllMarketplacesOptions):
     }
   }
 
-  // MU-1 empty-set succeeds silently with the marker string + NO reload hint.
+  // CMC-10: empty-set succeeds silently. The renderer emits the
+  // "(no marketplaces)" sentinel when `message.marketplaces` is the empty
+  // array; callers MUST NOT compose the sentinel text.
   if (targets.length === 0) {
-    notifySuccess(opts.ctx, "No marketplaces configured.");
+    notify(opts.ctx, opts.pi, { marketplaces: [] });
     return;
   }
 
@@ -180,12 +222,12 @@ export async function updateAllMarketplaces(opts: UpdateAllMarketplacesOptions):
   for (const t of targets) {
     await refreshOneMarketplace({
       ctx: opts.ctx,
+      pi: opts.pi,
       name: t.name,
       scope: t.scope,
       locations: t.locations,
       gitOps,
       ...(opts.pluginUpdate !== undefined && { pluginUpdate: opts.pluginUpdate }),
-      ...(opts.pi !== undefined && { pi: opts.pi }),
     });
   }
 }
@@ -197,17 +239,77 @@ interface RefreshOneArgs {
   readonly locations: ScopedLocations;
   readonly gitOps: GitOps;
   readonly pluginUpdate?: PluginUpdateFn;
-  readonly pi?: ExtensionAPI;
+  readonly pi: ExtensionAPI;
+}
+
+/**
+ * UXG-05 change-detection seam. Reads the persisted, schema-validated
+ * `MarketplaceManifest` and returns a comparison key (the `JSON.stringify` of
+ * the validated parsed content). Used to compare the manifest content PRE vs
+ * POST refresh so the no-op vs changed decision (autoupdate-OFF and
+ * autoupdate-ON alike) can distinguish a genuine change (`updated`) from a
+ * no-op (`skipped {up-to-date}`).
+ *
+ * WR-01: `loadMarketplaceManifest` returns the RAW `JSON.parse` value -- it
+ * runs `MARKETPLACE_VALIDATOR.Check()` but NEVER `.Parse()`/`.Clean()`. So the
+ * comparison key is `JSON.stringify` of the schema-validated-but-raw parsed
+ * manifest: its key order mirrors the source file and it retains any
+ * unknown/extra fields. Any content delta -- including reordered keys or
+ * changed extra fields -- reads as "changed", the conservative direction. Do
+ * NOT "optimize" `loadMarketplaceManifest` into `.Parse()`: that would rewrite
+ * the key order and could silently flip the no-op classification.
+ *
+ * Compares ONLY post-validation parsed content (T-27-05 mitigation): a tampered
+ * manifest that fails the schema throws inside `loadMarketplaceManifest` and
+ * routes to the `(failed)` path, never to the no-op `(skipped)` decision.
+ *
+ * WR-02: returns `undefined` ONLY for a genuine "no manifest yet" (ENOENT) PRE
+ * read; a `undefined` PRE key compared against a defined POST key reads as
+ * "changed", the safe default. Any OTHER PRE-read failure (EACCES, malformed
+ * JSON, schema-invalid) is re-thrown so it propagates to `refreshRecord`'s
+ * try/catch and routes to the existing `(failed)` path -- the same routing
+ * `validateManifestAtRoot` already uses for POST-read failures. This removes
+ * the silent always-`(updated)` failure mode for a corrupt/unreadable
+ * pre-existing manifest.
+ */
+async function manifestContentKey(
+  record: ExtensionState["marketplaces"][string],
+): Promise<string | undefined> {
+  try {
+    const parsed = await loadMarketplaceManifest(record.manifestPath);
+    return JSON.stringify(parsed);
+  } catch (err) {
+    // WR-02: only ENOENT (no manifest yet) maps to the changed-safe default.
+    // Mirrors the errno-narrowing idiom `reasonsFromCascadeError` already uses
+    // (gates on `(err as NodeJS.ErrnoException).code`). All other failures
+    // propagate to `(failed)`.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+
+    throw err;
+  }
 }
 
 async function refreshRecord(
   record: ExtensionState["marketplaces"][string],
   args: RefreshOneArgs,
-): Promise<void> {
+): Promise<boolean> {
   const { name, locations, gitOps } = args;
   const source = record.source as ParsedSource;
   let cloneAdvanced = false;
   try {
+    // UXG-05: capture the PRE-refresh validated-manifest content key BEFORE the
+    // refresh re-validates and re-persists. Read off the currently persisted
+    // `record.manifestPath` (the manifest as the user last saw it). NOT keyed on
+    // `record.lastUpdatedAt` (Pitfall 4 -- it is stamped to `now` every refresh
+    // regardless of content).
+    // WR-01: this read lives INSIDE the try so a non-ENOENT PRE-read failure
+    // (manifestContentKey re-throws per WR-02) is wrapped as MarketplaceUpdateError
+    // exactly like a POST-read failure -- same `(failed)` routing, same cause
+    // chain. Do NOT hoist it back outside the try (that bypasses the wrapper and
+    // surfaces a bare, mislabeled reason).
+    const preKey = await manifestContentKey(record);
     if (source.kind === "github") {
       const cloneDir = await locations.sourceCloneDir(name);
       await refreshGitHubClone(cloneDir, source.ref, gitOps, () => {
@@ -222,22 +324,44 @@ async function refreshRecord(
       );
     }
 
+    // UXG-05: capture the POST-refresh validated-manifest content key AFTER the
+    // refresh re-validates (and `validateManifestAtRoot` repoints
+    // `record.manifestPath` if the root moved). Whole-manifest equality of the
+    // parsed/validated content -- source-kind-uniform (a path source whose local
+    // marketplace.json is unchanged compares equal; a github source whose clone
+    // advanced but yielded byte-identical manifest content also compares equal).
+    const postKey = await manifestContentKey(record);
+    const changed = preKey !== postKey;
+
+    // lastUpdatedAt is stamped on EVERY refresh (used elsewhere); it is
+    // deliberately NOT the change signal (Pitfall 4).
     record.lastUpdatedAt = new Date().toISOString();
+    return changed;
   } catch (err) {
     throw new MarketplaceUpdateError(
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cloneAdvanced is set via callback inside refreshGitHubClone (CR-05).
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cloneAdvanced is set via callback inside refreshGitHubClone.
       cloneAdvanced
         ? `Marketplace "${name}" clone advanced but manifest could not be persisted.`
         : `Failed to update marketplace "${name}".`,
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cloneAdvanced is set via callback inside refreshGitHubClone (CR-05).
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cloneAdvanced is set via callback inside refreshGitHubClone.
       { cause: err, retryHint: cloneAdvanced ? "Retry the command." : "" },
     );
   }
 }
 
-async function snapshotAfterRefresh(
-  args: RefreshOneArgs,
-): Promise<{ autoupdate: boolean; plugins: readonly string[] }> {
+interface RefreshSnapshot {
+  readonly autoupdate: boolean;
+  readonly plugins: readonly string[];
+  /**
+   * UXG-05: true when the refresh changed the validated marketplace.json
+   * content; false when the manifest content was byte-identical pre/post
+   * (the no-op case). Drives the autoupdate-OFF `updated` vs `skipped
+   * {up-to-date}` emission. Source-kind-uniform (path + github).
+   */
+  readonly changed: boolean;
+}
+
+async function snapshotAfterRefresh(args: RefreshOneArgs): Promise<RefreshSnapshot> {
   const { name, scope, locations } = args;
   return withStateGuard(locations, async (state) => {
     const record = state.marketplaces[name];
@@ -245,118 +369,406 @@ async function snapshotAfterRefresh(
       throw new MarketplaceNotFoundError(name, [scope]);
     }
 
-    await refreshRecord(record, args);
+    const changed = await refreshRecord(record, args);
     return {
       autoupdate: record.autoupdate ?? false,
       plugins: Object.keys(record.plugins),
+      changed,
     };
   });
 }
 
 async function cascadeAutoupdates(
-  snapshot: { autoupdate: boolean; plugins: readonly string[] },
+  snapshot: RefreshSnapshot,
   name: string,
   scope: Scope,
   pluginUpdate: PluginUpdateFn | undefined,
-): Promise<Record<PluginUpdateOutcome["partition"], PluginUpdateOutcome[]>> {
-  const partitions: Record<PluginUpdateOutcome["partition"], PluginUpdateOutcome[]> = {
-    updated: [],
-    unchanged: [],
-    skipped: [],
-    failed: [],
-  };
+): Promise<readonly PluginUpdateOutcome[]> {
   if (!snapshot.autoupdate || pluginUpdate === undefined) {
-    return partitions;
+    return [];
   }
 
+  const outcomes: PluginUpdateOutcome[] = [];
   for (const plugin of snapshot.plugins) {
-    let outcome: PluginUpdateOutcome;
     try {
-      outcome = await pluginUpdate(plugin, name, scope);
+      outcomes.push(await pluginUpdate(plugin, name, scope));
     } catch (err) {
-      outcome = {
+      // `notes` is consumed by callers OUTSIDE the notify path (e.g.
+      // JSON-mode outcome aggregation in tests) and by the
+      // narrowFailReason notes-substring fallback below, so the cause-chain
+      // trailer is composed inline here. The user-visible cause-chain trailer
+      // renders via PluginFailedMessage.cause at the 4-space indent the
+      // renderer owns; the `outcome.cause` stamp below carries the raw `err`
+      // for that path.
+      //
+      // Pre-narrow the closed-set Reason via `reasonsFromCascadeError(err)`
+      // so the cascade row renders the precise cause class (`permission
+      // denied` / `source missing` / `no longer installable` / ...) instead
+      // of degrading to the permissive `not in manifest` fallback via the
+      // consumer's `narrowFailReasons` substring parse.
+      const typedReasons = reasonsFromCascadeError(err);
+      outcomes.push({
         partition: "failed",
         name: plugin,
-        notes: [formatErrorWithCauses(err)],
-      };
+        notes: [composeErrorWithCauseChain(err)],
+        ...(typedReasons !== undefined && { reasons: typedReasons }),
+        // CMC-13: required `boolean` on the outcome contract. `(failed)`
+        // cascade rows do not render the soft-dep marker (MSG-SD-3), so the
+        // value is deliberately `false`; explicit emission keeps every
+        // producer site honest.
+        declaresAgents: false,
+        declaresMcp: false,
+        // Carry the raw `err` so the cascade mapper
+        // (outcomeToCascadePluginMessage) can attach it to
+        // PluginFailedMessage.cause for the 4-space-indent cause-chain
+        // trailer. `notes` above is retained for the non-notify consumers
+        // (test fixtures + outcome aggregators) and for the narrowFailReason
+        // notes-substring fallback.
+        ...(err instanceof Error && { cause: err }),
+      });
     }
-
-    partitions[outcome.partition].push(outcome);
   }
 
-  return partitions;
+  return outcomes;
 }
 
-function appendSoftDepWarnings(
-  body: string,
-  pi: ExtensionAPI | undefined,
-  updated: readonly PluginUpdateOutcome[],
-): string {
-  if (pi === undefined) {
-    return body;
+/**
+ * Typed-dispatch helper for the `cascadeAutoupdates` catch. Maps a thrown
+ * error to a closed-set Reason[] using the same priority order as the cascade
+ * narrowers in `orchestrators/plugin/{update,reinstall}.ts::reasonsFromTypedError`:
+ * PluginShapeError variants first, then errno-bearing FS errors, then
+ * `undefined` to defer to the consumer's substring fallback.
+ */
+function reasonsFromCascadeError(err: unknown): readonly Reason[] | undefined {
+  if (err instanceof PluginShapeError) {
+    // Switch on `err.shape.kind` for compile-time exhaustiveness.
+    switch (err.shape.kind) {
+      case "no-longer-installable":
+      case "not-installable":
+        return ["no longer installable"] as const;
+      case "not-in-manifest":
+        return ["not in manifest"] as const;
+      case "already-installed":
+        // Cascade-path "already installed" is unexpected (we only
+        // cascade-update plugins already in the record); map to the
+        // permissive `not in manifest` fallback.
+        return ["not in manifest"] as const;
+    }
   }
 
-  const stagedAgents = updated.flatMap((o) => o.stagedAgents ?? []);
-  const stagedMcpServers = updated.flatMap((o) => o.stagedMcpServers ?? []);
-  const subagentWarn = subagentWarningIfNeeded(pi, stagedAgents);
-  const mcpWarn = mcpAdapterWarningIfNeeded(pi, stagedMcpServers);
-  return [body, subagentWarn, mcpWarn].filter((line) => line !== "").join("\n");
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      return ["permission denied"] as const;
+    }
+
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return ["source missing"] as const;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Map a `PluginUpdateOutcome` to a discriminated `PluginNotificationMessage`.
+ * The renderer (`renderPluginRow` in shared/notify.ts) owns the icon
+ * dispatch, the version-arrow composition, the reasons-brace composition, and
+ * the per-row soft-dep marker injection. The mapper's job is structural --
+ * pick the variant that matches the partition and forward the
+ * partition-specific fields.
+ *
+ * Per-partition mapping:
+ *  - `updated`   -> `PluginUpdatedMessage{ from, to, dependencies }`. Renderer
+ *                   composes `<name> v<from> → v<to> (updated)`; MSG-SD-3
+ *                   allows the soft-dep marker, and `dependencies` carries the
+ *                   declared kinds the notify-time probe combines with
+ *                   `softDepStatus(pi)`.
+ *  - `unchanged` -> `PluginSkippedMessage{ reasons: ["up-to-date"] }`. The
+ *                   `skipped` status routes through the warning severity
+ *                   ladder -> ⊘ glyph.
+ *  - `skipped`   -> `PluginSkippedMessage{ reasons: [<narrowed>] }`, narrowed
+ *                   via `narrowSkipReason`.
+ *  - `failed`    -> `PluginFailedMessage{ reasons: [<narrowed>], cause? }`. The
+ *                   cause chain rides on the per-plugin row; the cascade catch
+ *                   in `cascadeAutoupdates` stamps `outcome.cause` so the
+ *                   renderer emits a 4-space-indent trailer below the row.
+ *
+ * `scope` is forwarded so the renderer's orphan-fold logic
+ * (`renderScopeBracket(plugin.scope, mp.scope)`) can suppress the redundant
+ * `[<scope>]` bracket when the plugin scope matches the marketplace scope.
+ */
+function outcomeToCascadePluginMessage(
+  outcome: PluginUpdateOutcome,
+  scope: Scope,
+): PluginNotificationMessage {
+  // PluginUpdateOutcome is a discriminated union; the switch exhausts all 4
+  // partitions and ends with an `assertNever` so any future variant addition
+  // fails at compile time.
+  switch (outcome.partition) {
+    case "updated":
+      return {
+        status: "updated",
+        name: outcome.name,
+        scope,
+        from: outcome.fromVersion,
+        to: outcome.toVersion,
+        // CMC-13: declared kinds drive the per-row soft-dep marker
+        // (MSG-SD-3). The renderer narrows on `dependencies` membership
+        // ("agents" / "mcp") + the notify-time probe; we forward the boolean
+        // flags as the conventional Dependency[] representation.
+        dependencies: [
+          ...(outcome.declaresAgents ? (["agents"] as const) : []),
+          ...(outcome.declaresMcp ? (["mcp"] as const) : []),
+        ],
+      };
+    case "unchanged":
+      return {
+        status: "skipped",
+        name: outcome.name,
+        scope,
+        // The renderer routes `skipped` through warning severity ->
+        // ICON_UNINSTALLABLE (⊘).
+        reasons: ["up-to-date"],
+      };
+    case "skipped":
+      return {
+        status: "skipped",
+        name: outcome.name,
+        scope,
+        reasons: [narrowSkipReason(outcome)],
+      };
+    case "failed":
+      return {
+        status: "failed",
+        name: outcome.name,
+        scope,
+        reasons: [narrowFailReason(outcome)],
+        // The per-plugin cause-chain trailer. `outcome.cause` is populated by
+        // the cascadeAutoupdates catch where the raw thrown Error is in scope;
+        // failed outcomes produced by plugin/update.ts (no err in scope) leave
+        // this undefined and the renderer simply omits the trailer.
+        ...(outcome.cause !== undefined && { cause: outcome.cause }),
+      };
+    default:
+      // Exhaustiveness guard. A new partition added to PluginUpdateOutcome
+      // without updating this switch fails at compile time on
+      // `assertNever(outcome)`.
+      return assertNever(outcome);
+  }
+}
+
+/**
+ * Narrow a `skipped` outcome to a closed-set Reason.
+ *
+ * Prefer the pre-narrowed `outcome.reasons[0]` (populated by
+ * `plugin/update.ts` producers) over the substring parse of `outcome.notes`.
+ * The notes-fallback is retained for test fixtures that build outcomes
+ * without `reasons`; once every producer populates `reasons`, the fallback
+ * can be deleted.
+ */
+function narrowSkipReason(outcome: PluginUpdateSkippedOutcome): Reason {
+  const firstReason = outcome.reasons[0];
+  if (firstReason !== undefined) {
+    return firstReason;
+  }
+
+  // Fallback: legacy substring parse of `notes`. Retained for backward
+  // compatibility with notes-only outcome fixtures.
+  //
+  // WR-06: a `partition: "skipped"` outcome with no reasons AND no notes
+  // is a producer-contract violation -- the previous code masked it as
+  // `"up-to-date"` (a SUCCESS reason), so the operator read
+  // `skipped {up-to-date}` and assumed nothing was wrong while in fact
+  // the producer failed to populate its outcome. Map empty-notes to
+  // `"unreadable manifest"` instead so the brace surfaces a real failure
+  // classification rather than a false success claim (mirrors the
+  // narrowFailReason symmetric fallback below).
+  const notes = outcome.notes;
+  if (notes.length === 0) {
+    return "unreadable manifest";
+  }
+
+  const text = notes.join(" ").toLowerCase();
+  if (text.includes("not in manifest") || text.includes("not found in marketplace")) {
+    return "not in manifest";
+  }
+
+  if (text.includes("source mismatch")) {
+    return "source mismatch";
+  }
+
+  if (text.includes("no longer installable")) {
+    return "no longer installable";
+  }
+
+  // WR-06: no-substring-match -> SAME treatment as empty-notes; do not
+  // mask the unknown-class skip as `"up-to-date"`.
+  return "unreadable manifest";
+}
+
+/**
+ * Narrow a `failed` outcome to a closed-set Reason.
+ *
+ * Prefer pre-narrowed `outcome.reasons[0]` over notes parsing (same rationale
+ * as `narrowSkipReason` above). The fallback is `"unreadable manifest"`
+ * because most update failures bubble up from manifest re-reads.
+ */
+function narrowFailReason(outcome: PluginUpdateFailedOutcome): Reason {
+  const firstReason = outcome.reasons?.[0];
+  if (firstReason !== undefined) {
+    return firstReason;
+  }
+
+  // Fallback: legacy substring parse of `notes`. Retained for backward
+  // compatibility with notes-only outcome fixtures.
+  const notes = outcome.notes;
+  if (notes.length === 0) {
+    return "unreadable manifest";
+  }
+
+  const text = notes.join(" ").toLowerCase();
+  if (text.includes("not in manifest") || text.includes("not found in marketplace")) {
+    return "not in manifest";
+  }
+
+  if (text.includes("rollback partial")) {
+    return "rollback partial";
+  }
+
+  if (text.includes("invalid manifest") || text.includes("unparseable")) {
+    return "invalid manifest";
+  }
+
+  if (text.includes("unreadable")) {
+    return "unreadable manifest";
+  }
+
+  return "unreadable manifest";
 }
 
 async function refreshOneMarketplace(args: RefreshOneArgs): Promise<void> {
   const { ctx, name, scope, locations, pluginUpdate, pi } = args;
 
-  let snapshot: { autoupdate: boolean; plugins: readonly string[] };
+  let snapshot: RefreshSnapshot;
   try {
     snapshot = await snapshotAfterRefresh(args);
   } catch (err) {
-    // MU-5 + ES-4: surface MarketplaceUpdateError or any other failure
-    // via notifyError with chained cause. The retryHint is appended
-    // when present.
-    if (err instanceof MarketplaceUpdateError && err.retryHint !== "") {
-      notifyError(ctx, `${formatErrorWithCauses(err)}\n${err.retryHint}`, err.cause);
-    } else {
-      notifyError(ctx, formatErrorWithCauses(err), err);
-    }
-
+    // A marketplace refresh failure renders as the header
+    // `⊘ <name> [<scope>] (failed)`. The MarketplaceNotificationMessage
+    // shape carries no `cause` (SNM-10 confines `cause` to plugin-level
+    // variants), so surface the underlying MarketplaceUpdateError cause
+    // (and its retry-hint, carried in the cause chain) via a synthetic
+    // failed-plugin child whose `cause` drives the depth-5 cause-chain
+    // trailer the renderer appends. Mirrors the reinstall synthetic-failed
+    // recipe (orchestrators/plugin/reinstall.ts).
+    const typedReasons = reasonsFromCascadeError(err);
+    const failedRow: PluginFailedMessage = {
+      status: "failed",
+      name,
+      reasons: typedReasons ?? (["network unreachable"] as const),
+      cause: err instanceof Error ? err : new Error(errorMessage(err)),
+    };
+    notify(ctx, pi, {
+      marketplaces: [{ name, scope, status: "failed", plugins: [failedRow] }],
+    });
     return;
   }
 
-  // D-03-INV (Plan 06-05): post-state-commit completion-cache invalidation.
-  // Manifest refresh may have changed the plugin set; drop the cached
-  // plugin index so the next completion read rebuilds from the freshly
-  // updated marketplace.json. Defense-in-depth try/catch.
+  // Post-state-commit completion-cache invalidation. Manifest refresh may
+  // have changed the plugin set; drop the cached plugin index so the next
+  // completion read rebuilds from the freshly updated marketplace.json.
+  // Defense-in-depth try/catch.
   try {
     await dropMarketplaceCache(await locations.pluginCacheFile(name), scope, name);
-  } catch (err) {
-    notifyWarning(
-      ctx,
-      `Marketplace "${name}" updated; completion cache refresh deferred: ${errorMessage(err)}`,
-    );
+  } catch {
+    // Intentional non-surfacing (PU-4 / AS-6): this cleanup runs AFTER the
+    // durable atomic state save, so a leak here cannot corrupt state. A
+    // cache-refresh failure is deliberately NOT surfaced -- emitting a second
+    // notify after the primary would double severity routing. The cache `rm`
+    // still runs above; only the user-facing warning is suppressed.
   }
 
-  // CASCADE OUTSIDE the outer guard (D-08). Honors MU-4 literal
+  // CASCADE OUTSIDE the outer guard. Honors MU-4 literal
   // "persisted before any plugin cascade runs".
-  const partitions = await cascadeAutoupdates(snapshot, name, scope, pluginUpdate);
+  const outcomes = await cascadeAutoupdates(snapshot, name, scope, pluginUpdate);
 
-  // SUCCESS path composition:
-  // - Body lists per-partition results in MU-7 order: updated → unchanged → skipped → failed
-  // - RH-5 soft-dep warnings BEFORE the trailing reload hint
-  // - RH-1 / RH-2: reload hint with verb 'refresh' iff updated[].length > 0
-  const updatedNames = partitions.updated.map((o) => o.name).sort((a, b) => a.localeCompare(b));
-  const baseLines: string[] = [`Updated marketplace "${name}" in ${scope} scope.`];
-  if (snapshot.autoupdate && pluginUpdate !== undefined) {
-    // MU-7 partition rendering. Empty partitions are omitted.
-    renderPartition(baseLines, "Updated", partitions.updated, /*withVersions*/ true);
-    renderPartition(baseLines, "Unchanged", partitions.unchanged, false);
-    renderPartition(baseLines, "Skipped", partitions.skipped, false);
-    renderPartition(baseLines, "Failed", partitions.failed, false);
+  // CMC-32 / UXG-05 binding: BOTH the autoupdate-OFF (manifest-only refresh)
+  // and the autoupdate-ON (cascade) paths now DISTINGUISH a no-op from a
+  // genuine change via the change detector + the cascade outcomes:
+  //   - no change: the validated manifest content is byte-identical pre/post
+  //     (snapshot.changed === false) AND every cascaded plugin was a no-op
+  //     (`partition === "unchanged"`) -> emit `(skipped) {up-to-date}` (catalog
+  //     state `update-no-op-skipped` / `update-autoupdate-noop-skipped`).
+  //     Routes WARNING via computeSeverity (mp.status === "skipped"); this is
+  //     intentional for Phase 27 -- the benign-skip -> info softening is UXG-02
+  //     in Phase 28, NOT pre-empted here.
+  //   - changed: the manifest content changed OR any plugin actually
+  //     updated/installed/reinstalled/uninstalled/failed (i.e. NOT every
+  //     outcome is `unchanged`) -> emit `(updated)` (catalog state
+  //     `manifest-refresh-changed`, or the cascade-rows shape on the ON path).
+  // The autoupdate-OFF payload has no plugin rows; the autoupdate-ON no-op
+  // payload deliberately drops the all-`unchanged` cascade rows (plugins:[])
+  // for byte-form consistency with the OFF no-op.
+  // NEITHER no-op emits a reload-hint: `shouldEmitReloadHint` fires only on a
+  // PLUGIN row with a state-changing status, never on a marketplace status, and
+  // these payloads have no plugin rows (plugins:[]). UXG-05 is orthogonal to
+  // the reload-hint discipline.
+  //
+  // Closes the Phase 27 UAT Test-3 gap (UXG-05, severity major): the
+  // autoupdate-ON branch previously emitted `status: "updated"` unconditionally
+  // and never consulted `snapshot.changed`, so a true no-op update on an
+  // autoupdate-ON marketplace always rendered `(updated)`. It now mirrors the
+  // autoupdate-OFF no-op.
+  if (!snapshot.autoupdate || pluginUpdate === undefined) {
+    if (!snapshot.changed) {
+      notify(ctx, pi, {
+        marketplaces: [{ name, scope, status: "skipped", reasons: ["up-to-date"], plugins: [] }],
+      });
+      return;
+    }
+
+    notify(ctx, pi, {
+      marketplaces: [{ name, scope, status: "updated", plugins: [] }],
+    });
+    return;
   }
 
-  const body = appendSoftDepWarnings(baseLines.join("\n"), pi, partitions.updated);
+  // Autoupdate-ON no-op gate (Phase 27 UAT Test-3): a true no-op requires BOTH
+  // (A) the validated manifest content is unchanged (snapshot.changed === false)
+  // AND (B) every cascaded plugin outcome is `unchanged`. `updated` / `skipped`
+  // (e.g. a source-mismatch skip) / `failed` outcomes are NOT no-ops -- a
+  // `failed` outcome keeps the existing `(updated)`-with-rows emission so the
+  // per-plugin failed routing is preserved (a thrown refresh failure is already
+  // handled upstream in `refreshOneMarketplace`'s catch and never reaches here).
+  // When both hold, emit the SAME `(skipped) {up-to-date}` payload as the OFF
+  // no-op (plugins:[] -> shouldEmitReloadHint stays false, warning severity).
+  const cascadeIsNoOp = outcomes.every((o) => o.partition === "unchanged");
+  if (!snapshot.changed && cascadeIsNoOp) {
+    notify(ctx, pi, {
+      marketplaces: [{ name, scope, status: "skipped", reasons: ["up-to-date"], plugins: [] }],
+    });
+    return;
+  }
 
-  const hint = reloadHint("refresh", updatedNames);
-  notifySuccess(ctx, appendReloadHint(body, hint));
+  // Cascade rows -- per-plugin PluginFailedMessage.cause /
+  // PluginUpdatedMessage{from,to,dependencies} / PluginSkippedMessage.
+  // notify owns: severity (any failed -> error; any skipped/manual recovery
+  // -> warning; otherwise info), reload-hint (fires only when a plugin row
+  // carries a status in {installed, updated, reinstalled, uninstalled} -- the
+  // marketplace status never triggers it), and the per-row soft-dep marker
+  // (single probe per notify call, threaded into every renderPluginRow).
+  // Caller-supplied plugin order is honored verbatim.
+  notify(ctx, pi, {
+    marketplaces: [
+      {
+        name,
+        scope,
+        status: "updated",
+        plugins: outcomes.map((o) => outcomeToCascadePluginMessage(o, scope)),
+      },
+    ],
+  });
 }
 
 /**
@@ -387,3 +799,11 @@ async function validateManifestAtRoot(
     record.marketplaceRoot = marketplaceRoot;
   }
 }
+
+/**
+ * Test seam for the outcome -> plugin-message mapper. Tests verify the
+ * `outcome.reasons` typed-Reason preference over the notes-parsing fallback
+ * AND the discriminated-union construction (per-plugin cause + glyph flip on
+ * `unchanged` -> `skipped {up-to-date}`).
+ */
+export { outcomeToCascadePluginMessage as __test_outcomeToCascadePluginMessage };

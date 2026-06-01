@@ -79,9 +79,9 @@ export default tseslint.config(
     // BLOCK A (D-06 / IL-2 / IL-3): Output discipline scoped to the extension.
     // Direct stdout/stderr writes and console.* calls are forbidden in the
     // extension. Sanctioned exception: load-time migrate-record save failure
-    // in `migrateLegacyMarketplaceRecords` (IL-3) -- disabled inline at the
-    // single callsite with `// eslint-disable-next-line no-restricted-syntax
-    // -- IL-3: ...`. The `--` justification is required (Pitfall #5).
+    // in `migrateLegacyMarketplaceRecords` (IL-3) -- allowed via the
+    // block-level files-override for `persistence/migrate.ts` below (BLOCK
+    // B-2). No inline `eslint-disable-next-line` directive is required.
     files: ["extensions/pi-claude-marketplace/**/*.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -106,12 +106,12 @@ export default tseslint.config(
         {
           selector: "CallExpression[callee.object.name='console'][callee.property.name='warn']",
           message:
-            "console.warn is forbidden in the extension (IL-3) except at the single sanctioned migrateLegacyMarketplaceRecords callsite (use eslint-disable-next-line with a -- comment citing IL-3).",
+            "console.warn is forbidden in the extension (IL-2) except at the single sanctioned migrateLegacyMarketplaceRecords callsite, which is allowed via a block-level files-override in this config.",
         },
         {
           selector: "CallExpression[callee.object.name='console'][callee.property.name='error']",
           message:
-            "console.error is forbidden in the extension (IL-2). Use notifyError(ctx, ..., cause) via shared/notify.ts wrappers.",
+            "console.error is forbidden in the extension (IL-2). Use notify(ctx, pi, NotificationMessage) (failed status carries cause via per-plugin cause?: Error) from shared/notify.ts.",
         },
         {
           selector: "CallExpression[callee.object.name='console'][callee.property.name='info']",
@@ -122,7 +122,7 @@ export default tseslint.config(
           selector:
             "CallExpression[callee.property.name='notify'][callee.object.property.name='ui']",
           message:
-            "Direct ctx.ui.notify is forbidden -- use notifySuccess/notifyWarning/notifyError from shared/notify.ts (D-07).",
+            "Direct ctx.ui.notify is forbidden -- use notify(ctx, pi, NotificationMessage) or notifyUsageError(ctx, UsageErrorMessage) from shared/notify.ts.",
         },
       ],
       // Catches console.debug / console.trace / console.dir which the AST
@@ -140,6 +140,19 @@ export default tseslint.config(
     },
   },
   {
+    // Per-file override -- migrate.ts emits the single sanctioned
+    // legacy-migration console.warn (IL-3). That one callsite trips BOTH
+    // rules: the explicit `console.warn` selector in `no-restricted-syntax`
+    // AND the catch-all `no-console: error`, so both must be disabled for
+    // this file (and only this file). No other console.warn is permitted in
+    // the extension.
+    files: ["extensions/pi-claude-marketplace/persistence/migrate.ts"],
+    rules: {
+      "no-console": "off",
+      "no-restricted-syntax": "off",
+    },
+  },
+  {
     // BLOCK C (D-11): Import-direction enforcement. 9-zone no-restricted-paths
     // mapping: each folder declares which sibling folders MUST NOT import from
     // it (i.e. enforces the upward/inward direction of the dep graph).
@@ -150,16 +163,17 @@ export default tseslint.config(
         {
           basePath: import.meta.dirname,
           zones: [
+            // D-21-02 Phase 21: edge/ may now import domain/ directly; the
+            // prior cross-zone re-export hack via the retired rendering
+            // layer is gone.
             {
               target: "./extensions/pi-claude-marketplace/edge",
               from: [
                 "./extensions/pi-claude-marketplace/bridges",
-                "./extensions/pi-claude-marketplace/domain",
                 "./extensions/pi-claude-marketplace/transaction",
                 "./extensions/pi-claude-marketplace/persistence",
               ],
-              message:
-                "edge/ may only import from orchestrators/, presentation/, shared/, platform/.",
+              message: "edge/ may only import from orchestrators/, domain/, shared/, platform/.",
             },
             {
               target: "./extensions/pi-claude-marketplace/orchestrators",
@@ -172,7 +186,6 @@ export default tseslint.config(
                 "./extensions/pi-claude-marketplace/edge",
                 "./extensions/pi-claude-marketplace/orchestrators",
                 "./extensions/pi-claude-marketplace/transaction",
-                "./extensions/pi-claude-marketplace/presentation",
               ],
               message:
                 "bridges/ may only import from domain/, persistence/, shared/, platform/. Cross-bridge imports are also forbidden.",
@@ -185,7 +198,6 @@ export default tseslint.config(
                 "./extensions/pi-claude-marketplace/bridges",
                 "./extensions/pi-claude-marketplace/transaction",
                 "./extensions/pi-claude-marketplace/persistence",
-                "./extensions/pi-claude-marketplace/presentation",
               ],
               message:
                 "domain/ MUST NOT import upward -- pure logic only. shared/ and platform/ are the only sibling imports allowed.",
@@ -197,7 +209,6 @@ export default tseslint.config(
                 "./extensions/pi-claude-marketplace/orchestrators",
                 "./extensions/pi-claude-marketplace/bridges",
                 "./extensions/pi-claude-marketplace/domain",
-                "./extensions/pi-claude-marketplace/presentation",
               ],
               message: "transaction/ may only import from persistence/, shared/, platform/.",
             },
@@ -208,20 +219,8 @@ export default tseslint.config(
                 "./extensions/pi-claude-marketplace/orchestrators",
                 "./extensions/pi-claude-marketplace/bridges",
                 "./extensions/pi-claude-marketplace/transaction",
-                "./extensions/pi-claude-marketplace/presentation",
               ],
               message: "persistence/ may only import from domain/, shared/, platform/.",
-            },
-            {
-              target: "./extensions/pi-claude-marketplace/presentation",
-              from: [
-                "./extensions/pi-claude-marketplace/edge",
-                "./extensions/pi-claude-marketplace/orchestrators",
-                "./extensions/pi-claude-marketplace/bridges",
-                "./extensions/pi-claude-marketplace/transaction",
-                "./extensions/pi-claude-marketplace/persistence",
-              ],
-              message: "presentation/ may only import from domain/, shared/, platform/.",
             },
             {
               target: "./extensions/pi-claude-marketplace/platform",
@@ -232,7 +231,6 @@ export default tseslint.config(
                 "./extensions/pi-claude-marketplace/domain",
                 "./extensions/pi-claude-marketplace/transaction",
                 "./extensions/pi-claude-marketplace/persistence",
-                "./extensions/pi-claude-marketplace/presentation",
               ],
               message:
                 "platform/ may only import from shared/. It's the external-system boundary (git, Pi API surface).",
@@ -246,7 +244,6 @@ export default tseslint.config(
                 "./extensions/pi-claude-marketplace/domain",
                 "./extensions/pi-claude-marketplace/transaction",
                 "./extensions/pi-claude-marketplace/persistence",
-                "./extensions/pi-claude-marketplace/presentation",
               ],
               message: "shared/ may only import from platform/ for Pi API types.",
             },
@@ -256,9 +253,11 @@ export default tseslint.config(
     },
   },
   {
-    // BLOCK E (Phase 7 D-04): Direct Pi peer imports are allowed only in
-    // platform/pi-api.ts. All other extension code imports Pi API types from
-    // the wrapper so peer-dependency version bumps have a single audit point.
+    // BLOCK E (Phase 7 D-04): Pi peer-import chokepoint. Direct imports of
+    // `@earendil-works/pi-coding-agent` are allowed only in
+    // `extensions/pi-claude-marketplace/platform/pi-api.ts`. All other
+    // extension code imports Pi API types through the wrapper so
+    // peer-dependency version bumps have a single audit point.
     files: ["extensions/pi-claude-marketplace/**/*.ts"],
     ignores: ["extensions/pi-claude-marketplace/platform/pi-api.ts"],
     rules: {

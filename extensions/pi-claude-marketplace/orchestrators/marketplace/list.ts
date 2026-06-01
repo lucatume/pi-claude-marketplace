@@ -3,31 +3,40 @@
 // ML-1..4 + SC-6 + NFR-5.
 //
 // READ-ONLY: NO withStateGuard (D-04 corollary). NO manifest reads
-// (ML-3 -- `loadState` reads only state.json; `renderMarketplaceList`
-// is a pure formatter on the in-memory records). NO gitOps surface
+// (ML-3 -- `loadState` reads only state.json; the V2 `notify()` is a
+// pure formatter on the in-memory records). NO gitOps surface
 // (NFR-5 by construction -- list.ts does not even import platform/git
 // or DEFAULT_GIT_OPS).
 //
 // Flow:
-//   const scopes: Scope[] = opts.scope !== undefined ? [opts.scope] : ["user", "project"];
+//   const scopes: Scope[] = opts.scope !== undefined ? [opts.scope] : ["project", "user"];
 //   for each scope: loadState(locationsFor(scope, cwd).extensionRoot)
-//     -> collect every state.marketplaces[<name>]
-//   notifySuccess(ctx, renderMarketplaceList(allRecords));
-//   // ML-4: when allRecords is empty, renderMarketplaceList returns
-//   // "No marketplaces configured." verbatim.
+//     -> accumulate one MarketplaceNotificationMessage per state.marketplaces[<name>]
+//   notify(opts.ctx, opts.pi, { marketplaces: <built array> });
+// : an empty top-level marketplaces array renders the
+//   //   `(no marketplaces)` sentinel (planner-chosen) -- replaces the V1
+//   //   CMC-10 EmptyToken path through renderMarketplaceList.
+// : caller-supplied order honored end-to-end (no internal
+//   //   sort); the outer scopes loop is project-then-user (SC-6 / MSG-GR-3),
+//   //   so same-name cross-scope rows land in V1's compareByNameThenScope
+//   //   project-before-user order when single-name. Cross-name ordering is
+//   //   insertion order (Object.values on state.marketplaces); the V1
+//   //   alphabetic sort is dropped per Phase 18 PATTERNS list.ts.
 
 import { locationsFor } from "../../persistence/locations.ts";
 import { loadState } from "../../persistence/state-io.ts";
-import { renderMarketplaceList } from "../../presentation/marketplace-list.ts";
-import { notifySuccess } from "../../shared/notify.ts";
+import { notify } from "../../shared/notify.ts";
 
-import type { ParsedSource } from "../../domain/source.ts";
-import type { ExtensionContext } from "../../platform/pi-api.ts";
-import type { MarketplaceListEntry } from "../../presentation/marketplace-list.ts";
+import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
+import type { MarketplaceNotificationMessage } from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
 
 export interface ListMarketplacesOptions {
   readonly ctx: ExtensionContext;
+  /**
+   * Required by `notify(ctx, pi, message)` for soft-dep probing.
+   */
+  readonly pi: ExtensionAPI;
   /** When omitted, SC-6 mandates enumeration of BOTH scopes. */
   readonly scope?: Scope;
   /** Project-scope cwd (ignored for user scope). */
@@ -36,28 +45,50 @@ export interface ListMarketplacesOptions {
 
 export async function listMarketplaces(opts: ListMarketplacesOptions): Promise<void> {
   // SC-6: bare form enumerates both scopes; explicit --scope narrows.
-  const scopes: readonly Scope[] = opts.scope === undefined ? ["user", "project"] : [opts.scope];
+  // Iteration order is project-first per MSG-GR-3 so same-name cross-scope
+  // pairs render project-before-user (matching the V1 compareByNameThenScope
+  // tie-breaker).
+  const scopes: readonly Scope[] = opts.scope === undefined ? ["project", "user"] : [opts.scope];
 
-  const allRecords: MarketplaceListEntry[] = [];
+  const marketplaces: MarketplaceNotificationMessage[] = [];
   for (const scope of scopes) {
     const locations = locationsFor(scope, opts.cwd);
     const state = await loadState(locations.extensionRoot);
     for (const record of Object.values(state.marketplaces)) {
-      // state-io stores `source` as `Type.Unknown()`; the renderer expects
-      // `ParsedSource`. The state-io load path validates structure; the
-      // discriminant `kind` is preserved end-to-end.
-      const entry: MarketplaceListEntry = {
+      // NotificationMessage construction recipe (Plan 18-01 pilot; mirrored here).
+      // - One MarketplaceNotificationMessage per record, emitted via one
+      //   notify(opts.ctx, opts.pi, ...) call below; `plugins: []` is required.
+      // - Discriminator here: `mp.status === undefined` (list-surface arm of
+      //   renderMpHeader). Unique to this orchestrator in the marketplace family.
+      // - `details: MarketplaceDetails` is OPTIONAL and INDEPENDENT of status
+      //   per D-15-06; SET when the persisted record carries `autoupdate`
+      //   and/or `lastUpdatedAt`, OMITTED otherwise so the renderer emits a
+      //  bare `● <name> [<scope>]` row (list-surface sub-branch A).
+      // - Severity (info; no 2nd arg) and reload-hint are computed by
+      //  notify (list surface emits neither).
+      // - Reference: catalog UAT `mixed-scopes` fixture at
+      //   tests/architecture/catalog-uat.test.ts:1087-1107 (binding
+      //   `<autoupdate>` + `<last-updated <iso>>` tokens).
+      marketplaces.push({
         name: record.name,
         scope: record.scope,
-        source: record.source as ParsedSource,
-        ...(record.autoupdate !== undefined && { autoupdate: record.autoupdate }),
-      };
-      allRecords.push(entry);
+        ...(record.autoupdate !== undefined || record.lastUpdatedAt !== undefined
+          ? {
+              details: {
+                autoupdate: record.autoupdate ?? false,
+                ...(record.lastUpdatedAt !== undefined && {
+                  lastUpdatedAt: record.lastUpdatedAt,
+                }),
+              },
+            }
+          : {}),
+        plugins: [],
+      });
     }
   }
 
-  // renderMarketplaceList handles both populated and empty cases:
-  //   - allRecords.length > 0  -> grouped-by-scope rendering (ML-1, ML-2)
-  //   - allRecords.length === 0 -> "No marketplaces configured." (ML-4)
-  notifySuccess(opts.ctx, renderMarketplaceList(allRecords));
+  // : empty top-level marketplaces array renders `(no marketplaces)`.
+  // : caller-supplied order honored end-to-end; the outer loop above
+  // already enforces the SC-6 / MSG-GR-3 project-first ordering.
+  notify(opts.ctx, opts.pi, { marketplaces });
 }

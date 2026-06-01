@@ -6,19 +6,20 @@
     "url": "https://github.com/acolomba/pi-claude-marketplace/issues"
   },
   "dependencies": {
-    "isomorphic-git": "^1.37.6",
+    "isomorphic-git": "^1.38.1",
     "proper-lockfile": "^4.1.2",
     "write-file-atomic": "^8.0.0"
   },
   "description": "Access Claude plugin marketplaces from Pi.",
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
     "@earendil-works/pi-coding-agent": "^0.75.3",
     "@earendil-works/pi-tui": "^0.78.0",
+    "@eslint/js": "^10.0.1",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@types/proper-lockfile": "^4.1.4",
     "@types/write-file-atomic": "^4.0.3",
-    "eslint": "^10.2.1",
+    "@typescript-eslint/rule-tester": "^8.59.4",
+    "eslint": "^10.4.0",
     "eslint-plugin-import-x": "^4.16.2",
     "eslint-plugin-sonarjs": "^4.0.3",
     "globals": "^17.6.0",
@@ -26,7 +27,8 @@
     "prettier": "^3.8.3",
     "typebox": "^1.1.38",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.59.1"
+    "typescript-eslint": "^8.59.4",
+    "yaml": "^2.9.0"
   },
   "engines": {
     "node": ">=20.19.0"
@@ -71,16 +73,16 @@
     "format:check": "prettier --check \"**/*.{js,json,ts}\"",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "test": "node --test \"tests/{architecture,bridges,domain,edge,helpers,orchestrators,persistence,presentation,shared,transaction}/**/*.test.ts\"",
+    "test": "node --test \"tests/{architecture,bridges,domain,edge,helpers,orchestrators,persistence,shared,transaction}/**/*.test.ts\"",
     "test:coverage": "rm -rf coverage && mkdir -p coverage && npm run test:coverage:unit && npm run test:coverage:integration && npm run test:coverage:e2e",
     "test:coverage:e2e": "PI_CM_E2E_REF=pinned node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/e2e.lcov \"tests/e2e/**/*.test.ts\"",
     "test:coverage:integration": "node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/integration.lcov \"tests/integration/**/*.test.ts\"",
-    "test:coverage:unit": "node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/unit.lcov \"tests/{architecture,bridges,domain,edge,helpers,orchestrators,persistence,presentation,shared,transaction}/**/*.test.ts\"",
+    "test:coverage:unit": "node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/unit.lcov \"tests/{architecture,bridges,domain,edge,helpers,orchestrators,persistence,shared,transaction}/**/*.test.ts\"",
     "test:e2e": "PI_CM_E2E_REF=pinned node --test \"tests/e2e/**/*.test.ts\"",
     "test:e2e:nightly": "PI_CM_E2E_REF=main node --test \"tests/e2e/**/*.test.ts\"",
     "test:integration": "node --test \"tests/integration/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "type": "module",
-  "version": "0.1.7"
+  "version": "0.2.0"
 }

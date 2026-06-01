@@ -1,40 +1,44 @@
 // edge/handlers/marketplace/list.ts
 //
-// Thin-shim plain handler for
+// Thin-shim factory for
 // `/claude:plugin marketplace <list|ls> [--scope user|project]`.
 // Also reached via the `ls` alias through edge/router.ts.
-// No factory needed -- `listMarketplaces` takes no orchestrator-side
-// dependencies. Delegates with parsed scope (undefined = enumerate both).
+//
+// `makeMarketplaceListHandler(pi)` factory threads `pi` down to
+// `listMarketplaces`, following the `makeAddHandler` /
+// `makeAutoupdateHandler` / `makeRemoveHandler` convention.
 
 import { listMarketplaces } from "../../../orchestrators/marketplace/list.ts";
-import { notifyError } from "../../../shared/notify.ts";
+import { notifyUsageError } from "../../../shared/notify.ts";
 import { parseCommandArgs } from "../../args-schema.ts";
 
-import type { ExtensionCommandContext } from "../../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionCommandContext } from "../../../platform/pi-api.ts";
 
 const USAGE = "Usage: /claude:plugin marketplace <list|ls> [--scope user|project]";
 
-export async function handleMarketplaceList(
-  args: string,
-  ctx: ExtensionCommandContext,
-): Promise<void> {
-  const parsed = parseCommandArgs(
-    args,
-    {
-      positional: [] as const,
-      usage: USAGE,
-    },
-    (message) => {
-      notifyError(ctx, message);
-    },
-  );
-  if (parsed === undefined) {
-    return;
-  }
+export function makeMarketplaceListHandler(
+  pi: ExtensionAPI,
+): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
+  return async (args, ctx): Promise<void> => {
+    const parsed = parseCommandArgs(
+      args,
+      {
+        positional: [] as const,
+        usage: USAGE,
+      },
+      (message) => {
+        notifyUsageError(ctx, { message, usage: USAGE });
+      },
+    );
+    if (parsed === undefined) {
+      return;
+    }
 
-  await listMarketplaces({
-    ctx,
-    cwd: ctx.cwd,
-    ...(parsed.scope !== undefined && { scope: parsed.scope }),
-  });
+    await listMarketplaces({
+      ctx,
+      pi,
+      cwd: ctx.cwd,
+      ...(parsed.scope !== undefined && { scope: parsed.scope }),
+    });
+  };
 }

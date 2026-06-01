@@ -71,10 +71,13 @@ test("shim :: bare /update with no positional calls updatePlugins with target = 
     const { ctx, notifications } = makeCtx(cwd);
     const handler = makeUpdateHandler(makePi());
     await handler("", ctx);
-    // PUP-1 empty-set silent success: "No plugins installed."
+    // Phase 19 / Plan 19-05: V2 empty-targets renders via notify({
+    // marketplaces: [] }) -> renderer's `(no marketplaces)` sentinel
+    // per D-16-17. Mirrors the Wave 1 precedent at
+    // orchestrators/marketplace/update.ts:230.
     assert.equal(notifications.length, 1);
     assert.equal(notifications[0]!.severity, undefined);
-    assert.match(notifications[0]!.message, /No plugins installed\./);
+    assert.equal(notifications[0]!.message, "(no marketplaces)");
   });
 });
 
@@ -111,9 +114,9 @@ test("shim :: --scope user/project propagated to updatePlugins", async () => {
     const { ctx, notifications } = makeCtx(cwd);
     const handler = makeUpdateHandler(makePi());
     await handler("--scope project", ctx);
-    // PUP-1 empty-set silent success on project scope.
+    // Phase 19 / Plan 19-05: V2 empty-targets renders `(no marketplaces)`.
     assert.equal(notifications.length, 1);
-    assert.match(notifications[0]!.message, /No plugins installed\./);
+    assert.equal(notifications[0]!.message, "(no marketplaces)");
   });
 });
 
@@ -138,11 +141,11 @@ test("shim :: bare form + --map-model is accepted; control reaches updatePlugins
     const { ctx, notifications } = makeCtx(cwd);
     const handler = makeUpdateHandler(makePi());
     await handler("--map-model", ctx);
-    // Bare form with --map-model: empty state -> PUP-1 silent success.
-    // Critically, no USAGE error.
+    // Phase 19 / Plan 19-05: V2 empty-targets renders `(no marketplaces)`;
+    // critically, no USAGE error fires.
     assert.equal(notifications.length, 1);
     assert.doesNotMatch(notifications[0]!.message, /Usage: \/claude:plugin update/);
-    assert.match(notifications[0]!.message, /No plugins installed\./);
+    assert.equal(notifications[0]!.message, "(no marketplaces)");
   });
 });
 

@@ -1,8 +1,9 @@
 // Plan 06-04 Task 1: marketplace update handler shim tests.
 //
 // Two forms via optional positional:
-//   - bare    -> updateAllMarketplaces (MU-1 empty-set silent success on
-//                  fresh state -> "No marketplaces configured.")
+//   - bare    -> updateAllMarketplaces (empty-set silent success on
+//                  fresh state -> `(no marketplaces)` EmptyToken per
+//                  CMC-10 / Plan 13-02c-01)
 //   - <name>  -> updateMarketplace (MarketplaceNotFoundError -> notifyError)
 
 import assert from "node:assert/strict";
@@ -16,7 +17,7 @@ import { makeMockGitOps } from "../../../helpers/git-mock.ts";
 
 import type { EdgeDeps } from "../../../../extensions/pi-claude-marketplace/edge/types.ts";
 import type { PluginUpdateOutcome } from "../../../../extensions/pi-claude-marketplace/orchestrators/types.ts";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 interface NotifyRecord {
   message: string;
@@ -36,12 +37,28 @@ function makeCtx(cwd: string): { ctx: ExtensionCommandContext; notifications: No
   return { ctx, notifications };
 }
 
+// Plan 18-00 (Wave 0): `makeMarketplaceUpdateHandler(pi, deps)` requires
+// `pi` as first positional arg (the upstream orchestrator's `pi?` was
+// promoted to required `pi` in the same plan).
+function makePi(): ExtensionAPI {
+  return {
+    getAllTools: (): unknown[] => [],
+  } as unknown as ExtensionAPI;
+}
+
 function makeDeps(): { deps: EdgeDeps; pluginUpdateCalls: string[] } {
   const gitMock = makeMockGitOps();
   const pluginUpdateCalls: string[] = [];
   const pluginUpdate = (plugin: string): Promise<PluginUpdateOutcome> => {
     pluginUpdateCalls.push(plugin);
-    return Promise.resolve({ partition: "unchanged", name: plugin });
+    return Promise.resolve({
+      partition: "unchanged",
+      name: plugin,
+      fromVersion: "0.0.0",
+      toVersion: "0.0.0",
+      declaresAgents: false,
+      declaresMcp: false,
+    });
   };
 
   const deps: EdgeDeps = { gitOps: gitMock.gitOps, pluginUpdate };
@@ -71,11 +88,13 @@ test("shim :: bare /marketplace update calls updateAllMarketplaces", async () =>
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps } = makeDeps();
-    const handler = makeMarketplaceUpdateHandler(deps);
+    const handler = makeMarketplaceUpdateHandler(makePi(), deps);
     await handler("", ctx);
     // updateAllMarketplaces on fresh state -> "No marketplaces configured."
     assert.equal(notifications.length, 1);
-    assert.match(notifications[0]!.message, /No marketplaces configured\./);
+    // CMC-10: bare `(no marketplaces)` EmptyToken (formerly the
+    // "No marketplaces configured." sentence; retired by Plan 13-02c-01).
+    assert.equal(notifications[0]!.message, "(no marketplaces)");
   });
 });
 
@@ -83,7 +102,7 @@ test("shim :: named /marketplace update <name> calls updateMarketplace with name
   await withHermeticHome(async ({ cwd }) => {
     const { ctx } = makeCtx(cwd);
     const { deps } = makeDeps();
-    const handler = makeMarketplaceUpdateHandler(deps);
+    const handler = makeMarketplaceUpdateHandler(makePi(), deps);
     // updateMarketplace's `resolveScopeFromState` throws
     // MarketplaceNotFoundError when --scope is omitted and the name is
     // absent in BOTH scopes. The throw is NOT caught by the orchestrator
@@ -98,11 +117,13 @@ test("shim :: --scope user/project propagated", async () => {
   await withHermeticHome(async ({ cwd }) => {
     const { ctx, notifications } = makeCtx(cwd);
     const { deps } = makeDeps();
-    const handler = makeMarketplaceUpdateHandler(deps);
+    const handler = makeMarketplaceUpdateHandler(makePi(), deps);
     await handler("--scope project", ctx);
     // updateAllMarketplaces on project scope, empty -> "No marketplaces..."
     assert.equal(notifications.length, 1);
-    assert.match(notifications[0]!.message, /No marketplaces configured\./);
+    // CMC-10: bare `(no marketplaces)` EmptyToken (formerly the
+    // "No marketplaces configured." sentence; retired by Plan 13-02c-01).
+    assert.equal(notifications[0]!.message, "(no marketplaces)");
   });
 });
 
@@ -110,7 +131,7 @@ test("shim :: deps.pluginUpdate passed through to orchestrator for cascade", asy
   await withHermeticHome(async ({ cwd }) => {
     const { ctx } = makeCtx(cwd);
     const { deps, pluginUpdateCalls } = makeDeps();
-    const handler = makeMarketplaceUpdateHandler(deps);
+    const handler = makeMarketplaceUpdateHandler(makePi(), deps);
     // Empty state -> nothing to update -> pluginUpdate is never called (no
     // marketplaces with autoupdate=true). But the deps.pluginUpdate field
     // was structurally accepted -- the type-check that deps.pluginUpdate

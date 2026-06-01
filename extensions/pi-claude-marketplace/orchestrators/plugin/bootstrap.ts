@@ -30,7 +30,7 @@ import { MarketplaceDuplicateNameError } from "../../shared/errors.ts";
 import { addMarketplace } from "../marketplace/add.ts";
 import { setMarketplaceAutoupdate } from "../marketplace/autoupdate.ts";
 
-import type { ExtensionContext } from "../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
 import type { GitOps } from "../marketplace/shared.ts";
 
 /**
@@ -45,12 +45,19 @@ const BOOTSTRAP_SOURCE = "anthropics/claude-plugins-official";
  * The manifest `name` field for `anthropics/claude-plugins-official`.
  * `addMarketplace` derives this value from the cloned marketplace
  * manifest and records it; `setMarketplaceAutoupdate` reads the same
- * key. Keeping it as a single shared constant prevents drift.
+ * key. The edge handler also names this marketplace on the failed row it
+ * emits when bootstrap throws. Keeping it as a single shared constant
+ * prevents drift.
  */
-const BOOTSTRAP_MARKETPLACE_NAME = "claude-plugins-official";
+export const BOOTSTRAP_MARKETPLACE_NAME = "claude-plugins-official";
 
 export interface BootstrapOptions {
   readonly ctx: ExtensionContext;
+  /**
+   * Required by `addMarketplace` / `setMarketplaceAutoupdate` orchestrators.
+   * Bootstrap itself does not read `pi` directly.
+   */
+  readonly pi: ExtensionAPI;
   readonly cwd: string;
   /** D-12 injection seam. Always provided by the edge handler via EdgeDeps. */
   readonly gitOps: GitOps;
@@ -84,6 +91,7 @@ export async function bootstrapClaudePlugin(opts: BootstrapOptions): Promise<voi
   try {
     await addMarketplace({
       ctx: opts.ctx,
+      pi: opts.pi,
       scope: "user",
       cwd: opts.cwd,
       rawSource: BOOTSTRAP_SOURCE,
@@ -102,6 +110,7 @@ export async function bootstrapClaudePlugin(opts: BootstrapOptions): Promise<voi
 
   await setMarketplaceAutoupdate({
     ctx: opts.ctx,
+    pi: opts.pi,
     name: BOOTSTRAP_MARKETPLACE_NAME,
     enable: true,
     scope: "user",
