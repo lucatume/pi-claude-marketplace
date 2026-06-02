@@ -1,16 +1,15 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.5
-milestone_name: Notification Output Polish
-status: Awaiting next milestone
-stopped_at: Phase 29 context gathered
-last_updated: "2026-05-31T20:14:53.854Z"
-last_activity: 2026-05-31 -- Milestone v1.5 completed and archived
+milestone: v1.6
+milestone_name: GitHub Private Marketplace Authentication
+status: complete
+last_updated: "2026-06-01T17:50:00.000Z"
+last_activity: 2026-06-01 -- Phase 36 complete (1/1 plans), milestone v1.6 complete
 progress:
-  total_phases: 17
-  completed_phases: 17
-  total_plans: 61
-  completed_plans: 61
+  total_phases: 7
+  completed_phases: 7
+  total_plans: 16
+  completed_plans: 11
   percent: 100
 ---
 
@@ -20,20 +19,20 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-05-30)
 
-**Core value:** A Pi user can run `/claude:plugin install <plugin>@<marketplace>` and, after `/reload`, have every supported Claude plugin component appear as a working Pi-native artefact -- atomically, recoverably, and with soft-dependency degradation that never blocks the install. **Current focus:** Phase 29 -- notification-label-suppression-update-classification
+**Core value:** A Pi user can run `/claude:plugin install <plugin>@<marketplace>` and, after `/reload`, have every supported Claude plugin component appear as a working Pi-native artefact -- atomically, recoverably, and with soft-dependency degradation that never blocks the install. **Current focus:** v1.6 milestone COMPLETE
 
 ## Current Position
 
-Phase: Milestone v1.5 complete
-Plan: --
-Status: Awaiting next milestone
-Last activity: 2026-05-31 -- Milestone v1.5 completed and archived
+Phase: 36 (Integration Gate) -- COMPLETE
+Plan: 1 of 1
+Status: v1.6 milestone complete; all 7 phases done
+Last activity: 2026-06-01 -- Phase 36 complete (1/1 plans); v1.6 GitHub Private Marketplace Auth DONE
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 123
+- Total plans completed: 127
 - Average duration: -
 - Total execution time: -
 
@@ -67,6 +66,13 @@ Last activity: 2026-05-31 -- Milestone v1.5 completed and archived
 | 27 | 5 | - | - |
 | 28 | 2 | - | - |
 | 29 | 3 | - | - |
+| 30 | 1 | - | - |
+| 31 | 2 | - | - |
+| 32 | 1 | - | - |
+| 33 | 1 | - | - |
+| 34 | 1 | - | - |
+| 35 | TBD | - | - |
+| 36 | TBD | - | - |
 
 **Recent Trend:**
 
@@ -149,6 +155,7 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - [Phase 25]: SNM-37 gate satisfied via scripts/pi.sh source-load (no npm publish/link, D-25-01) + a tests/shared/snm37-behavioral-smoke.test.ts byte-form smoke proving v1.4 identity at the pre-tui notify boundary (D-25-04; stronger than pi --version, moot under -e source-load). Real-publish validation deferred (D-25-06). SNM-37 text + ROADMAP SC#1 amended in lockstep (D-25-03). Gates SNM-38 (25-02) + SNM-39 (25-03). -- Plan 25-01.
 - [Phase ?]: [Phase 25]: SNM-38 (G-MIL-03 indent ladder) REFUTED by pre-tui byte evidence (D-25-09): notify() emits the catalog-conformant 0/2/4 ladder at ctx.ui.notify (captured indents [0,2,2,2,2,4,0,0,2]); the observed 1/3 visual is a markdown/tui display-layer artifact, not a renderer deviation. Recorded as a docs/output-catalog.md Indentation-discipline clarification + a tests/shared/snm38-indent-ladder.test.ts readability lock (on top of the catalog-uat byte-equality gate). Anchored on notify.ts constants, NOT the UAT 2/4 truth-line misquote. -- Plan 25-02.
 - [Phase 25]: SNM-39 (G-MIL-07 tab completion) DEFER-WITH-FINDING (D-25-10): our provider is correct (TC-6 `update @` -> `["@mp-a","@mp-b"]` GREEN; cause (a) eliminated by v0.2.0 source-load, cause (c) ruled out). Root cause is cause (b) -- host-side `@`-precedence in the GLOBAL `@earendil-works/pi-tui` 0.76.0 that scripts/pi.sh execs (`@`-logic byte-identical to local 0.74.2): `CombinedAutocompleteProvider.getSuggestions:188` checks `extractAtPrefix:191`/`:331` against `PATH_DELIMITERS:6` (no `@`) and routes any `@`-leading token to file-mention completion BEFORE the slash branch `:205`, so our `getArgumentCompletions` is never reached for bare `update @`. LIVE scripts/pi.sh trigger (D-25-08) showed FILE PATHS (not `@<mp>` candidates) -> CONFIRMS the interception (D-25-05 real-home spot-check not triggered). pi-tui-external; defer, do NOT contort the provider (would degrade bare-`@<mp>` UX without fixing the host). Recorded in UAT + a finding comment above TC-6 (provider.test.ts:793). -- Plan 25-03.
+- [Roadmap v1.6]: 7-phase split (30-36) from research build-order A-G: Phase 30 (A) duplicate GitCredentials type fix (AUTH-10); Phase 31 (B) platform/git-credential.ts + CredentialOps interface (AUTH-06/08/09); Phase 32 (C) domain/github-auth.ts Device Flow state machine with injectable HTTP seam (AUTH-01..05/07); Phase 33 (D) platform/git.ts buildAuthCallbacks + authAttempted guard (AUTH-01/02); Phase 34 (E) GitOps interface threading through shared.ts + DEFAULT_GIT_OPS + refreshGitHubClone (AUTH-01/02); Phase 35 (F) orchestrator call sites add.ts + update.ts + output catalog Device Flow prompt (AUTH-01/02/03); Phase 36 (G) integration gate -- npm run check GREEN, all failure paths tested (all AUTH). No npm runtime deps added. Two new files: platform/git-credential.ts, domain/github-auth.ts.
 - [Phase 27]: UXG-06 closed doc-only -- catalog github-source prose corrected (marketplace add never auto-enables autoupdate for any source; add.ts:235-244/311-320), autoupdate heading renamed to the real autoupdate|noautoupdate <name> verbs (no disable subcommand), catalog-uat FIXTURES key synced byte-for-byte (loadCatalogExamples sectionRe coupling). catalog-uat + npm run check GREEN. -- Plan 27-01.
 - [Phase 27]: UXG-01 closed -- marketplace list `renderMpHeader` SUB-BRANCH B drops the `<last-updated <iso>>` token (array element removed, not emptied, per Pitfall 2); `MarketplaceDetails.lastUpdatedAt?` (notify.ts:285) + state-io.ts:70 persistence retained so notify-types.test.ts (`_MarketplaceDetailsExpected`) stays untouched/GREEN; renderer + catalog + catalog-uat fixture + notify-v2 byte test + orchestrator list test landed in one atomic commit (lockstep, no intermediate RED). `<autoupdate>` marker byte-unchanged. npm run check GREEN 1143/1143. -- Plan 27-02.
 - [Phase 27]: UXG-04 closed via Strategy B -- autoupdate FLIP surface now renders marker tokens (`<autoupdate>` / `<no autoupdate>`) instead of `(autoupdate enabled)`/`(autoupdate disabled)` status tokens; idempotent flips render the marker plus a `{already autoupdate}`/`{already no autoupdate}` brace (no `(skipped)` token). Renamed two REASONS members (already enabled->already autoupdate, already disabled->already no autoupdate); kept MARKETPLACE_STATUSES (7) and MARKERS (2) membership intact (`<no autoupdate>` already a MARKERS member, only emission is new). Inverted the autoupdate.ts marker-as-outcome header comment (reverses Phase 17.1 / D-18-05) and reconciled the three list-surface `<no autoupdate>`-not-emitted catalog prose statements surface-precisely (list surface unchanged). Renderer+orchestrator+catalog+byte gate+per-variant+orchestrator+2 bootstrap tests landed in one atomic commit (dbd149a); npm run check GREEN 1143/1143. -- Plan 27-03.
@@ -205,10 +212,10 @@ Additional v1.4.1-scope deferrals:
 
 ## Session Continuity
 
-Last session: 2026-05-31T17:13:22.668Z
-Stopped At: Phase 29 context gathered
-Resume File: .planning/phases/29-notification-label-suppression-update-classification/29-CONTEXT.md
+Last session: 2026-06-01T00:00:00.000Z
+Stopped At: v1.6 roadmap created
+Resume File: .planning/ROADMAP.md (Phase 30 next)
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Begin Phase 32 with /gsd-plan-phase 32
