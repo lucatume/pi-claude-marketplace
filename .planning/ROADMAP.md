@@ -9,7 +9,8 @@
 - Done **v1.4 Structured Notification Messages** -- Phases 15-21 (shipped 2026-05-28)
 - Done **v1.4.1 Post-ship UAT Patches** -- Phases 22-26 (closed 2026-05-30)
 - Done **v1.5 Notification Output Polish** -- Phases 27-29 (shipped 2026-05-31)
-- **v1.6 GitHub Private Marketplace Authentication** -- Phases 30-36 (in progress)
+- Done **v1.6 GitHub Private Marketplace Authentication** -- Phases 30-36 (shipped 2026-06-01)
+- Done **v1.7 Transaction Resilience Hardening** -- Phases 37-41 (shipped 2026-06-02)
 
 For full details of each milestone, see `.planning/milestones/v[X.Y]-ROADMAP.md` and `.planning/milestones/v[X.Y]-REQUIREMENTS.md`.
 
@@ -105,7 +106,7 @@ Closed the 8 gaps surfaced by the v1.4 milestone-spanning UAT: reload-hint suppr
 </details>
 
 <details>
-<summary>v1.6 GitHub Private Marketplace Authentication (Phases 30-36) -- IN PROGRESS</summary>
+<summary>Done v1.6 GitHub Private Marketplace Authentication (Phases 30-36) -- SHIPPED 2026-06-01</summary>
 
 On-demand Device Flow auth for private GitHub marketplace sources. Tries `git credential fill` first (silent reuse); triggers Device Flow only on a cache miss or 401; stores the resulting token via `git credential approve`; evicts via `git credential reject` on `onAuthFailure`. No env vars required. Two new modules (`platform/git-credential.ts`, `domain/github-auth.ts`) plus targeted wiring changes. 10/10 AUTH requirements.
 
@@ -116,6 +117,23 @@ On-demand Device Flow auth for private GitHub marketplace sources. Tries `git cr
 - [x] Phase 34: GitOps Interface Threading (AUTH-01, AUTH-02) (completed 2026-06-01)
 - [x] Phase 35: Orchestrator Call Sites & Output Catalog (AUTH-01, AUTH-02, AUTH-03)
 - [x] Phase 36: Integration Gate (all AUTH) (completed 2026-06-01)
+
+</details>
+
+<details>
+<summary>Done v1.7 Transaction Resilience Hardening (Phases 37-41) -- SHIPPED 2026-06-02</summary>
+
+Eight correctness fixes to the existing saga/two-phase-commit infrastructure: phase-ledger
+undo gap, parallel-rename orphan leaks in agents and commands bridges, ghost state records
+on partial cascade unstage, update.ts state-before-commit divergence, reinstall blocking
+on orphan targets, and inline documentation for two already-safe patterns. No new
+dependencies; no user-visible behavior changes on the happy path.
+
+- [x] Phase 37: Phase-Ledger Undo Gap (TR-02)
+- [x] Phase 38: Sequential Commit Loops + Orphan Tolerance (TR-01, TR-05, TR-06)
+- [x] Phase 39: Cascade Ghost Record (TR-03)
+- [x] Phase 40: Update State-Before-Commit Reorder (TR-04)
+- [x] Phase 41: Documentation and Test Closeout (TR-07, TR-08)
 
 </details>
 
@@ -777,3 +795,8 @@ Plans:
 | 34. GitOps Interface Threading                                       | v1.6      | 1/1 | Complete    | 2026-06-01 |
 | 35. Orchestrator Call Sites & Output Catalog                         | v1.6      | 4/4 | Complete    | 2026-06-01 |
 | 36. Integration Gate                                                 | v1.6      | 1/1 | Complete   | 2026-06-01 |
+| 37. Phase-Ledger Undo Gap                                            | v1.7      | 1/1 | Complete   | 2026-06-02 |
+| 38. Sequential Commit Loops + Orphan Tolerance                       | v1.7      | 1/1 | Complete   | 2026-06-02 |
+| 39. Cascade Ghost Record                                             | v1.7      | 1/1 | Complete   | 2026-06-02 |
+| 40. Update State-Before-Commit Reorder                               | v1.7      | 1/1 | Complete   | 2026-06-02 |
+| 41. Documentation and Test Closeout                                  | v1.7      | 1/1 | Complete   | 2026-06-02 |

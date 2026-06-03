@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1154,5 +1154,310 @@ test("Phase 8 / PRL-10 rollbackAgentsReplacement records leak when restoreAgents
     } finally {
       await chmod(path.dirname(locations.agentsIndexPath), 0o755);
     }
+  });
+});
+
+// TR-01 sequential commit rollback (agents) ------------------------------
+
+test("TR-01 commitPreparedAgents sequential commit rolls back completed renames on throw", async () => {
+  // 2 staged agents (acme-helper sorts before bot). Pre-seed pair #2's
+  // target (`pi-claude-marketplace-acme-bot.md`) as a non-empty directory
+  // so the second forward rename fails with ENOTEMPTY/EISDIR. The first
+  // rename should succeed; the catch reverse-walks completedRenames and
+  // restores the helper file to staging.
+  await withTmpScope(async ({ locations }) => {
+    const pluginRoot = path.join(FIXTURES, "test-plugin");
+    const resolved = makeResolved("acme", pluginRoot);
+
+    const prepared = await prepareStagePluginAgents({
+      locations,
+      marketplaceName: "mp1",
+      pluginName: "acme",
+      pluginRoot,
+      pluginDataDir: path.join(locations.dataRoot, "mp1", "acme"),
+      resolved,
+      agentsSourceDir: path.join(pluginRoot, "agents"),
+    });
+    assert.equal(prepared.kind, "staged");
+    if (prepared.kind !== "staged") {
+      throw new Error("prepared.kind must be 'staged' for this test");
+    }
+
+    // Pre-seed the agentsDir + obstacle directory for pair #2 (bot.md).
+    await mkdir(locations.agentsDir, { recursive: true });
+    const obstacleDir = path.join(locations.agentsDir, "pi-claude-marketplace-acme-bot.md");
+    await mkdir(obstacleDir, { recursive: true });
+    await writeFile(path.join(obstacleDir, "blocker.txt"), "non-empty");
+
+    // Sanity: 2 staged files; the helper sorts before the bot.
+    assert.equal(prepared._stagedFilePaths.length, 2);
+    const helperPair = prepared._stagedFilePaths.find((p) =>
+      p.to.endsWith("pi-claude-marketplace-acme-helper.md"),
+    );
+    assert.ok(helperPair, "expected an acme-helper staged pair");
+
+    await assert.rejects(
+      () => commitPreparedAgents(prepared),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        // Original error surfaces (ENOTEMPTY/EISDIR/etc). The exact errno
+        // text varies by platform; just confirm we got SOME error.
+        return true;
+      },
+    );
+
+    // Key observable: after rollback + cleanup, the agentsDir contains
+    // ONLY the pre-seeded obstacle directory -- no acme-helper.md file
+    // landed (rolled back) and no bot.md file landed (forward #2 never
+    // succeeded). Without TR-01 rollback, the helper file would have been
+    // left at the target as a partial-commit orphan.
+    const helperAtTargetStat = await stat(
+      path.join(locations.agentsDir, "pi-claude-marketplace-acme-helper.md"),
+    ).catch(() => null);
+    assert.equal(
+      helperAtTargetStat,
+      null,
+      "rollback must have removed the helper file from the target",
+    );
+
+    // The pre-seeded obstacle dir is still in place (untouched by rollback).
+    const obstacleStat = await stat(obstacleDir);
+    assert.ok(obstacleStat.isDirectory(), "pre-seeded obstacle dir survives");
+
+    // Staging dir is cleaned up by the catch's final cleanupStaging.
+    assert.equal(
+      await pathExists(prepared.stagingDir),
+      false,
+      "staging dir must be cleaned up after the failed commit",
+    );
+
+    // Silence unused-variable lint for helperPair (only used as a sanity
+    // check that the sort order matches our pre-seed key).
+    void helperPair;
+  });
+});
+
+test("TR-01 commitPreparedAgents rollback rename failure surfaces via appendLeaks", async () => {
+  // Same shape as the previous test (pair #2 target pre-seeded as non-empty
+  // dir to force ENOTEMPTY on forward rename #2). Additionally, mutate
+  // pair #1's `from` getter so the second access (rollback's
+  // `rename(pair.to, pair.from)`) reads a path that is itself a non-empty
+  // directory -- forcing the rollback rename to fail with ENOTEMPTY too.
+  // The bridge catches the rollback failure into rollbackLeaks[] and
+  // surfaces it via appendLeaks, NOT ManualRecoveryError.
+  await withTmpScope(async ({ locations }) => {
+    const pluginRoot = path.join(FIXTURES, "test-plugin");
+    const resolved = makeResolved("acme", pluginRoot);
+
+    const prepared = await prepareStagePluginAgents({
+      locations,
+      marketplaceName: "mp1",
+      pluginName: "acme",
+      pluginRoot,
+      pluginDataDir: path.join(locations.dataRoot, "mp1", "acme"),
+      resolved,
+      agentsSourceDir: path.join(pluginRoot, "agents"),
+    });
+    assert.equal(prepared.kind, "staged");
+    if (prepared.kind !== "staged") {
+      throw new Error("prepared.kind must be 'staged' for this test");
+    }
+
+    // Force rename #2 to throw ENOTEMPTY by pre-seeding its target as a
+    // non-empty directory.
+    await mkdir(locations.agentsDir, { recursive: true });
+    const obstacleDir = path.join(locations.agentsDir, "pi-claude-marketplace-acme-bot.md");
+    await mkdir(obstacleDir, { recursive: true });
+    await writeFile(path.join(obstacleDir, "blocker.txt"), "non-empty");
+
+    // Pre-create a non-empty directory at a fresh path that will be used as
+    // the rollback destination for pair #1.
+    const rollbackBlocker = path.join(prepared.stagingDir, "rollback-blocker.md");
+    await mkdir(rollbackBlocker, { recursive: true });
+    await writeFile(path.join(rollbackBlocker, "child.txt"), "non-empty");
+
+    // Mutate pair #1 (helper) so `pair.from` returns the real staging path
+    // on the first access (forward rename) and the non-empty blocker dir
+    // path on the second access (rollback rename). This forces rollback
+    // rename to fail with ENOTEMPTY/EISDIR, exercising the rollbackLeaks[]
+    // accumulation + appendLeaks chain in the catch block.
+    const helperPair = prepared._stagedFilePaths.find((p) =>
+      p.to.endsWith("pi-claude-marketplace-acme-helper.md"),
+    ) as { from: string; to: string } | undefined;
+    assert.ok(helperPair, "expected an acme-helper staged pair");
+
+    const realFrom = helperPair.from;
+    let fromAccessCount = 0;
+    // Inner object isn't frozen (only the outer array is); we can redefine
+    // `from` as a getter. The narrowed type is already mutable -- delete
+    // via Partial<> cast so strict-mode delete-of-required is permitted.
+    const mutablePair = helperPair;
+    delete (mutablePair as Partial<typeof mutablePair>).from;
+    Object.defineProperty(mutablePair, "from", {
+      get() {
+        fromAccessCount += 1;
+        // Access #1: forward rename source. Access #2: rollback rename dest.
+        return fromAccessCount === 1 ? realFrom : rollbackBlocker;
+      },
+      configurable: true,
+      enumerable: true,
+    });
+
+    await assert.rejects(
+      () => commitPreparedAgents(prepared),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        // The bridge MUST use appendLeaks (not ManualRecoveryError) on the
+        // commit-path catch (Pitfall 8).
+        assert.ok(
+          err.name !== "ManualRecoveryError",
+          "commit catch must NOT use ManualRecoveryError",
+        );
+        // The rollback leak must appear in the user-visible message.
+        assert.match(
+          err.message,
+          /\(additionally: failed to roll back agent rename/,
+          `expected appendLeaks rollback chain in message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+});
+
+// TR-06 orphan tolerance in replacePreparedAgents -----------------------
+
+test("TR-06 replacePreparedAgents tolerates owned orphan file from prior partial install", async () => {
+  // A previous partial install left an orphan agent file at the target.
+  // Because the basename matches an owned previous entry's generatedName,
+  // the 3-arm policy pre-removes the orphan via removeOrphanIfPresent and
+  // proceeds with the rename. The new staged content lands.
+  await withTmpScope(async ({ locations }) => {
+    const pluginRoot = path.join(FIXTURES, "test-plugin");
+    const resolved = makeResolved("acme", pluginRoot);
+
+    // Step 1: do a normal commit so the agents-index records the previous
+    // generatedNames (acme-helper + bot). After commit, the target files
+    // exist on disk and the index lists their entries.
+    const first = await prepareStagePluginAgents({
+      locations,
+      marketplaceName: "mp1",
+      pluginName: "acme",
+      pluginRoot,
+      pluginDataDir: path.join(locations.dataRoot, "mp1", "acme"),
+      resolved,
+      agentsSourceDir: path.join(pluginRoot, "agents"),
+    });
+    await commitPreparedAgents(first);
+
+    // Step 2: out-of-band, replace the bot target file with orphan bytes
+    // (simulating a prior partial install having left a file at the same
+    // basename). The orphan body carries the V1 generated-agent marker so
+    // the AG-5 foreign-content check still classifies it as owned and the
+    // replace path proceeds. The index still claims ownership of this
+    // generatedName.
+    const orphanTarget = path.join(locations.agentsDir, "pi-claude-marketplace-acme-bot.md");
+    await rm(orphanTarget, { force: true });
+    await writeFile(
+      orphanTarget,
+      "---\nname: pi-claude-marketplace-acme-bot\n---\norphan-agent generated by pi-claude-marketplace\n",
+      "utf8",
+    );
+
+    // Step 3: re-prepare + replace. The replace path's backup loop sees
+    // the file at orphanTarget (basename "pi-claude-marketplace-acme-bot"
+    // IS in ownedNames), backs it up, then proceeds. The new content
+    // lands; orphan bytes are gone.
+    const second = await prepareStagePluginAgents({
+      locations,
+      marketplaceName: "mp1",
+      pluginName: "acme",
+      pluginRoot,
+      pluginDataDir: path.join(locations.dataRoot, "mp1", "acme"),
+      resolved,
+      agentsSourceDir: path.join(pluginRoot, "agents"),
+    });
+
+    const replacement = await replacePreparedAgents(second);
+    assert.equal(replacement.kind, "replaced");
+
+    const replacedBody = await readFile(orphanTarget, "utf8");
+    assert.ok(
+      !replacedBody.includes("orphan-agent"),
+      "orphan-agent bytes must be gone after replace",
+    );
+    // The new agent body must carry the V1 generated marker (this is
+    // the regenerated content, not the orphan).
+    assert.ok(
+      replacedBody.includes("generated by pi-claude-marketplace"),
+      "replacement body must carry the V1 generated marker",
+    );
+  });
+});
+
+// TR-07 step-1 ENOENT-tolerance regression test ----------------
+
+test("TR-07 commitPreparedAgents step-1 ENOENT-tolerance enables retry-safe self-heal", async () => {
+  // A previous commit landed the bot target file, but partial-commit drift
+  // (e.g., an out-of-band cleanup or a crash between file delete and index
+  // save) removed the on-disk file while the index still references the
+  // OLD targetPath. On the next prepare + commit cycle, step 1 attempts
+  // `rm` on the already-gone target; the ENOENT swallow lets step 2 proceed
+  // with the new rename. Final disk state is clean: the bot file is at its
+  // target exactly once, the index reflects truth, and the second staging
+  // dir is cleaned up. This test asserts ONLY the final state -- it does
+  // NOT spy on rm calls, count Promise.all iterations, or otherwise pin
+  // implementation details (Pitfall 13).
+  await withTmpScope(async ({ locations }) => {
+    const pluginRoot = path.join(FIXTURES, "test-plugin");
+    const resolved = makeResolved("acme", pluginRoot);
+
+    // Cycle 1: full prepare + commit.
+    const prepared1 = await prepareStagePluginAgents({
+      locations,
+      marketplaceName: "mp1",
+      pluginName: "acme",
+      pluginRoot,
+      pluginDataDir: path.join(locations.dataRoot, "mp1", "acme"),
+      resolved,
+      agentsSourceDir: path.join(pluginRoot, "agents"),
+    });
+    assert.equal(prepared1.kind, "staged");
+    await commitPreparedAgents(prepared1);
+
+    // Inject partial-commit drift: the bot target file is gone, but the
+    // index still references its targetPath. Step-1 ENOENT-tolerance is
+    // designed to self-heal exactly this scenario.
+    const targetPath = path.join(locations.agentsDir, "pi-claude-marketplace-acme-bot.md");
+    assert.ok(await pathExists(targetPath), "expected cycle-1 commit to land bot.md");
+    await rm(targetPath);
+
+    // Cycle 2: re-prepare + commit. Step 1 attempts `rm` on the
+    // already-gone target; the ENOENT swallow lets step 2 proceed.
+    const prepared2 = await prepareStagePluginAgents({
+      locations,
+      marketplaceName: "mp1",
+      pluginName: "acme",
+      pluginRoot,
+      pluginDataDir: path.join(locations.dataRoot, "mp1", "acme"),
+      resolved,
+      agentsSourceDir: path.join(pluginRoot, "agents"),
+    });
+    assert.equal(prepared2.kind, "staged");
+    await commitPreparedAgents(prepared2);
+
+    // Behavior assertion: final disk + index state is clean.
+    assert.ok(await pathExists(targetPath), "bot.md must exist at target after retry");
+    const indexJson = JSON.parse(await readFile(locations.agentsIndexPath, "utf8")) as AgentsIndex;
+    assert.equal(
+      indexJson.agents.filter((a) => a.generatedName === "pi-claude-marketplace-acme-bot").length,
+      1,
+      "index has exactly one row for the bot agent after retry",
+    );
+    assert.equal(
+      prepared2.kind === "staged" ? await pathExists(prepared2.stagingDir) : true,
+      false,
+      "staging dir cleaned up after retry",
+    );
   });
 });

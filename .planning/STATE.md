@@ -1,15 +1,15 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.6
-milestone_name: GitHub Private Marketplace Authentication
-status: complete
-last_updated: "2026-06-01T17:50:00.000Z"
-last_activity: 2026-06-01 -- Phase 36 complete (1/1 plans), milestone v1.6 complete
+milestone: v1.7
+milestone_name: Transaction Resilience Hardening
+status: "v1.7 shipped -- PR #30"
+last_updated: "2026-06-03T00:49:12.622Z"
+last_activity: "2026-06-02 -- v1.7 PR #30 created"
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 16
-  completed_plans: 11
+  total_phases: 5
+  completed_phases: 5
+  total_plans: 5
+  completed_plans: 5
   percent: 100
 ---
 
@@ -19,14 +19,14 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-05-30)
 
-**Core value:** A Pi user can run `/claude:plugin install <plugin>@<marketplace>` and, after `/reload`, have every supported Claude plugin component appear as a working Pi-native artefact -- atomically, recoverably, and with soft-dependency degradation that never blocks the install. **Current focus:** v1.6 milestone COMPLETE
+**Core value:** A Pi user can run `/claude:plugin install <plugin>@<marketplace>` and, after `/reload`, have every supported Claude plugin component appear as a working Pi-native artefact -- atomically, recoverably, and with soft-dependency degradation that never blocks the install. **Current focus:** Phase 41 -- Documentation and Test Closeout
 
 ## Current Position
 
-Phase: 36 (Integration Gate) -- COMPLETE
-Plan: 1 of 1
-Status: v1.6 milestone complete; all 7 phases done
-Last activity: 2026-06-01 -- Phase 36 complete (1/1 plans); v1.6 GitHub Private Marketplace Auth DONE
+Phase: Milestone v1.7 complete
+Plan: --
+Status: v1.7 shipped -- PR #30
+Last activity: 2026-06-02 -- v1.7 PR #30 created
 
 ## Performance Metrics
 
@@ -218,4 +218,4 @@ Resume File: .planning/ROADMAP.md (Phase 30 next)
 
 ## Operator Next Steps
 
-- Begin Phase 32 with /gsd-plan-phase 32
+- Start the next milestone with /gsd-new-milestone

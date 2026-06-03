@@ -21,12 +21,17 @@
 //     so a plugin author cannot escape the source tree by planting a symlink.
 
 import { randomUUID } from "node:crypto";
-import { cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { assertSafeName } from "../../domain/name.ts";
 import { appendLeakToError, errorMessage, ManualRecoveryError } from "../../shared/errors.ts";
-import { cleanupStaging, pathExists, rollbackReplacementCommon } from "../../shared/fs-utils.ts";
+import {
+  cleanupStaging,
+  pathExists,
+  removeOrphanIfPresent,
+  rollbackReplacementCommon,
+} from "../../shared/fs-utils.ts";
 import { assertPathInside } from "../../shared/path-safety.ts";
 import { substituteClaudeVars } from "../../shared/vars.ts";
 
@@ -223,8 +228,29 @@ export async function commitPreparedSkills(
   // Step 2 + 3: ensure target root exists, then atomically rename each staged
   // dir into place. `rename` is per-OS atomic on same FS, which we guarantee
   // because both staging and target live under `<extensionRoot>/`.
+  // If a stale target dir exists (e.g. from a previous failed uninstall), remove
+  // it first -- POSIX rename(2) fails with ENOTEMPTY on non-empty directories.
+  // PI-6 cross-plugin conflict guard already ran before staging, so any pre-existing
+  // dir at pair.to is an orphan safe to discard.
   await mkdir(prepared.locations.skillsTargetDir, { recursive: true });
   for (const pair of prepared._renamePairs) {
+    // If a stale directory exists at the target (e.g. orphaned from a previous
+    // failed uninstall), remove it before renaming -- POSIX rename(2) fails with
+    // ENOTEMPTY on non-empty directories. Only remove if it is a directory; a
+    // file at pair.to is unexpected and should surface as a commit error (ENOTDIR).
+    // PI-6 cross-plugin conflict guard already ran before staging, so any
+    // pre-existing directory here is an orphan safe to discard.
+    try {
+      const targetStat = await stat(pair.to);
+      if (targetStat.isDirectory()) {
+        await rm(pair.to, { recursive: true, force: true });
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw e;
+      }
+    }
+
     await rename(pair.from, pair.to);
   }
 
@@ -282,9 +308,20 @@ export async function replacePreparedSkills(
       backups.push({ name, from: target, to: backup });
     }
 
+    // TR-06: 3-arm policy at the rename loop. ownedNames is the basename
+    // membership set derived from state.json (via _previousNames). When a
+    // pre-existing target shares an owned basename, it is treated as an
+    // orphan from a prior partial install and pre-removed via the
+    // kind-strict helper. Foreign content (basename NOT in ownedNames)
+    // still triggers the existing PI-6 "non-previous content" rejection
+    // verbatim. Skills targets are directories -> mode "tree".
+    const ownedNames = new Set<string>(prepared._previousNames);
     await mkdir(prepared.locations.skillsTargetDir, { recursive: true });
     for (const pair of prepared._renamePairs) {
-      if (await pathExists(pair.to)) {
+      const targetName = path.basename(pair.to);
+      if (ownedNames.has(targetName)) {
+        await removeOrphanIfPresent(pair.to, "tree");
+      } else if (await pathExists(pair.to)) {
         throw new Error(`Cannot replace skill target with non-previous content at ${pair.to}`);
       }
 

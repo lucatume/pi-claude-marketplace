@@ -33,8 +33,18 @@ import writeFileAtomic from "write-file-atomic";
 import { assertSafeName } from "../../domain/name.ts";
 import { loadAgentsIndex, saveAgentsIndex } from "../../persistence/agents-index-io.ts";
 import { AgentOwnershipConflictError } from "../../shared/errors-bridges.ts";
-import { appendLeakToError, errorMessage, ManualRecoveryError } from "../../shared/errors.ts";
-import { cleanupStaging, pathExists, rollbackReplacementCommon } from "../../shared/fs-utils.ts";
+import {
+  appendLeakToError,
+  appendLeaks,
+  errorMessage,
+  ManualRecoveryError,
+} from "../../shared/errors.ts";
+import {
+  cleanupStaging,
+  pathExists,
+  removeOrphanIfPresent,
+  rollbackReplacementCommon,
+} from "../../shared/fs-utils.ts";
 import { assertPathInside } from "../../shared/path-safety.ts";
 
 import { assertNoAgentCollisions, convertAgent } from "./convert.ts";
@@ -315,9 +325,19 @@ export async function commitPreparedAgents(
     return undefined;
   }
 
-  // Step 1: rm ONLY safe-to-overwrite previous target files. The
-  // _foreignPreservedEntries list is INTENTIONALLY excluded -- those
-  // targets stay untouched on disk and their rows stay in the index.
+  // TR-07 / Phase 41: Step 1 is retry-safe by construction. The Promise.all
+  // rm loop pre-removes OLD plugin-owned targets; ENOENT means "already gone"
+  // -- the only way ENOENT can fire is if a prior partial commit already
+  // removed the target before crashing, in which case the second pass is a
+  // no-op and step 2 proceeds with the new rename. This is the self-heal
+  // property documented at the function JSDoc above (the index pointing at
+  // the OLD targetPaths plus step-1 ENOENT tolerance closes the retry loop).
+  // The loop stays parallel here because step 1 has no source to roll back
+  // to -- those files were never backed up (commitPreparedAgents is the
+  // commit path, not the replacePreparedAgents backup path); rollback would
+  // have nothing to restore. _foreignPreservedEntries is INTENTIONALLY
+  // excluded -- those targets stay untouched on disk and their rows stay
+  // in the index.
   try {
     await Promise.all(
       prepared._previousEntries.map(async (entry) => {
@@ -337,15 +357,42 @@ export async function commitPreparedAgents(
     );
   }
 
-  // Step 2: mkdir <scopeRoot>/agents/ + parallel rename staged -> target.
+  // Step 2: mkdir <scopeRoot>/agents/ + sequential rename staged -> target.
+  // TR-01: Sequential so we can track completed renames and reverse them on
+  // a partial failure -- mirrors the rollback shape in
+  // `rollbackReplacementCommon` (shared/fs-utils.ts:135-177): spread-before-
+  // reverse to avoid in-place mutation, per-pair try/catch into a leaks[]
+  // string array, and the rollback loop NEVER throws (Pitfall 1).
+  const completedRenames: { from: string; to: string }[] = [];
   try {
     await mkdir(prepared.locations.agentsDir, { recursive: true });
-    await Promise.all(prepared._stagedFilePaths.map(({ from, to }) => rename(from, to)));
+    for (const pair of prepared._stagedFilePaths) {
+      await rename(pair.from, pair.to);
+      completedRenames.push(pair);
+    }
   } catch (err) {
-    throw appendLeakToError(
-      err,
+    // Reverse-walk completed renames -- restore each back to staging. The
+    // rollback loop NEVER throws; rollback failures accumulate into
+    // rollbackLeaks[] for surfacing via appendLeaks below.
+    const rollbackLeaks: string[] = [];
+    for (const pair of [...completedRenames].reverse()) {
+      try {
+        await rename(pair.to, pair.from);
+      } catch (rollbackErr) {
+        rollbackLeaks.push(
+          `failed to roll back agent rename ${pair.to} -> ${pair.from}: ${errorMessage(rollbackErr)}`,
+        );
+      }
+    }
+
+    // Surface BOTH original err AND rollback leaks AND staging-cleanup leak
+    // via appendLeaks (sequential-cause chain; preserves Error.cause for the
+    // depth-5 walker in shared/notify.ts). Pitfall 8: use appendLeaks here,
+    // NOT ManualRecoveryError -- commit-path leaks are transient IO.
+    throw appendLeaks(err, [
+      ...rollbackLeaks,
       await cleanupStaging(prepared.stagingDir, "agents staging directory"),
-    );
+    ]);
   }
 
   // Step 3: persist new index (LAST step before cleanup -- RESEARCH
@@ -428,9 +475,20 @@ export async function replacePreparedAgents(
       backups.push({ name: entry.generatedName, from: entry.targetPath, to: backup });
     }
 
+    // TR-06: 3-arm policy at the rename loop. ownedNames is the basename
+    // membership set derived from state.json (via _previousEntries). When
+    // a pre-existing target shares an owned basename, it is treated as an
+    // orphan from a prior partial install and pre-removed via the
+    // kind-strict helper. Foreign content (basename NOT in ownedNames)
+    // still triggers the existing PI-6 "non-previous content" rejection
+    // verbatim. Agents targets are .md files -> mode "file".
+    const ownedNames = new Set<string>(prepared._previousEntries.map((e) => e.generatedName));
     await mkdir(prepared.locations.agentsDir, { recursive: true });
     for (const pair of prepared._stagedFilePaths) {
-      if (await pathExists(pair.to)) {
+      const targetName = path.basename(pair.to, ".md");
+      if (ownedNames.has(targetName)) {
+        await removeOrphanIfPresent(pair.to, "file");
+      } else if (await pathExists(pair.to)) {
         throw new Error(`Cannot replace agent target with non-previous content at ${pair.to}`);
       }
 
