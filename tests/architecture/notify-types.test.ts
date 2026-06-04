@@ -54,14 +54,21 @@ import {
   DEPENDENCIES,
   MARKETPLACE_STATUSES,
   PLUGIN_STATUSES,
+  REASONS,
 } from "../../extensions/pi-claude-marketplace/shared/notify.ts";
 
 import type {
+  CascadeNotificationMessage,
   Dependency,
   MarketplaceDetails,
+  MarketplaceInfoCascadeMessage,
+  MarketplaceInfoMessage,
   MarketplaceNotificationMessage,
   MarketplaceStatus,
   NotificationMessage,
+  PluginInfoCascadeMessage,
+  PluginInfoMessage,
+  PluginInfoRow,
   PluginNotificationMessage,
   PluginStatus,
   UsageErrorMessage,
@@ -178,29 +185,48 @@ export const _dv: _Assert_DependencyValues = true;
 // Top-level shape proofs (SNM-01, SNM-02, SNM-07, SNM-08, D-15-05, D-15-06)
 // ============================================================================
 
-// SNM-01: `NotificationMessage` has EXACTLY `marketplaces: readonly
-// MarketplaceNotificationMessage[]` and nothing else.
-interface _NotificationMessageExpected {
+// SNM-01 (Phase 42 amendment): `NotificationMessage` is the discriminated
+// union `CascadeNotificationMessage | MarketplaceInfoMessage |
+// PluginInfoMessage`. The cascade arm preserves the SNM-01 single-shape
+// envelope contract (`marketplaces: readonly MarketplaceNotificationMessage[]`
+// and an optional `kind?: "cascade"` discriminator per Phase 42 / RESEARCH
+// Migration Strategy #2). Lock the cascade arm's shape exactly here; the
+// new info-surface arms are locked further down.
+interface _CascadeMessageExpected {
+  readonly kind?: "cascade";
   readonly marketplaces: readonly MarketplaceNotificationMessage[];
 }
-type _Assert_NotificationMessageShape = NotificationMessage extends _NotificationMessageExpected
-  ? _NotificationMessageExpected extends NotificationMessage
+type _Assert_CascadeMessageShape = CascadeNotificationMessage extends _CascadeMessageExpected
+  ? _CascadeMessageExpected extends CascadeNotificationMessage
     ? true
     : never
   : never;
-export const _nms: _Assert_NotificationMessageShape = true;
+export const _nms: _Assert_CascadeMessageShape = true;
 
-// SNM-01: NotificationMessage has NO `severity` field (severity is computed
-// structurally by the Phase 16 renderer; never embedded as a field per PRD
-// §6.12 ES-2).
-// @ts-expect-error -- SNM-01: NotificationMessage has NO severity field
-export type _NoSeverityOnNotificationMessage = NotificationMessage["severity"];
+// Phase 42 / Migration Strategy #2 backward-compat proof: a value with
+// `{ marketplaces: [...] }` and NO `kind` field MUST still type-check as a
+// `NotificationMessage`. This locks the optional-`kind?`-on-cascade
+// discipline so v1.0-v1.7 call sites (90+ orchestrator / test / fixture
+// sites that construct `{ marketplaces: [...] }`) continue to compile
+// without migration after the discriminated-union conversion.
+type _Assert_CascadeNoKind = {
+  readonly marketplaces: readonly MarketplaceNotificationMessage[];
+} extends NotificationMessage
+  ? true
+  : never;
+export const _l6: _Assert_CascadeNoKind = true;
 
-// SNM-01: NotificationMessage has NO top-level `trailer` field (reload hint
-// is computed; per-plugin causes live on PluginFailedMessage /
+// SNM-01: CascadeNotificationMessage has NO `severity` field (severity is
+// computed structurally by the Phase 16 renderer; never embedded as a field
+// per PRD §6.12 ES-2).
+// @ts-expect-error -- SNM-01: CascadeNotificationMessage has NO severity field
+export type _NoSeverityOnNotificationMessage = CascadeNotificationMessage["severity"];
+
+// SNM-01: CascadeNotificationMessage has NO top-level `trailer` field
+// (reload hint is computed; per-plugin causes live on PluginFailedMessage /
 // PluginManualRecoveryMessage per SNM-10).
-// @ts-expect-error -- SNM-01: NotificationMessage has NO trailer field
-export type _NoTrailerOnNotificationMessage = NotificationMessage["trailer"];
+// @ts-expect-error -- SNM-01: CascadeNotificationMessage has NO trailer field
+export type _NoTrailerOnNotificationMessage = CascadeNotificationMessage["trailer"];
 
 // SNM-02 + D-15-06 + Phase 17.1 D-17.1-01 reasons? amendment:
 // `MarketplaceNotificationMessage` carries name + scope + optional status +
@@ -610,6 +636,309 @@ export const _vMR: _Assert_VersionOnManualRecovery = true;
 // version is captured at install time and carries through to the inventory row).
 type _Assert_VersionOnPresent = _VPresent["version"] extends string | undefined ? true : never;
 export const _vP: _Assert_VersionOnPresent = true;
+
+// ============================================================================
+// Phase 42 / INFO-04 / INFO-08: REASONS closed-set extension + length lock
+//
+// The REASONS tuple grew from 28 to 29 entries with the addition of the new
+// `"not added"` literal that the new info-surface variants emit on the
+// `--scope` mismatch row (INFO-04). The length-lock + closed-set membership
+// proof catch the two drift modes the atomic-supersession commit must not
+// regress: (i) accidental removal / rename / reorder of the new entry, and
+// (ii) silent shrinkage of the tuple back to 28 entries.
+//
+// Pattern: mirrors the existing `_l1` / `_l2` / `_l3` length-lock blocks
+// above (PLUGIN_STATUSES at 11, MARKETPLACE_STATUSES at 7, DEPENDENCIES at
+// 2) -- those re-stated drift guards remain byte-identical; Phase 42 added
+// `_l4` / `_l4b` here and `_l5..._l9` for the new info variants below.
+// ============================================================================
+
+type _Assert_ReasonsLen = (typeof REASONS)["length"] extends 29 ? true : never;
+export const _l4: _Assert_ReasonsLen = true;
+
+type _Assert_NotAddedMember = "not added" extends (typeof REASONS)[number] ? true : never;
+export const _l4b: _Assert_NotAddedMember = true;
+
+// ============================================================================
+// Phase 42 / SC#1: 3-arm discriminated `NotificationMessage` union reachable
+//
+// The exported `NotificationMessage` type alias is now a 3-arm discriminated
+// union (`CascadeNotificationMessage | MarketplaceInfoMessage |
+// PluginInfoMessage`); the two new info-surface arms are reachable by their
+// `kind` discriminator via `Extract<NotificationMessage, { kind: "..." }>`.
+// SC#1 wording: "MarketplaceInfoMessage / PluginInfoMessage reachable from
+// NotificationMessage via the kind discriminator." This proof is the
+// load-bearing reach test.
+// ============================================================================
+
+type _Assert_NotifKinds =
+  Extract<NotificationMessage, { kind: "marketplace-info" }> extends never
+    ? never
+    : Extract<NotificationMessage, { kind: "plugin-info" }> extends never
+      ? never
+      : true;
+export const _l5: _Assert_NotifKinds = true;
+
+// ============================================================================
+// Phase 42 / SC#1: MarketplaceInfoMessage shape proof
+//
+// Bidirectional `extends` proves set-equality between the exported variant
+// type and an `_MarketplaceInfoExpected` literal mirroring the six fields
+// from the variant interface. Both source-kind sub-shapes (github with
+// optional ref, path) are covered by the union in `source`. Mirrors the
+// existing `_MarketplaceDetailsExpected` pattern above.
+// ============================================================================
+
+interface _MarketplaceInfoExpected {
+  readonly kind: "marketplace-info";
+  readonly name: string;
+  readonly scope: _Scope;
+  readonly details: MarketplaceDetails;
+  readonly source:
+    | {
+        readonly sourceKind: "github";
+        readonly owner: string;
+        readonly repo: string;
+        readonly ref?: string;
+      }
+    | { readonly sourceKind: "path"; readonly absPath: string };
+  // Phase 42 / WR-04: no parallel top-level `lastUpdated?` field. The ISO
+  // timestamp lives ONLY on `details.lastUpdatedAt` (single source of truth
+  // mirroring persistence/state-io.ts); the renderer reads it from there
+  // on the github-source arm.
+  readonly description?: string;
+}
+type _Assert_MarketplaceInfoShape = MarketplaceInfoMessage extends _MarketplaceInfoExpected
+  ? _MarketplaceInfoExpected extends MarketplaceInfoMessage
+    ? true
+    : never
+  : never;
+export const _l7: _Assert_MarketplaceInfoShape = true;
+
+// ============================================================================
+// Phase 42 / SC#1: PluginInfoMessage + PluginInfoRow discriminated-shape proof
+//
+// `PluginInfoMessage` carries `marketplaceName` / `marketplaceScope` /
+// `marketplaceDetails` plus a `plugin: PluginInfoRow` whose
+// `componentsResolved: true | false` discriminator drives the renderer's
+// switch. Each arm has the EXACT field set documented in the variant
+// interface JSDoc -- the resolved arm carries the four optional per-kind
+// component arrays + optional `dependencies`; the unresolved arm has NO
+// `components` property (and the `keyof` exclusion proof below locks that).
+// ============================================================================
+
+interface _PluginInfoBaseExpected {
+  readonly status: "installed" | "available" | "unavailable" | "failed";
+  readonly name: string;
+  readonly version?: string;
+  readonly scope?: _Scope;
+  readonly description?: string;
+  readonly reasons?: readonly _Reason[];
+}
+interface _PluginInfoExpected {
+  readonly kind: "plugin-info";
+  readonly marketplaceName: string;
+  readonly marketplaceScope: _Scope;
+  readonly marketplaceDetails: MarketplaceDetails;
+  readonly plugin: PluginInfoRow;
+}
+type _Assert_PluginInfoShape = PluginInfoMessage extends _PluginInfoExpected
+  ? _PluginInfoExpected extends PluginInfoMessage
+    ? true
+    : never
+  : never;
+export const _l8: _Assert_PluginInfoShape = true;
+
+// Per-arm proofs of the PluginInfoRow `componentsResolved` discriminator.
+// Extract each arm via the discriminator literal so the per-arm field set
+// is locked individually -- mirrors the per-variant `_VInstalled` /
+// `_VFailed` / etc. extraction pattern used above for
+// PluginNotificationMessage.
+type _RowResolved = Extract<PluginInfoRow, { componentsResolved: true }>;
+type _RowUnresolved = Extract<PluginInfoRow, { componentsResolved: false }>;
+
+// Both arms share the `PluginInfoRowBase` field set.
+type _Assert_RowResolvedBase = _RowResolved extends _PluginInfoBaseExpected ? true : never;
+export const _l8a: _Assert_RowResolvedBase = true;
+type _Assert_RowUnresolvedBase = _RowUnresolved extends _PluginInfoBaseExpected ? true : never;
+export const _l8b: _Assert_RowUnresolvedBase = true;
+
+// Resolved arm: components carries the four optional per-kind arrays, plus
+// optional dependencies. Locks the "renderer assumes pre-sorted input"
+// precondition's shape (the precondition itself is enforced by Phase 44's
+// orchestrator -- see RESEARCH Pitfall 5).
+interface _ComponentsExpected {
+  readonly agents?: readonly string[];
+  readonly commands?: readonly string[];
+  readonly mcp?: readonly string[];
+  readonly skills?: readonly string[];
+}
+type _Assert_RowResolvedComponents = _RowResolved["components"] extends _ComponentsExpected
+  ? _ComponentsExpected extends _RowResolved["components"]
+    ? true
+    : never
+  : never;
+export const _l8c: _Assert_RowResolvedComponents = true;
+
+type _Assert_RowResolvedDependencies = _RowResolved["dependencies"] extends
+  | readonly string[]
+  | undefined
+  ? true
+  : never;
+export const _l8d: _Assert_RowResolvedDependencies = true;
+
+// Unresolved arm: NO `components` property at all (the INFO-05 marker
+// carries no component data -- the renderer emits the `components: not
+// resolved` line and short-circuits). The `keyof` exclusion proof locks
+// the negative: the literal `"components"` is NOT a key of the unresolved
+// arm.
+type _Assert_RowUnresolvedNoComponents = "components" extends keyof _RowUnresolved ? never : true;
+export const _l8e: _Assert_RowUnresolvedNoComponents = true;
+// @ts-expect-error -- INFO-05: componentsResolved:false arm has NO components field
+export type _NoComponentsOnUnresolved = _RowUnresolved["components"];
+
+// ============================================================================
+// Phase 43 / INFO-03 / SC#1: MarketplaceInfoCascadeMessage variant proofs
+//
+// The `NotificationMessage` union now exposes a fourth variant --
+// `MarketplaceInfoCascadeMessage` -- emitted by `getMarketplaceInfo` when no
+// `--scope` is supplied and the requested marketplace name is present in
+// BOTH scopes. The fan-out wrapper carries one or more
+// `MarketplaceInfoMessage` blocks in caller order; `notify()` joins their
+// per-block bodies with `\n\n`. Three proofs:
+//
+//   - `_l9`  -- the union exposes the new arm via Extract on the kind
+//                discriminator (non-`never`).
+//   - `_l9a` -- bidirectional shape proof: the variant carries EXACTLY
+//                `kind: "marketplace-info-cascade"` and
+//                `blocks: readonly MarketplaceInfoMessage[]`.
+//   - `_l9b` -- union arity proof: the four arms (cascade |
+//                marketplace-info | plugin-info | marketplace-info-cascade)
+//                are simultaneously reachable. Any future regression that
+//                drops one of the four arms from the union (e.g. an
+//                accidental `Omit`) collapses the conjunction to `never`.
+// ============================================================================
+
+type _Assert_CascadeInfoKind =
+  Extract<NotificationMessage, { kind: "marketplace-info-cascade" }> extends never ? never : true;
+export const _l9: _Assert_CascadeInfoKind = true;
+
+interface _MarketplaceInfoCascadeExpected {
+  readonly kind: "marketplace-info-cascade";
+  readonly blocks: readonly [MarketplaceInfoMessage, ...MarketplaceInfoMessage[]];
+}
+type _Assert_MarketplaceInfoCascadeShape =
+  MarketplaceInfoCascadeMessage extends _MarketplaceInfoCascadeExpected
+    ? _MarketplaceInfoCascadeExpected extends MarketplaceInfoCascadeMessage
+      ? true
+      : never
+    : never;
+export const _l9a: _Assert_MarketplaceInfoCascadeShape = true;
+
+// Union arity: prove all FOUR arms are simultaneously reachable. The
+// cascade arm is reached via its structural `marketplaces` field (its
+// `kind?` is OPTIONAL so Extract on `{ kind: "cascade" }` does not narrow
+// it -- the cascade arm permits absent kind for the v1.0-v1.7 migration
+// path). The three info arms are reached via their REQUIRED `kind`
+// discriminator literals. Any future regression that drops one of the four
+// arms from the union collapses the conjunction to `never`.
+type _Assert_NotifFourArms =
+  Extract<NotificationMessage, { marketplaces: readonly unknown[] }> extends never
+    ? never
+    : Extract<NotificationMessage, { kind: "marketplace-info" }> extends never
+      ? never
+      : Extract<NotificationMessage, { kind: "plugin-info" }> extends never
+        ? never
+        : Extract<NotificationMessage, { kind: "marketplace-info-cascade" }> extends never
+          ? never
+          : true;
+export const _l9b: _Assert_NotifFourArms = true;
+
+// ============================================================================
+// Phase 44 / INFO-02 / INFO-03: PluginInfoCascadeMessage variant proofs
+//
+// The `NotificationMessage` union now exposes a fifth variant --
+// `PluginInfoCascadeMessage` -- emitted by `getPluginInfo` when no
+// `--scope` is supplied and the requested `<plugin>@<marketplace>` pair
+// is present in BOTH scopes. The fan-out wrapper carries one or more
+// `PluginInfoMessage` blocks in caller order; `notify()` joins their
+// per-block bodies with `\n\n` (mirrors Phase 43's
+// `MarketplaceInfoCascadeMessage` and the install-cascade
+// `composeMarketplaceBlock` join). Three proofs:
+//
+//   - `_l10`  -- the union exposes the new arm via Extract on the kind
+//                 discriminator (non-`never`).
+//   - `_l10a` -- bidirectional shape proof: the variant carries EXACTLY
+//                 `kind: "plugin-info-cascade"` and
+//                 `blocks: readonly PluginInfoMessage[]`.
+//   - `_l10b` -- union arity proof: all FIVE arms (cascade |
+//                 marketplace-info | plugin-info | marketplace-info-cascade
+//                 | plugin-info-cascade) are simultaneously reachable.
+//                 Any future regression that drops one of the five arms
+//                 from the union collapses the conjunction to `never`.
+// ============================================================================
+
+type _Assert_PluginInfoCascadeKind =
+  Extract<NotificationMessage, { kind: "plugin-info-cascade" }> extends never ? never : true;
+export const _l10: _Assert_PluginInfoCascadeKind = true;
+
+interface _PluginInfoCascadeExpected {
+  readonly kind: "plugin-info-cascade";
+  readonly blocks: readonly [PluginInfoMessage, ...PluginInfoMessage[]];
+}
+type _Assert_PluginInfoCascadeShape = PluginInfoCascadeMessage extends _PluginInfoCascadeExpected
+  ? _PluginInfoCascadeExpected extends PluginInfoCascadeMessage
+    ? true
+    : never
+  : never;
+export const _l10a: _Assert_PluginInfoCascadeShape = true;
+
+// Union arity: prove all FIVE arms are simultaneously reachable. The
+// cascade arm is reached via its structural `marketplaces` field; the
+// four info arms via their REQUIRED `kind` discriminator literals.
+type _Assert_NotifFiveArms =
+  Extract<NotificationMessage, { marketplaces: readonly unknown[] }> extends never
+    ? never
+    : Extract<NotificationMessage, { kind: "marketplace-info" }> extends never
+      ? never
+      : Extract<NotificationMessage, { kind: "plugin-info" }> extends never
+        ? never
+        : Extract<NotificationMessage, { kind: "marketplace-info-cascade" }> extends never
+          ? never
+          : Extract<NotificationMessage, { kind: "plugin-info-cascade" }> extends never
+            ? never
+            : true;
+export const _l10b: _Assert_NotifFiveArms = true;
+
+// The `CascadeNotificationMessage` arm declares `kind?: "cascade"` as
+// OPTIONAL (back-compat for v1.0-v1.7 call sites that construct cascades
+// without a `kind` field). Because `kind?: "cascade"` is NOT assignable
+// to `kind: "cascade"` (the optional field could be `undefined`),
+// `Extract<NotificationMessage, { kind: "cascade" }>` evaluates to
+// `never` -- it CANNOT be used to narrow to the cascade arm. Callers
+// must narrow via the structural `marketplaces` field instead (see
+// `_l9b` / `_l10b` above). This lock makes the pitfall loud: a future
+// contributor who "fixes" the union by promoting `kind` to required
+// would start matching this Extract and the assertion would flip from
+// `true` to `never`, surfacing the breaking change.
+type _Assert_ExtractCascadeByOptionalKindIsNever =
+  Extract<NotificationMessage, { kind: "cascade" }> extends never ? true : never;
+export const _l11: _Assert_ExtractCascadeByOptionalKindIsNever = true;
+
+// ============================================================================
+// Phase 42 drift guards (re-stated explicitly -- the pre-existing length-locks
+// `_l1` / `_l2` / `_l3` above remain byte-identical at 11 / 7 / 2).
+//
+// Verified at Phase 42 commit time:
+//   - PLUGIN_STATUSES.length === 11 (UAT G-21-01; unchanged since `present`
+//     was added in Phase 21).
+//   - MARKETPLACE_STATUSES.length === 7 (D-17.1-01; unchanged since Phase 17.1
+//     supersession landed the autoupdate flip discriminators).
+//   - DEPENDENCIES.length === 2 (SNM-06; unchanged since Phase 15).
+//
+// Phase 42 only extends REASONS (28 → 29 via the `"not added"` addition);
+// the other three closed sets are untouched.
+// ============================================================================
 
 // ============================================================================
 // node:test anchor

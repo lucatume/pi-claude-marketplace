@@ -85,6 +85,12 @@ Then reload.
 /reload
 ```
 
+Run a plugin:
+
+```text
+/pr-review-toolkit:review-pr
+```
+
 ### Name mapping
 
 Command and skill names are prefixed with the plugin name. If the command or skill is already prefixed with the plugin name plus `-`, that common part is elided.
@@ -168,6 +174,13 @@ List configured marketplaces.
 /claude:plugin marketplace ls
 ```
 
+Show details for one marketplace.
+
+```text
+/claude:plugin marketplace info context7-marketplace
+/claude:plugin marketplace info context7-marketplace --scope user
+```
+
 Update one marketplace, or all marketplaces if a name is omitted.
 
 ```text
@@ -204,6 +217,12 @@ Filter the list by plugin status, installed, available for installation, or unav
 /claude:plugin list --installed
 /claude:plugin list --available
 /claude:plugin list --unavailable
+```
+
+Show details for one plugin.
+
+```text
+/claude:plugin info pr-review-toolkit@claude-plugins-official
 ```
 
 Install a plugin, using the `<plugin>@<marketplace>` format.

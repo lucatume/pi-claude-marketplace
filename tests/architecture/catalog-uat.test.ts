@@ -1253,6 +1253,379 @@ const FIXTURES: FixtureMap = {
   },
 
   // -------------------------------------------------------------------------
+  // /claude:plugin marketplace info -- Phase 42 / INFO-04 / INFO-08
+  // anchored the first catalog state (`scope-mismatch-not-added`), and
+  // Phase 43 / Plan 43-02 / INFO-07 closes full catalog state coverage
+  // for the marketplace info command surface:
+  //
+  //   - Success states:
+  //     * github-single-scope-full       (INFO-01 github + all optionals)
+  //     * github-single-scope-minimal    (INFO-01 github, no ref/lastUpdated/desc)
+  //     * path-single-scope              (INFO-01 path, minimal)
+  //     * path-single-scope-with-description (INFO-01 path + description)
+  //   - Multi-scope fan-out:
+  //     * both-scopes-fan-out            (INFO-03 project-first fan-out)
+  //   - Failure states:
+  //     * absent-from-both               (no [scope] bracket; INFO-04 + D-03)
+  //     * scope-mismatch-not-added       (Phase 42 anchor; PRESERVED byte-identical)
+  //
+  // Severity routing: every success + fan-out state is `info` (omits
+  // `expectedSeverity`); the two `{not added}` failure states route to
+  // `"error"`. The Phase 42 `scope-mismatch-not-added` fixture
+  // (annotation, fence body, payload, severity) is preserved
+  // byte-identical -- Plan 43-02 additions are purely additive.
+  // -------------------------------------------------------------------------
+  "/claude:plugin marketplace info <name>": {
+    // Phase 43 / Plan 43-02 / INFO-07: full catalog state coverage for marketplace info.
+    "github-single-scope-full": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "marketplace-info",
+        name: "claude-plugins-official",
+        scope: "user",
+        details: { autoupdate: true, lastUpdatedAt: "2026-06-03T00:00:00Z" },
+        source: {
+          sourceKind: "github",
+          owner: "anthropics",
+          repo: "claude-plugins-official",
+          ref: "main",
+        },
+        description: "Official Claude plugin marketplace.",
+      } satisfies NotificationMessage,
+    },
+
+    "github-single-scope-minimal": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "marketplace-info",
+        name: "community-mp",
+        scope: "user",
+        details: { autoupdate: false },
+        source: { sourceKind: "github", owner: "someuser", repo: "community-mp" },
+      } satisfies NotificationMessage,
+    },
+
+    "path-single-scope": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "marketplace-info",
+        name: "local-mp",
+        scope: "project",
+        details: { autoupdate: false },
+        source: { sourceKind: "path", absPath: "/home/user/marketplaces/local-mp" },
+      } satisfies NotificationMessage,
+    },
+
+    "path-single-scope-with-description": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "marketplace-info",
+        name: "dev-mp",
+        scope: "user",
+        details: { autoupdate: true },
+        source: { sourceKind: "path", absPath: "/home/user/src/dev-mp" },
+        description: "Local development marketplace; experimental plugins.",
+      } satisfies NotificationMessage,
+    },
+
+    "both-scopes-fan-out": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "marketplace-info-cascade",
+        blocks: [
+          {
+            kind: "marketplace-info",
+            name: "my-mp",
+            scope: "project",
+            details: { autoupdate: true },
+            source: { sourceKind: "path", absPath: "/repo/path/my-mp" },
+          },
+          {
+            kind: "marketplace-info",
+            name: "my-mp",
+            scope: "user",
+            details: { autoupdate: false },
+            source: { sourceKind: "github", owner: "someuser", repo: "my-mp" },
+          },
+        ],
+      } satisfies NotificationMessage,
+    },
+
+    "absent-from-both": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "error",
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "ghost-mp",
+        // Unused placeholder per the INFO-04 carve-out (renderer skips
+        // the header on the bare `{not added}` row); supply a default.
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "failed",
+          name: "ghost-mp",
+          // D-03: `plugin.scope` OMITTED so the renderer's bracket
+          // short-circuit emits no `[scope]` token. Absent-from-both
+          // states have no [scope] bracket because the marketplace is
+          // in NEITHER scope -- emitting one would be misleading.
+          reasons: ["not added"],
+          componentsResolved: false,
+        },
+      } satisfies NotificationMessage,
+    },
+
+    // Phase 42 anchor preserved byte-identical. DO NOT modify.
+    "scope-mismatch-not-added": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "error",
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "my-mp",
+        marketplaceScope: "user",
+        // Minimal MarketplaceDetails -- the carve-out renderer does not
+        // emit a marketplace header for this catalog state, so the
+        // autoupdate marker is never composed; supply the required
+        // `autoupdate` field with a default value.
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "failed",
+          name: "my-mp",
+          scope: "user",
+          reasons: ["not added"],
+          componentsResolved: false,
+        },
+      } satisfies NotificationMessage,
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Phase 44 / Plan 44-02 / INFO-02 + INFO-05 + INFO-07: full catalog state
+  // coverage for `/claude:plugin info <plugin>@<marketplace>`. Mirrors the
+  // Phase 43 marketplace-info entry above.
+  //
+  //   - Success states:
+  //     * installed-single-scope                       (INFO-02 happy path)
+  //     * installed-single-scope-with-dependencies     (INFO-02 + dependencies line)
+  //     * available-single-scope                       (INFO-02 available bucket)
+  //     * unavailable-single-scope                     (INFO-02 unavailable + {hooks})
+  //   - Multi-scope fan-out:
+  //     * installed-both-scopes-fan-out                (INFO-03 project-first fan-out)
+  //   - Components arm (INFO-05):
+  //     * components-not-resolved                      (external-source marker)
+  //   - Failure states:
+  //     * missing-plugin-not-in-manifest               ({not in manifest})
+  //     * missing-marketplace-not-added-absent-from-both  ({not added}, no [scope])
+  //     * missing-marketplace-not-added-scope-mismatch    ({not added}, with [scope])
+  //
+  // Severity routing: every success + fan-out + components-not-resolved
+  // state is `info` (omits `expectedSeverity`); the three `{not added}` /
+  // `{not in manifest}` failure states route to `"error"`.
+  // -------------------------------------------------------------------------
+  "/claude:plugin info <plugin>@<marketplace>": {
+    "installed-single-scope": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "claude-plugins-official",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: true },
+        plugin: {
+          status: "installed",
+          name: "commit-commands",
+          version: "1.2.0",
+          description: "Helpful git commit commands for everyday use.",
+          componentsResolved: true,
+          components: {
+            agents: ["review-bot"],
+            commands: ["c1", "c2"],
+            skills: ["commit-summary"],
+          },
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "installed-single-scope-with-dependencies": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "claude-plugins-official",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: true },
+        plugin: {
+          status: "installed",
+          name: "commit-commands",
+          version: "1.2.0",
+          description: "Helpful git commit commands for everyday use.",
+          componentsResolved: true,
+          components: {
+            agents: ["review-bot"],
+            commands: ["c1", "c2"],
+            skills: ["commit-summary"],
+          },
+          dependencies: ["helper@utils-mp"],
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "available-single-scope": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "community-mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "available",
+          name: "chat-helper",
+          version: "0.5.0",
+          description: "Quick chat helper plugin; experimental.",
+          componentsResolved: true,
+          components: {
+            commands: ["chat"],
+            skills: ["chat-init"],
+          },
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "unavailable-single-scope": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "community-mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "unavailable",
+          name: "legacy-plugin",
+          version: "0.1.0",
+          description: "Old plugin that declares hooks; not installable in Pi.",
+          reasons: ["hooks"],
+          componentsResolved: false,
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "installed-both-scopes-fan-out": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "plugin-info-cascade",
+        blocks: [
+          {
+            kind: "plugin-info",
+            marketplaceName: "mp",
+            marketplaceScope: "project",
+            marketplaceDetails: { autoupdate: true },
+            plugin: {
+              status: "installed",
+              name: "foo",
+              version: "1.0.0",
+              componentsResolved: true,
+              components: { skills: ["s1"] },
+            },
+          },
+          {
+            kind: "plugin-info",
+            marketplaceName: "mp",
+            marketplaceScope: "user",
+            marketplaceDetails: { autoupdate: false },
+            plugin: {
+              status: "installed",
+              name: "foo",
+              version: "2.0.0",
+              componentsResolved: true,
+              components: { agents: ["a1"] },
+            },
+          },
+        ],
+      } satisfies NotificationMessage,
+    },
+
+    "components-not-resolved": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "remote-mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "installed",
+          name: "remote-plugin",
+          version: "1.0.0",
+          description: "Remote plugin sourced from an external npm package.",
+          componentsResolved: false,
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "missing-plugin-not-in-manifest": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "error",
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "failed",
+          name: "ghost-plugin",
+          reasons: ["not in manifest"],
+          // The renderer's standard-body path runs the components switch
+          // unconditionally; use `componentsResolved: true` with empty
+          // components so no `components: not resolved` marker appears
+          // (the failed row is its own structural signal; INFO-05's
+          // marker is reserved for installed/available external sources).
+          componentsResolved: true,
+          components: {},
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "missing-marketplace-not-added-absent-from-both": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "error",
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "ghost-mp",
+        // Unused placeholder per the INFO-04 carve-out (renderer skips
+        // the header on the bare `{not added}` row); supply a default.
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "failed",
+          // The MARKETPLACE name (not the plugin name) -- the
+          // user-facing failure is "the marketplace is not added".
+          name: "ghost-mp",
+          // D-03: `plugin.scope` OMITTED so the renderer's bracket
+          // short-circuit emits no `[scope]` token.
+          reasons: ["not added"],
+          componentsResolved: false,
+        },
+      } satisfies NotificationMessage,
+    },
+
+    "missing-marketplace-not-added-scope-mismatch": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "error",
+      message: {
+        kind: "plugin-info",
+        marketplaceName: "ghost-mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "failed",
+          name: "ghost-mp",
+          // `--scope user` was requested explicitly -> renderer emits
+          // `[user]` bracket.
+          scope: "user",
+          reasons: ["not added"],
+          componentsResolved: false,
+        },
+      } satisfies NotificationMessage,
+    },
+  },
+
+  // -------------------------------------------------------------------------
   // /claude:plugin marketplace remove -- marketplace + cascade.
   // -------------------------------------------------------------------------
   "/claude:plugin marketplace remove <name>": {

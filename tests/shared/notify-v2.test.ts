@@ -2527,3 +2527,808 @@ test("UXG-07 (D-29-02): warning -- benign-only cascade routes to INFO so NO summ
     "info-severity cascade must NOT carry a summary line",
   );
 });
+
+// ===========================================================================
+// Phase 42 / INFO-04 / INFO-08 -- info-message variants + `wrapDescription`
+//
+// The Phase 42 atomic-supersession commit lands two new top-level
+// NotificationMessage variants (`MarketplaceInfoMessage`,
+// `PluginInfoMessage`), the new `"not added"` REASON closed-set entry, and
+// the file-private `wrapDescription` helper. The tests below lock:
+//   - wrapDescription edge cases (6 tests covering empty, short, exact-fit,
+//     long, over-length single word, whitespace normalization) -- driven
+//     end-to-end through `notify()` with a `plugin-info` payload whose
+//     description exercises each case, per RESEARCH Anti-Pattern: do NOT
+//     export wrapDescription.
+//   - The INFO-04 `{not added}` --scope mismatch byte form + severity.
+//   - renderMarketplaceInfo: github source with ref + lastUpdated +
+//     description; path source without lastUpdated and without description.
+//   - renderPluginInfo: componentsResolved:true with sorted components +
+//     dependencies + wrapping description; componentsResolved:false with
+//     the `components: not resolved` marker.
+//   - Cascade backward-compat smoke: a payload without `kind` (Migration
+//     Strategy #2) routes through the cascade arm byte-identically to a
+//     payload with `kind: "cascade"` carrying the same marketplaces array.
+// ===========================================================================
+
+/**
+ * Helper: construct a minimal PluginInfoMessage carrying the supplied
+ * description (and otherwise stable shape) so the wrapDescription edge-case
+ * tests can lock the description block bytes without re-stating the
+ * marketplace header / plugin row scaffolding each time. Returns the body
+ * lines that follow the 2-space-indented plugin row (i.e., the description
+ * block + any per-kind component lines or the not-resolved marker).
+ */
+function pluginInfoDescriptionBlock(description: string): string[] {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info",
+    marketplaceName: "official",
+    marketplaceScope: "user",
+    marketplaceDetails: { autoupdate: true },
+    plugin: {
+      status: "installed",
+      name: "alpha",
+      version: "1.0.0",
+      description,
+      componentsResolved: false,
+    },
+  };
+  notify(ctx as never, pi as never, msg);
+  const body = ctx.ui.notify.mock.calls[0]!.arguments[0] as string;
+  const lines = body.split("\n");
+  // Drop the marketplace header line and the 2-space-indent plugin row;
+  // return the description block + the `components: not resolved` marker.
+  return lines.slice(2);
+}
+
+test("Phase 42 / wrapDescription: empty description omits the wrap block entirely", () => {
+  // Empty input -> wrapDescription returns [] -> renderer pushes no
+  // description lines. The body skips straight from the plugin row to the
+  // `components: not resolved` marker.
+  const tail = pluginInfoDescriptionBlock("");
+  assert.deepEqual(tail, ["    components: not resolved"]);
+});
+
+test("Phase 42 / wrapDescription: short description renders as a single 4-space-indented line", () => {
+  const tail = pluginInfoDescriptionBlock("Hello world.");
+  assert.deepEqual(tail, ["    Hello world.", "    components: not resolved"]);
+});
+
+test("Phase 42 / wrapDescription: text fitting exactly 66 chars on a word boundary stays on one line", () => {
+  // 66 chars of text (no indent) -- last word ends at col 66 exactly.
+  // 6 words of 10 chars + 5 single-space separators = 65 chars; add a
+  // trailing 1-char word to hit 66 (with the leading space, +2).
+  // Compose deterministically: "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd
+  // eeeeeeeeee" = 5 * 10 + 4 = 54; append " ffffffffff" (11 more) = 65;
+  // append " g" (2 more) = 67 -- too long. Instead: build 66 chars from
+  // 11 * 6-char words separated by single spaces.
+  // 11 words of 6 chars = 66 chars; with 10 single-space separators between
+  // them = 66 + 10 = 76. Too long. Use 6 words of 10 chars + 5 spaces = 65,
+  // plus a single trailing char... easier: 11 chars * 6 = 66 with NO
+  // spaces (single token). But a single-token of 66 chars fits.
+  const text = "x".repeat(66);
+  const tail = pluginInfoDescriptionBlock(text);
+  assert.deepEqual(tail, [`    ${text}`, "    components: not resolved"]);
+});
+
+test("Phase 42 / wrapDescription: long description wraps at word boundary at 66-char text width", () => {
+  // Two 60-char words separated by a space -- 121 chars total; the first
+  // word fits on line 1 (60 chars), the second wraps to line 2 (also 60).
+  // Lock: both lines indented 4 spaces; no ellipsis; no truncation.
+  const first = "a".repeat(60);
+  const second = "b".repeat(60);
+  const tail = pluginInfoDescriptionBlock(`${first} ${second}`);
+  assert.deepEqual(tail, [`    ${first}`, `    ${second}`, "    components: not resolved"]);
+});
+
+test("Phase 42 / wrapDescription: an over-length single word emits on its own line at indent with no ellipsis", () => {
+  // INFO-02 forbids ellipsis. A 70-char single token is emitted at indent;
+  // the rendered line WILL exceed the 70-char total width and that is the
+  // intentional contract (no truncation).
+  const word = "supercalifragilisticexpialidociousandevenlongerwithanotherwordtoexceed";
+  const tail = pluginInfoDescriptionBlock(word);
+  assert.deepEqual(tail, [`    ${word}`, "    components: not resolved"]);
+});
+
+test("Phase 42 / wrapDescription: whitespace collapsed (tabs, newlines, double spaces) into single-space-separated words", () => {
+  // Mixed whitespace input -> tokenized via /\s+/ -> joined with single
+  // spaces. Three words ("hello", "world", "foo") fit on a single line.
+  const tail = pluginInfoDescriptionBlock("  hello\t\tworld\n\nfoo  ");
+  assert.deepEqual(tail, ["    hello world foo", "    components: not resolved"]);
+});
+
+test("Phase 42 / WR-05 / wrapDescription: whitespace-only description reaches wrapDescription and returns no body lines", () => {
+  // WR-05: the renderer's short-circuit at `description.length > 0` only
+  // catches the empty-string case. A whitespace-only string (e.g. "   ")
+  // has length > 0, so wrapDescription IS called -- it splits on /\s+/,
+  // filters empty tokens, ends up with `words.length === 0`, and returns
+  // []. This locks the wrapDescription empty-token-filter + empty-return
+  // branch via end-to-end render: the body collapses to just the
+  // marketplace header + plugin row + the components-not-resolved marker
+  // (no description block).
+  const tail = pluginInfoDescriptionBlock("   ");
+  assert.deepEqual(tail, ["    components: not resolved"]);
+});
+
+test("Phase 42 / WR-05 / wrapDescription: two words whose `current.length + 1 + word.length === wrapCol` stay on one line (boundary-equality)", () => {
+  // WR-05: the greedy accumulator's boundary predicate is
+  // `current.length + 1 + word.length <= wrapCol`. Exercise the equality
+  // (<=) branch with two words whose joined length is EXACTLY 66 chars.
+  // Compose: word A is 32 chars + " " (1) + word B 33 chars = 66 chars.
+  // Both must end up on the same line (the predicate <= holds with =).
+  const a = "a".repeat(32);
+  const b = "b".repeat(33);
+  assert.equal(
+    a.length + 1 + b.length,
+    66,
+    "fixture precondition: joined width must be exactly 66",
+  );
+  const tail = pluginInfoDescriptionBlock(`${a} ${b}`);
+  assert.deepEqual(tail, [`    ${a} ${b}`, "    components: not resolved"]);
+});
+
+test("Phase 42 / INFO-04: {not added} row renders as bare column-0 plugin row with error severity", () => {
+  // The INFO-04 carve-out: a plugin-info payload whose plugin row is
+  // status:"failed" + reasons:["not added"] renders ONLY the bare plugin
+  // row at column 0 (no marketplace header). Severity routes to "error"
+  // via computeSeverity's plugin-info arm.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info",
+    marketplaceName: "my-mp",
+    marketplaceScope: "user",
+    marketplaceDetails: { autoupdate: false },
+    plugin: {
+      status: "failed",
+      name: "my-mp",
+      scope: "user",
+      reasons: ["not added"],
+      componentsResolved: false,
+    },
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args[0], "⊘ my-mp [user] (failed) {not added}");
+  assert.equal(args[1], "error");
+});
+
+test("Phase 42 / INFO-04: {not added} row never carries a reload-hint (read-only surface)", () => {
+  // INFO surfaces are read-only -- shouldEmitReloadHint short-circuits
+  // false on info kinds. Lock that the bare plugin row does NOT carry
+  // `\n\n/reload to pick up changes`.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info",
+    marketplaceName: "my-mp",
+    marketplaceScope: "user",
+    marketplaceDetails: { autoupdate: false },
+    plugin: {
+      status: "failed",
+      name: "my-mp",
+      scope: "user",
+      reasons: ["not added"],
+      componentsResolved: false,
+    },
+  };
+  notify(ctx as never, pi as never, msg);
+  const body = ctx.ui.notify.mock.calls[0]!.arguments[0] as string;
+  assert.ok(
+    !body.includes("/reload"),
+    "info-surface plugin-info must NOT carry the reload-hint trailer",
+  );
+});
+
+test("Phase 42 / INFO-01: renderMarketplaceInfo (github source + ref + lastUpdated + description)", () => {
+  // Full github source rendering: header + github line with #ref + last_updated
+  // + single-attribute description line (NOT wrapped -- description wrapping
+  // is plugin info-only per INFO-02).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info",
+    name: "official",
+    scope: "user",
+    // Phase 42 / WR-04: timestamp lives ONLY on `details.lastUpdatedAt`
+    // (single source of truth -- the parallel top-level `lastUpdated?`
+    // field was removed). Renderer reads it from `details` on the
+    // github-source arm.
+    details: { autoupdate: true, lastUpdatedAt: "2026-05-01T12:34:56Z" },
+    source: { sourceKind: "github", owner: "acolombo", repo: "official", ref: "main" },
+    description: "The official Claude plugin marketplace.",
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● official [user] <autoupdate>",
+      "github: acolombo/official#main",
+      "last_updated: 2026-05-01T12:34:56Z",
+      "description: The official Claude plugin marketplace.",
+    ].join("\n"),
+  );
+  // marketplace-info routes to info severity (no failure surface on the
+  // variant itself per Phase 42 / computeSeverity).
+  assert.equal(args.length, 1);
+});
+
+test("Phase 42 / INFO-01: renderMarketplaceInfo (path source, no lastUpdated, no description)", () => {
+  // Path source omits the `last_updated:` line (last_updated is github-only
+  // per INFO-01) AND omits the `description:` line when description is
+  // undefined. The header carries the `<no autoupdate>` marker because
+  // autoupdate:false on the info surface (INFO-01: both markers emitted,
+  // unlike the list surface's absence-conveys-off rule).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info",
+    name: "local-mp",
+    scope: "project",
+    details: { autoupdate: false },
+    source: { sourceKind: "path", absPath: "/home/user/projects/local-mp" },
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    ["● local-mp [project] <no autoupdate>", "path: /home/user/projects/local-mp"].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+test("Phase 42 / INFO-02 / INFO-05: renderPluginInfo (componentsResolved:true with sorted components + dependencies + wrapping description)", () => {
+  // Full plugin info path: marketplace header + 2-space-indent plugin row +
+  // wrapped description (4-space indent, 66-col text width) + per-kind
+  // component lines (alphabetical by kind: agents, commands, mcp, skills)
+  // + dependencies line last. The renderer assumes pre-sorted per-kind name
+  // arrays (RESEARCH Pitfall 5 -- the orchestrator sorts at construction).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info",
+    marketplaceName: "official",
+    marketplaceScope: "user",
+    marketplaceDetails: { autoupdate: true },
+    plugin: {
+      status: "installed",
+      name: "alpha",
+      version: "1.0.0",
+      description: "A short description of the alpha plugin.",
+      componentsResolved: true,
+      components: {
+        agents: ["agent-a", "agent-b"],
+        commands: ["cmd-a"],
+        skills: ["skill-a", "skill-b"],
+        // mcp omitted -- the renderer must skip the kind when the array is
+        // undefined / empty.
+      },
+      dependencies: ["beta@official", "gamma@official"],
+    },
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● official [user] <autoupdate>",
+      "  ● alpha v1.0.0 (installed)",
+      "    A short description of the alpha plugin.",
+      "    agents: agent-a, agent-b",
+      "    commands: cmd-a",
+      "    skills: skill-a, skill-b",
+      "    dependencies: beta@official, gamma@official",
+    ].join("\n"),
+  );
+  // status:"installed" routes to info severity.
+  assert.equal(args.length, 1);
+});
+
+test("Phase 42 / INFO-05: renderPluginInfo (componentsResolved:false emits the `components: not resolved` marker)", () => {
+  // INFO-05 unresolved marker: when the plugin's plugin.json lives at an
+  // unsynced external source, the renderer emits a single marker line
+  // INSTEAD of per-kind component lists. No per-kind lines, no dependencies
+  // line; the marker is the entire components block.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info",
+    marketplaceName: "official",
+    marketplaceScope: "user",
+    marketplaceDetails: { autoupdate: true },
+    plugin: {
+      status: "available",
+      name: "external",
+      version: "2.0.0",
+      componentsResolved: false,
+    },
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● official [user] <autoupdate>",
+      "  ○ external v2.0.0 (available)",
+      "    components: not resolved",
+    ].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+// ===========================================================================
+// Phase 43 / INFO-03 -- MarketplaceInfoCascadeMessage fan-out variant.
+//
+// Per-status byte tests for the new 4th NotificationMessage arm. The
+// fan-out wrapper carries one or more MarketplaceInfoMessage blocks; the
+// renderer joins per-block bodies with `\n\n` (mirrors the cascade
+// composeMarketplaceBlock `\n\n` join). Severity is ALWAYS info (no
+// failure surface on the fan-out wrapper itself -- the orchestrator routes
+// `{not added}` through PluginInfoMessage); reload-hint NEVER fires (info
+// surface, read-only). The single-block case is byte-identical to a bare
+// MarketplaceInfoMessage so the wrapper composes via reuse of
+// `renderMarketplaceInfo` rather than re-implementing the per-block
+// renderer (Phase 42 SC#4 byte-equality carried forward).
+// ===========================================================================
+
+test("Phase 43 / INFO-03: marketplace-info-cascade with a single block byte-equals the bare marketplace-info render", () => {
+  // The single-block case is the SAME byte form as the bare
+  // MarketplaceInfoMessage variant -- no extra blank line, no header
+  // decoration. Locks the composition discipline: the wrapper is just a
+  // `renderMarketplaceInfo` map + `\n\n` join.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info-cascade",
+    blocks: [
+      {
+        kind: "marketplace-info",
+        name: "official",
+        scope: "user",
+        details: { autoupdate: true, lastUpdatedAt: "2026-06-03T00:00:00Z" },
+        source: {
+          sourceKind: "github",
+          owner: "anthropics",
+          repo: "claude-plugins-official",
+          ref: "main",
+        },
+        description: "Official Claude plugin marketplace.",
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● official [user] <autoupdate>",
+      "github: anthropics/claude-plugins-official#main",
+      "last_updated: 2026-06-03T00:00:00Z",
+      "description: Official Claude plugin marketplace.",
+    ].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+test("Phase 43 / INFO-03: marketplace-info-cascade with two blocks renders project-first then user, joined by one blank line", () => {
+  // The orchestrator iterates project-first per MSG-GR-3 / INFO-03; the
+  // renderer honors caller-supplied order (no internal sort). Lock the
+  // `\n\n` separator + project-first ordering.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info-cascade",
+    blocks: [
+      {
+        kind: "marketplace-info",
+        name: "my-mp",
+        scope: "project",
+        details: { autoupdate: true },
+        source: { sourceKind: "path", absPath: "/repo/path/my-mp" },
+      },
+      {
+        kind: "marketplace-info",
+        name: "my-mp",
+        scope: "user",
+        details: { autoupdate: false },
+        source: { sourceKind: "github", owner: "someuser", repo: "my-mp" },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● my-mp [project] <autoupdate>",
+      "path: /repo/path/my-mp",
+      "",
+      "● my-mp [user] <no autoupdate>",
+      "github: someuser/my-mp",
+    ].join("\n"),
+  );
+});
+
+test("Phase 43 / INFO-03: marketplace-info-cascade severity is always info (no second arg) and no reload-hint", () => {
+  // No failure can be expressed on the fan-out wrapper -- computeSeverity
+  // routes the variant to undefined (info / no 2nd arg). The dispatcher
+  // omits the 2nd arg accordingly. Reload-hint never fires (info surface).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info-cascade",
+    blocks: [
+      {
+        kind: "marketplace-info",
+        name: "my-mp",
+        scope: "project",
+        details: { autoupdate: true },
+        source: { sourceKind: "path", absPath: "/repo/path/my-mp" },
+      },
+      {
+        kind: "marketplace-info",
+        name: "my-mp",
+        scope: "user",
+        details: { autoupdate: false },
+        source: { sourceKind: "github", owner: "someuser", repo: "my-mp" },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args.length, 1, "info severity must omit the 2nd arg");
+  assert.ok(
+    !(args[0] as string).includes("/reload"),
+    "info-surface marketplace-info-cascade must NOT carry the reload-hint trailer",
+  );
+});
+
+test("Phase 43 / INFO-03 + INFO-01: single-block fan-out (github source, all optional fields) byte form", () => {
+  // INFO-01 full github happy path through the new fan-out wrapper. The
+  // single-block case proves the wrapper does not add any per-block
+  // decoration beyond `renderMarketplaceInfo`.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info-cascade",
+    blocks: [
+      {
+        kind: "marketplace-info",
+        name: "claude-plugins-official",
+        scope: "user",
+        details: { autoupdate: true, lastUpdatedAt: "2026-05-01T12:34:56Z" },
+        source: {
+          sourceKind: "github",
+          owner: "anthropics",
+          repo: "claude-plugins-official",
+          ref: "main",
+        },
+        description: "The official Claude plugin marketplace.",
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● claude-plugins-official [user] <autoupdate>",
+      "github: anthropics/claude-plugins-official#main",
+      "last_updated: 2026-05-01T12:34:56Z",
+      "description: The official Claude plugin marketplace.",
+    ].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+test("Phase 43 / INFO-03 + INFO-01: single-block fan-out (path source, minimal) byte form omits last_updated and description", () => {
+  // INFO-01 path-source arm: NO `last_updated:` (gated on github source);
+  // NO `description:` when undefined. The fan-out wrapper preserves the
+  // bare two-line body verbatim.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "marketplace-info-cascade",
+    blocks: [
+      {
+        kind: "marketplace-info",
+        name: "local-mp",
+        scope: "project",
+        details: { autoupdate: false },
+        source: { sourceKind: "path", absPath: "/home/user/projects/local-mp" },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    ["● local-mp [project] <no autoupdate>", "path: /home/user/projects/local-mp"].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+// ===========================================================================
+// Phase 44 / INFO-02 + INFO-03 -- PluginInfoCascadeMessage fan-out variant.
+//
+// Per-status byte tests for the new 5th NotificationMessage arm. The
+// fan-out wrapper carries one or more PluginInfoMessage blocks; the
+// renderer joins per-block bodies with `\n\n` (mirrors Phase 43's
+// MarketplaceInfoCascadeMessage AND the install-cascade
+// composeMarketplaceBlock `\n\n` join). Severity is ALWAYS info (no
+// failure surface on the fan-out wrapper itself -- the orchestrator
+// routes `{not added}` through PluginInfoMessage); reload-hint NEVER
+// fires (info surface, read-only). The single-block case is byte-
+// identical to a bare PluginInfoMessage so the wrapper composes via
+// reuse of `renderPluginInfo` rather than re-implementing the per-block
+// renderer (Phase 42 SC#4 + Phase 43 byte-equality carried forward).
+// ===========================================================================
+
+test("Phase 44 / INFO-02: plugin-info-cascade with a single block byte-equals the bare plugin-info render", () => {
+  // The single-block case is the SAME byte form as the bare
+  // PluginInfoMessage variant -- no extra blank line, no header
+  // decoration. Locks the composition discipline: the wrapper is just a
+  // `renderPluginInfo` map + `\n\n` join.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info-cascade",
+    blocks: [
+      {
+        kind: "plugin-info",
+        marketplaceName: "mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "installed",
+          name: "foo",
+          version: "1.0.0",
+          componentsResolved: true,
+          components: { skills: ["s1"] },
+        },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    ["● mp [user] <no autoupdate>", "  ● foo v1.0.0 (installed)", "    skills: s1"].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+test("Phase 44 / INFO-02 + INFO-03: plugin-info-cascade with two blocks renders project-first then user, joined by one blank line", () => {
+  // The orchestrator iterates project-first per MSG-GR-3 / INFO-03; the
+  // renderer honors caller-supplied order (no internal sort). Lock the
+  // `\n\n` separator + project-first ordering. Each block carries its
+  // own marketplace header (mirrors install-cascade `\n\n` join).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info-cascade",
+    blocks: [
+      {
+        kind: "plugin-info",
+        marketplaceName: "mp",
+        marketplaceScope: "project",
+        marketplaceDetails: { autoupdate: true },
+        plugin: {
+          status: "installed",
+          name: "foo",
+          version: "1.0.0",
+          componentsResolved: true,
+          components: { skills: ["s1"] },
+        },
+      },
+      {
+        kind: "plugin-info",
+        marketplaceName: "mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "installed",
+          name: "foo",
+          version: "2.0.0",
+          componentsResolved: true,
+          components: { agents: ["a1"] },
+        },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● mp [project] <autoupdate>",
+      "  ● foo v1.0.0 (installed)",
+      "    skills: s1",
+      "",
+      "● mp [user] <no autoupdate>",
+      "  ● foo v2.0.0 (installed)",
+      "    agents: a1",
+    ].join("\n"),
+  );
+});
+
+test("Phase 44 / INFO-02: plugin-info-cascade severity is always info (no second arg) and no reload-hint", () => {
+  // No failure can be expressed on the fan-out wrapper -- computeSeverity
+  // routes the variant to undefined (info / no 2nd arg). The dispatcher
+  // omits the 2nd arg accordingly. Reload-hint never fires (info surface).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info-cascade",
+    blocks: [
+      {
+        kind: "plugin-info",
+        marketplaceName: "mp",
+        marketplaceScope: "project",
+        marketplaceDetails: { autoupdate: true },
+        plugin: {
+          status: "installed",
+          name: "foo",
+          version: "1.0.0",
+          componentsResolved: true,
+          components: { skills: ["s1"] },
+        },
+      },
+      {
+        kind: "plugin-info",
+        marketplaceName: "mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "installed",
+          name: "foo",
+          version: "2.0.0",
+          componentsResolved: true,
+          components: { agents: ["a1"] },
+        },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args.length, 1, "info severity must omit the 2nd arg");
+  assert.ok(
+    !(args[0] as string).includes("/reload"),
+    "info-surface plugin-info-cascade must NOT carry the reload-hint trailer",
+  );
+});
+
+test("Phase 44 / INFO-02: plugin-info-cascade single block installed with resolved components + dependencies renders full INFO-02 happy path", () => {
+  // INFO-02 happy path through the new fan-out wrapper: marketplace
+  // header at column 0; plugin row at 2-space indent (status glyph +
+  // name + version + (status)); description wrapped at col 4 / 66; the
+  // per-kind component lines at 4-space indent in `agents, commands,
+  // mcp, skills` order (COMPONENT_KINDS tuple); the `dependencies:`
+  // line LAST. Severity info; no reload-hint.
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info-cascade",
+    blocks: [
+      {
+        kind: "plugin-info",
+        marketplaceName: "official",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: true },
+        plugin: {
+          status: "installed",
+          name: "commit-commands",
+          version: "1.2.0",
+          description: "Helpful git commit commands for everyday use.",
+          componentsResolved: true,
+          components: {
+            agents: ["review-bot"],
+            commands: ["c1", "c2"],
+            skills: ["commit-summary"],
+          },
+          dependencies: ["helper@utils-mp"],
+        },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● official [user] <autoupdate>",
+      "  ● commit-commands v1.2.0 (installed)",
+      "    Helpful git commit commands for everyday use.",
+      "    agents: review-bot",
+      "    commands: c1, c2",
+      "    skills: commit-summary",
+      "    dependencies: helper@utils-mp",
+    ].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+test("Phase 44 / INFO-05: plugin-info-cascade single block components-not-resolved emits the marker line at col 4", () => {
+  // INFO-05 through the new fan-out wrapper: an external-source plugin
+  // surfaces the marker line `    components: not resolved` at 4-space
+  // indent in place of the per-kind component lists. The orchestrator
+  // deliberately does NOT fetch external sources (NFR-5 preserved).
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    kind: "plugin-info-cascade",
+    blocks: [
+      {
+        kind: "plugin-info",
+        marketplaceName: "remote-mp",
+        marketplaceScope: "user",
+        marketplaceDetails: { autoupdate: false },
+        plugin: {
+          status: "installed",
+          name: "remote-plugin",
+          version: "1.0.0",
+          description: "Remote plugin sourced from an external npm package.",
+          componentsResolved: false,
+        },
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(
+    args[0],
+    [
+      "● remote-mp [user] <no autoupdate>",
+      "  ● remote-plugin v1.0.0 (installed)",
+      "    Remote plugin sourced from an external npm package.",
+      "    components: not resolved",
+    ].join("\n"),
+  );
+  assert.equal(args.length, 1);
+});
+
+test('Phase 42 / Migration Strategy #2: cascade payload WITHOUT `kind` field byte-equals payload WITH `kind: "cascade"`', () => {
+  // The Phase 42 dispatcher uses `message.kind ?? \"cascade\"` so v1.0-v1.7
+  // call sites that omit `kind` continue to route through the cascade arm
+  // byte-identically. Lock the equivalence end-to-end: invoke notify() with
+  // both shapes and assert byte equality.
+  const ctxNoKind = makeCtx();
+  const ctxWithKind = makeCtx();
+  const pi = piWithBothLoaded();
+  const noKindMsg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "official",
+        scope: "user",
+        plugins: [{ status: "installed", name: "alpha", version: "1.0.0", dependencies: [] }],
+      },
+    ],
+  };
+  const withKindMsg: NotificationMessage = {
+    kind: "cascade",
+    marketplaces: [
+      {
+        name: "official",
+        scope: "user",
+        plugins: [{ status: "installed", name: "alpha", version: "1.0.0", dependencies: [] }],
+      },
+    ],
+  };
+  notify(ctxNoKind as never, pi as never, noKindMsg);
+  notify(ctxWithKind as never, pi as never, withKindMsg);
+  const noKindArgs = ctxNoKind.ui.notify.mock.calls[0]!.arguments;
+  const withKindArgs = ctxWithKind.ui.notify.mock.calls[0]!.arguments;
+  assert.deepEqual(
+    noKindArgs,
+    withKindArgs,
+    'Optional kind?:"cascade" must produce byte-identical notify() output to omitted kind',
+  );
+});

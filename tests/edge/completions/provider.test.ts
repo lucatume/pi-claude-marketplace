@@ -94,16 +94,19 @@ async function emptyFixture(): Promise<Fixture> {
 // TC-1 -- top-level subcommand keywords.
 // ---------------------------------------------------------------------------
 
-test("TC-1 :: first positional surfaces top-level keywords (bootstrap/install/uninstall/update/reinstall/list/ls/import/marketplace)", async () => {
+test("TC-1 :: first positional surfaces top-level keywords (bootstrap/install/uninstall/update/reinstall/list/ls/info/import/marketplace)", async () => {
   __resetCacheForTests();
   const f = await emptyFixture();
   try {
     const items = await getArgumentCompletions("", f.resolver);
     assert.ok(items !== null);
     const labels = items.map((i) => i.label);
+    // Phase 44 / INFO-02: `info` added to TOP_LEVEL_SUBCOMMANDS for
+    // the new `info <plugin>@<marketplace>` top-level verb.
     assert.deepEqual([...labels].sort(), [
       "bootstrap",
       "import",
+      "info",
       "install",
       "list",
       "ls",
@@ -173,9 +176,13 @@ test("TC-2 :: after marketplace surfaces nested keywords and aliases", async () 
   try {
     const items = await getArgumentCompletions("marketplace ", f.resolver);
     assert.ok(items !== null);
+    // Phase 43 / INFO-06: `info` added to MARKETPLACE_SUBCOMMANDS for
+    // `marketplace info <name>` argument completion (TC-5 via the
+    // MARKETPLACE_VERBS_WITH_NAME_ARG set).
     assert.deepEqual([...items.map((i) => i.label)].sort(), [
       "add",
       "autoupdate",
+      "info",
       "list",
       "ls",
       "noautoupdate",
@@ -576,6 +583,77 @@ test("TC-5 :: marketplace noautoupdate <here> completes with marketplace names",
     assert.deepEqual(
       items.map((i) => i.label),
       ["mp-a"],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+// Phase 43 / Plan 43-01 / INFO-06: `marketplace info <name>` argument
+// completion. The TC-5 union surface is reused: candidates are the union
+// of marketplace names across BOTH scopes; the `--scope` filter does NOT
+// narrow the completion candidate set (the orchestrator handles scope-
+// mismatch at execution time via the INFO-04 `{not added}` row).
+
+test("TC-5 :: marketplace info <here> completes with union of marketplace names from both scopes", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: {
+      user: { "mp-u": {} },
+      project: { "mp-p": {} },
+    },
+    manifests: { user: {}, project: {} },
+  });
+  try {
+    const items = await getArgumentCompletions("marketplace info ", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual([...items.map((i) => i.label)].sort(), ["mp-p", "mp-u"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("TC-5 :: exact `marketplace info` token without trailing space completes marketplace names", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { "mp-a": {} }, project: {} },
+    manifests: { user: {}, project: {} },
+  });
+  try {
+    const items = await getArgumentCompletions("marketplace info", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(
+      items.map((i) => i.label),
+      ["mp-a"],
+    );
+    assert.deepEqual(
+      items.map((i) => i.value),
+      ["marketplace info mp-a "],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("TC-5 :: marketplace info --scope project <here> still completes union of marketplace names (scope filter does NOT narrow set)", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    // Marketplace lives in USER scope only; with `--scope project` the
+    // completion still surfaces the name. The orchestrator handles the
+    // mismatch at execution time via the INFO-04 `{not added}` row.
+    state: { user: { "mp-a": {} }, project: {} },
+    manifests: { user: {}, project: {} },
+  });
+  try {
+    const items = await getArgumentCompletions("marketplace info --scope project mp", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(
+      items.map((i) => i.label),
+      ["mp-a"],
+    );
+    assert.deepEqual(
+      items.map((i) => i.value),
+      ["marketplace info --scope project mp-a "],
     );
   } finally {
     await f.cleanup();
@@ -1037,6 +1115,95 @@ test("TC-6 :: multi-marketplace plugin yields name@ without trailing space", asy
       false,
       "multi-mp plugin must NOT include trailing space",
     );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 44 / Plan 44-01 / INFO-02 + INFO-06: TC-6 `info` mode --
+// `<plugin>@<marketplace>` token completion across the union of
+// installed + available + unavailable rows from BOTH scopes (no
+// install-state exclusion; scope filter does NOT narrow the candidate
+// set -- the orchestrator handles scope mismatches via the INFO-04
+// `{not added}` row).
+// ---------------------------------------------------------------------------
+
+test("TC-6 / INFO-02 :: info <here> returns union of installed + available + unavailable refs across both scopes", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: {
+      user: { mp: {} },
+      project: { mp2: {} },
+    },
+    manifests: {
+      user: {
+        mp: [
+          { name: "foo", status: "installed" },
+          { name: "bar", status: "available" },
+          { name: "qux", status: "unavailable" },
+        ],
+      },
+      project: { mp2: [{ name: "baz", status: "installed" }] },
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("info ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    assert.deepEqual([...labels].sort(), ["bar@mp", "baz@mp2", "foo@mp", "qux@mp"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("TC-6 / INFO-02 :: info foo@<here> narrows to marketplaces carrying foo", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { "mp-a": {}, "mp-b": {} }, project: {} },
+    manifests: {
+      user: {
+        "mp-a": [{ name: "foo", status: "available" }],
+        "mp-b": [{ name: "other", status: "available" }],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("info foo@", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(
+      items.map((i) => i.label),
+      ["foo@mp-a"],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("TC-6 / INFO-02 :: info --scope project <here> returns the SAME union (scope filter does NOT narrow set)", async () => {
+  __resetCacheForTests();
+  // Marketplace lives in USER scope only; with `--scope project` the
+  // completion still surfaces every known plugin. The orchestrator
+  // handles the mismatch at execution time via the INFO-04
+  // `{not added}` row.
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: {
+      user: {
+        mp: [
+          { name: "foo", status: "installed" },
+          { name: "bar", status: "available" },
+        ],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("info --scope project ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    assert.deepEqual([...labels].sort(), ["bar@mp", "foo@mp"]);
   } finally {
     await f.cleanup();
   }
