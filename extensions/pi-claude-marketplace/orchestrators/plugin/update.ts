@@ -86,9 +86,14 @@ import { parseHooksConfig } from "../../domain/components/hooks.ts";
 import { PLUGIN_ENTRY_VALIDATOR, type PluginEntry } from "../../domain/components/plugin.ts";
 import { loadMarketplaceManifest } from "../../domain/manifest.ts";
 import { asAbsolutePluginRoot } from "../../domain/plugin-root.ts";
-import { requireInstallable, resolveStrict } from "../../domain/resolver.ts";
+import {
+  requireForceInstallable,
+  requireInstallable,
+  resolveStrict,
+} from "../../domain/resolver.ts";
 import { locationsFor } from "../../persistence/locations.ts";
 import { loadState } from "../../persistence/state-io.ts";
+import { softDepStatus } from "../../platform/pi-api.ts";
 import { dropMarketplaceCache } from "../../shared/completion-cache.ts";
 import {
   appendLeaks,
@@ -101,12 +106,15 @@ import {
 } from "../../shared/errors.ts";
 import { RECOVERY_PLUGIN_REINSTALL_PREFIX } from "../../shared/markers.ts";
 import {
+  notifyUpdateNoOpWithContext,
+  notifyUpdateWithContext,
   notifyWithContext,
   type MarketplaceRows,
   type Plural,
 } from "../../shared/notify-context.ts";
-import { skipSeverity } from "../../shared/notify-reasons.ts";
+import { companionSeverity, skipSeverity } from "../../shared/notify-reasons.ts";
 import { compareByNameThenScope, notify } from "../../shared/notify.ts";
+import { narrowUnsupportedKinds } from "../../shared/probe-classifiers.ts";
 import { withStateGuard } from "../../transaction/with-state-guard.ts";
 import { DEFAULT_GIT_OPS, refreshGitHubClone, type GitOps } from "../marketplace/shared.ts";
 
@@ -125,15 +133,15 @@ import type { PreparedAgentsStaging } from "../../bridges/agents/index.ts";
 import type { PreparedCommandsStaging } from "../../bridges/commands/index.ts";
 import type { PreparedMcpStaging } from "../../bridges/mcp/index.ts";
 import type { PreparedSkillsStaging } from "../../bridges/skills/index.ts";
-import type { ResolvedPluginInstallable } from "../../domain/resolver.ts";
+import type { MaterializablePlugin } from "../../domain/resolver.ts";
 import type { ParsedSource } from "../../domain/source.ts";
 import type { ScopedLocations } from "../../persistence/locations.ts";
 import type { ExtensionState } from "../../persistence/state-io.ts";
-import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
+import type { ExtensionAPI, ExtensionContext, SoftDepStatus } from "../../platform/pi-api.ts";
 import type { Dependency } from "../../shared/concerns/soft-dep.ts";
 import type { ContentReason, PluginFailedMessage } from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
-import type { PluginUpdateFn, PluginUpdateOutcome } from "../types.ts";
+import type { PluginUpdateFn, PluginUpdateOutcome, PluginUpdateSkippedOutcome } from "../types.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // updatePlugins -- direct entrypoint (PUP-1 three forms)
@@ -181,6 +189,15 @@ export interface UpdatePluginsOptions {
    * write-back on the direct path.
    */
   readonly local?: boolean;
+  /**
+   * FORCE-02 opt-in. When true, the candidate resolve admits the
+   * force-degradable `unsupported` arm (D-65-04): an `unsupported` target
+   * updates by degrading instead of blocking. Default false keeps the
+   * existing `requireInstallable` block. Never bypasses an `unavailable`/
+   * structural candidate (FORCE-05). The cascade entrypoint
+   * (`updateSinglePlugin`) does NOT accept this flag.
+   */
+  readonly force?: boolean;
 }
 
 /**
@@ -302,6 +319,11 @@ export async function updatePlugins(opts: UpdatePluginsOptions): Promise<void> {
         // resolves to false at the bridge call site so cascade re-installs
         // always omit `model:`.
         mapModel: opts.mapModel ?? false,
+        // FORCE-02: thread `--force` from the user-facing options bag into
+        // the per-plugin candidate gate (D-65-04). The cascade entrypoint
+        // (`updateSinglePlugin`) never sets this, so cascade re-installs
+        // resolve to false and keep the `requireInstallable` block.
+        force: opts.force ?? false,
         // WB-01: thread `--local` for the direct-path
         // write-back target selection.
         ...(opts.local === true && { local: true }),
@@ -345,7 +367,13 @@ export async function updatePlugins(opts: UpdatePluginsOptions): Promise<void> {
     // throw and are handled by the `catch` block above, never reaching
     // this branch.
     if (isPhase3aAggregateFailure(outcome)) {
-      renderUpdateCascadeIfAny(ctx, pi, outcomes, cardinality);
+      // WR-01: the failing plugin already fired its own `notifyDirectFailure`
+      // and is NOT pushed into `outcomes`. Flag the cascade as aborted-by-failure
+      // so the never-silent no-op headline is suppressed: if every accumulated
+      // outcome was `unchanged`, the bulk-suppressed cascade is empty and the
+      // headline would otherwise emit a contradictory `nothing to update` line
+      // directly after the failure notification.
+      renderUpdateCascadeIfAny(ctx, pi, outcomes, cardinality, true);
       return;
     }
 
@@ -437,9 +465,12 @@ function renderUpdateCascadeIfAny(
   pi: ExtensionAPI,
   outcomes: readonly TargetedOutcome[],
   cardinality: "single" | "plural",
+  // WR-01: the phase-3a abort path sets this so the never-silent no-op headline
+  // is suppressed when the accumulated outcomes contain no realized transition.
+  abortedByFailure = false,
 ): void {
   if (outcomes.length > 0) {
-    renderUpdateCascadeAndNotify(ctx, pi, outcomes, cardinality);
+    renderUpdateCascadeAndNotify(ctx, pi, outcomes, cardinality, abortedByFailure);
   }
 }
 
@@ -471,6 +502,16 @@ export const updateSinglePlugin: PluginUpdateFn = async (plugin, marketplace, sc
       cwd,
       locations,
       cascade: true,
+      // SEV-03 / D-69-01: the autoupdate cascade TAKES the force path
+      // automatically. A force-upgradable candidate (re-resolves `unsupported`)
+      // degrades in place -- supported components materialize, unsupported kinds
+      // skip -- and renders `(force-installed) {dropped kinds}` instead of
+      // declining with `(skipped) {no longer installable}`. `requireForceInstallable`
+      // still BLOCKS an `unavailable`/structural candidate (FORCE-05), so the
+      // automatic force path can never materialize a structurally-broken plugin.
+      // The manual `update` path (`updatePlugins` -> `runThreePhaseUpdate`
+      // directly) is unaffected; it sets `force` from the user's `--force` flag.
+      force: true,
     });
   } catch (err) {
     // Cascade-safe: capture throws into a partition='failed' outcome so the
@@ -597,6 +638,14 @@ interface ThreePhaseArgs {
    * own config writes (mirrors WR-09 orchestrated-mode semantics).
    */
   readonly local?: boolean;
+  /**
+   * FORCE-02 opt-in. Set by `updatePlugins` from `UpdatePluginsOptions.force`
+   * (which the edge handler populates from `--force`). Gates the candidate
+   * resolve in `preflightUpdate` (D-65-04). The cascade entrypoint
+   * `updateSinglePlugin` intentionally NEVER sets this; cascade-driven
+   * re-installs resolve to false at the gate.
+   */
+  readonly force?: boolean;
 }
 
 interface PrepHandles {
@@ -610,7 +659,7 @@ interface PluginPreflight {
   readonly state: ExtensionState;
   readonly record: ExtensionState["marketplaces"][string]["plugins"][string];
   readonly entry: PluginEntry;
-  readonly installable: ResolvedPluginInstallable;
+  readonly installable: MaterializablePlugin;
   readonly fromVersion: string;
   readonly toVersion: string;
 }
@@ -704,18 +753,55 @@ async function preflightUpdate(
   }
 
   const entry: PluginEntry = entryRaw;
-  let installable: ResolvedPluginInstallable;
+  let installable: MaterializablePlugin;
   try {
     const resolved = await resolveStrict(entry, { marketplaceRoot: mp.marketplaceRoot });
-    requireInstallable(resolved, "update");
+    // FORCE-02/FORCE-05 (D-65-04): `--force` widens the gate at the CANDIDATE
+    // resolve so an `unsupported` target degrades (supported components
+    // materialize, unsupported kinds skip) instead of blocking. Without
+    // `--force` the candidate still blocks via `requireInstallable` (the catch
+    // arm below renders `(skipped) {no longer installable}`). Both gates still
+    // reject an `unavailable`/structural candidate (FORCE-05).
+    if (args.force === true) {
+      requireForceInstallable(resolved, "update");
+    } else {
+      requireInstallable(resolved, "update");
+    }
+
     installable = resolved;
   } catch (err) {
     // `requireInstallable` throws `PluginShapeError` with
-    // `kind === "no-longer-installable"`. Pre-narrow to the closed Reason
-    // so the cascade row renders `(skipped) {no longer installable}`
-    // without substring-matching. `resolveStrict` itself never throws
-    // (returns a not-installable variant), so the only
-    // typed-throw producer in this block is `requireInstallable`.
+    // `kind === "no-longer-installable"`. `resolveStrict` itself never throws
+    // (returns a not-installable variant), so the only typed-throw producer in
+    // this block is `requireInstallable`.
+    //
+    // XSURF-03: source the decline discriminant from the thrown `err.shape`
+    // (`resolved` is out of scope here -- it is declared inside the `try`).
+    // `err.shape.forceable === true` ⇔ the resolver verdict was `unsupported`,
+    // i.e. a force-upgradable decline: `--force` could degrade-update it. For
+    // that arm carry the list-consistent degrade kinds via the SAME
+    // `narrowUnsupportedKinds` helper the `list (force-upgradable)` row uses
+    // (byte-parity, pinned by catalog-uat) and mark `forceUpgradable: true` so
+    // the projection flips ONLY this arm to the `force-upgradable` token. A
+    // structural decline (`forceable !== true` -- force cannot help) keeps the
+    // `no longer installable` reason and the plain skipped path.
+    if (
+      err instanceof PluginShapeError &&
+      err.shape.kind === "no-longer-installable" &&
+      err.shape.forceable
+    ) {
+      return {
+        partition: "skipped",
+        name: plugin,
+        fromVersion: record.version,
+        notes: [errorMessage(err)],
+        reasons: narrowUnsupportedKinds(err.shape.unsupportedKinds ?? []),
+        forceUpgradable: true,
+        declaresAgents: false,
+        declaresMcp: false,
+      };
+    }
+
     return {
       partition: "skipped",
       name: plugin,
@@ -1468,6 +1554,24 @@ async function runThreePhaseUpdate(args: ThreePhaseArgs): Promise<PluginUpdateOu
     stagedMcpServers,
     declaresAgents: stagedAgents.length > 0,
     declaresMcp: stagedMcpServers.length > 0,
+    // FSTAT-07 / D-66-04: a `--force` update whose candidate re-resolved
+    // `unsupported` degraded it -- carry the dropped kinds so the cascade
+    // renders `(force-installed)` instead of `(updated)`. Empty for a clean
+    // candidate (FSTAT-03 -- no lingering force state).
+    //
+    // SEV-03 / D-69-01: `newlyDegraded` records whether this degrade NEWLY
+    // introduced force state -- the PERSISTED `compatibility.unsupported` read
+    // from the prior install record (`preflight.record`, loaded BEFORE the
+    // update applied) was empty. The autoupdate cascade renderer reads it to
+    // raise the row to `warning` (newly degraded) vs `info` (already degraded);
+    // the manual `update --force` renderer ignores it (explicit opt-in stays
+    // info). No schema change -- the field already exists on the record.
+    ...(installable.state === "unsupported" && {
+      forceDegrade: {
+        kinds: [...installable.unsupported],
+        newlyDegraded: preflight.record.compatibility.unsupported.length === 0,
+      },
+    }),
   };
 }
 
@@ -1500,6 +1604,88 @@ interface TargetedOutcome {
 }
 
 /**
+ * SEV-04 / D-69-02: severity for a `skipped` update row. An absent-target skip
+ * (`not installed` / `not found`) is always error (D-01). A force-upgradable
+ * decline (`no longer installable`, no `--force`) follows the invocation shape:
+ * a targeted `<plugin>@<marketplace>` update the user explicitly opted into is
+ * actionable -> warning; a bulk / untargeted update that skips one the user did
+ * not name is benign -> info. This threads the EXISTING `cardinality`
+ * invocation-shape signal -- no inference from cascade shape. All OTHER
+ * non-idempotent reasons keep the producer-local `skipSeverity` judgment, so the
+ * change is surgical to the force-upgradable decline.
+ */
+function cascadeSkipSeverity(
+  reasons: readonly ContentReason[],
+  cardinality: "single" | "plural",
+): "info" | "warning" | "error" {
+  if (reasons.includes("not installed") || reasons.includes("not found")) {
+    return "error";
+  }
+
+  if (reasons.includes("no longer installable")) {
+    return cardinality === "single" ? "warning" : "info";
+  }
+
+  return skipSeverity(reasons);
+}
+
+/**
+ * Project a `skipped` outcome to its cascade row. Split out of
+ * `outcomeToCascadePluginMessage` so the parent switch stays within the
+ * cognitive-complexity budget.
+ *
+ * XSURF-03: the force-upgradable manual update-decline (`outcome.forceUpgradable`)
+ * flips to the `force-upgradable` token (consistent with how `list` describes
+ * the same plugin) + the update-worded `--force` trailer. The SEV-04 split
+ * (targeted=warning / bulk=info) moves onto this status arm directly -- it is no
+ * longer keyed on the reason string (the reason now carries the list-consistent
+ * degrade kinds, not `no longer installable`). Every other skipped reason keeps
+ * `status: "skipped"` + the unchanged `cascadeSkipSeverity` judgment.
+ */
+function projectSkippedOutcome(
+  target: ResolvedTarget,
+  outcome: PluginUpdateSkippedOutcome,
+  cardinality: "single" | "plural",
+): UpdateMsg {
+  // Producer-narrowed `outcome.reasons` (CR-06) takes precedence over the
+  // legacy notes-substring parse; empty `reasons` opts into the back-compat
+  // fallback path.
+  const reasons = outcome.reasons.length > 0 ? outcome.reasons : narrowSkipReasons(outcome.notes);
+  const version =
+    outcome.fromVersion !== undefined && outcome.fromVersion !== ""
+      ? { version: outcome.fromVersion }
+      : {};
+
+  if (outcome.forceUpgradable === true) {
+    return {
+      status: "force-upgradable",
+      name: outcome.name,
+      scope: target.scope,
+      ...version,
+      reasons,
+      forceHint: true,
+      severity: cardinality === "single" ? "warning" : "info",
+      needsReload: false,
+    };
+  }
+
+  return {
+    status: "skipped",
+    name: outcome.name,
+    scope: target.scope,
+    ...version,
+    reasons,
+    // D-01: an absent-target update (the named plugin is not installed / not
+    // found) cannot be carried out -> error (severity-only flip; the `(skipped)
+    // {not installed}` per-row grammar is preserved). Otherwise the
+    // benign/idempotent case stays info; an actionable (targeted) decline routes
+    // to warning (SEV-04); never reloads.
+    severity: cascadeSkipSeverity(reasons, cardinality),
+    needsReload: false,
+  };
+}
+
+/**
  * Map an outcome to a `PluginNotificationMessage`. Returns `undefined`
  * for outcomes the cascade should skip rendering entirely (currently
  * none -- the `unchanged` partition maps to a `(skipped) {up-to-date}`
@@ -1513,14 +1699,50 @@ interface TargetedOutcome {
  *
  * Plugin scope is forwarded so the renderer's orphan-fold
  * can suppress the redundant `[<scope>]` bracket when plugin.scope ===
- * mp.scope.
+ * mp.scope. `cardinality` drives the SEV-04 targeted-vs-bulk decline severity.
  */
 function outcomeToCascadePluginMessage(
   target: ResolvedTarget,
   outcome: PluginUpdateOutcome,
+  probe: SoftDepStatus,
+  cardinality: "single" | "plural",
 ): UpdateMsg {
+  // SEV-01: an otherwise-successful update whose DECLARED soft-dep companion is
+  // unloaded silently degrades a clean update -> raise the desired-state
+  // severity from info to warning (symmetric with the install success arm).
+  const successSeverity = companionSeverity(
+    { declaresAgents: outcome.declaresAgents, declaresMcp: outcome.declaresMcp },
+    probe,
+  );
   switch (outcome.partition) {
     case "updated":
+      // FSTAT-07 / D-66-04: a `--force` update whose candidate re-resolved
+      // `unsupported` degraded it -- report `(force-installed)` with the
+      // dropped-component detail instead of `(updated)`. This reads the LIVE
+      // candidate resolution of the just-completed update -- NOT the persisted
+      // `compatibility.unsupported` record the `list` / non-path `info`
+      // derivers read; they agree here only because the update just wrote that
+      // record. A clean candidate keeps `(updated)` (FSTAT-03 -- no lingering
+      // force state). force-installed is a realized transition
+      // (TRANSITION_STATUS_LIST), so it stamps the same info-severity + reload
+      // as the updated row. WR-03: thread `dependencies` (the same
+      // declared-kinds gate the `(updated)` row uses) so the soft-dep
+      // `{requires pi-subagents}` / `{requires pi-mcp}` markers fire on a
+      // degraded update exactly as on a clean one.
+      if (outcome.forceDegrade !== undefined && outcome.forceDegrade.kinds.length > 0) {
+        return {
+          status: "force-installed",
+          name: outcome.name,
+          scope: target.scope,
+          version: outcome.toVersion,
+          dependencies: outcomeDependencies(outcome.declaresAgents, outcome.declaresMcp),
+          reasons: narrowUnsupportedKinds(outcome.forceDegrade.kinds),
+          // SEV-01: info, raised to warning on a missing declared companion.
+          severity: successSeverity,
+          needsReload: true,
+        };
+      }
+
       return {
         status: "updated",
         name: outcome.name,
@@ -1531,8 +1753,9 @@ function outcomeToCascadePluginMessage(
         // marker (MSG-SD-3). The renderer narrows on `dependencies`
         // membership + the notify-time probe.
         dependencies: outcomeDependencies(outcome.declaresAgents, outcome.declaresMcp),
-        // D-03/D-06: realized update transition -> info, reloads Pi resources.
-        severity: "info",
+        // D-03/D-06: realized update transition -> reloads Pi resources.
+        // SEV-01: info, raised to warning above on a missing declared companion.
+        severity: successSeverity,
         needsReload: true,
       };
     case "unchanged":
@@ -1547,31 +1770,8 @@ function outcomeToCascadePluginMessage(
         severity: "info",
         needsReload: false,
       };
-    case "skipped": {
-      // Producer-narrowed `outcome.reasons` (CR-06) takes precedence over
-      // the legacy notes-substring parse; empty `reasons` opts into the
-      // back-compat fallback path.
-      const reasons =
-        outcome.reasons.length > 0 ? outcome.reasons : narrowSkipReasons(outcome.notes);
-      return {
-        status: "skipped",
-        name: outcome.name,
-        scope: target.scope,
-        ...(outcome.fromVersion !== undefined &&
-          outcome.fromVersion !== "" && { version: outcome.fromVersion }),
-        reasons,
-        // D-01: an absent-target update (the named plugin is not installed /
-        // not found) cannot be carried out -> error (severity-only flip; the
-        // `(skipped) {not installed}` per-row grammar is preserved). Otherwise
-        // benign idempotent skip -> info, actionable skip -> warning; never
-        // reloads.
-        severity:
-          reasons.includes("not installed") || reasons.includes("not found")
-            ? "error"
-            : skipSeverity(reasons),
-        needsReload: false,
-      };
-    }
+    case "skipped":
+      return projectSkippedOutcome(target, outcome, cardinality);
 
     case "failed": {
       const phaseFailures = outcome.phaseFailures ?? [];
@@ -1656,6 +1856,13 @@ function renderUpdateCascadeAndNotify(
   pi: ExtensionAPI,
   outcomes: readonly TargetedOutcome[],
   cardinality: "single" | "plural",
+  // WR-01: set on the phase-3a abort path. The failing plugin fired its own
+  // failure notification and is absent from `outcomes`, so the never-silent
+  // no-op headline must be suppressed here -- otherwise an all-`unchanged`
+  // accumulator emits a contradictory `nothing to update` line right after the
+  // failure. The empty/suppressed body renders nothing, which is acceptable
+  // since the failure was already reported.
+  abortedByFailure = false,
 ): void {
   // Group by (scope, marketplace) per CMC-21. Insertion order tracks the
   // first occurrence of each (scope, marketplace) pair -- the post-grouping
@@ -1667,8 +1874,32 @@ function renderUpdateCascadeAndNotify(
     readonly scope: Scope;
     readonly plugins: UpdateMsg[];
   }
+  // SEV-01: single companion probe per notify invocation, threaded into every
+  // per-row mapping so the success arms can raise severity on a missing
+  // declared companion (mirrors the renderer's single-probe discipline).
+  const probe = softDepStatus(pi);
+
+  // UGRM-02 / D-04: the headline counts realized transitions ONLY. The `updated`
+  // partition holds both clean `(updated)` rows AND force-installed degraded
+  // updates (the force-installed arm is emitted from `case "updated"`), so a
+  // single partition filter captures every realized transition. A
+  // `force-upgradable` decline is partition `skipped`, so it contributes 0
+  // (correct). Derived BEFORE row suppression -- independent of UGRM-01
+  // filtering.
+  const updatedCount = outcomes.filter((o) => o.outcome.partition === "updated").length;
+
   const byMp = new Map<string, MpGroup>();
   for (const { target, outcome } of outcomes) {
+    // UGRM-01 suppression (Site A -- at the orchestrator, NOT the renderer): a
+    // BULK (`plural`) update does not render a per-plugin `(skipped)
+    // {up-to-date}` row for each unchanged plugin. The single-target path is
+    // untouched (a user who named one plugin still sees its up-to-date skip
+    // row). Only the `unchanged` partition is suppressed; a `skipped`-partition
+    // row (e.g. the `force-upgradable` decline) survives into the cascade.
+    if (cardinality === "plural" && outcome.partition === "unchanged") {
+      continue;
+    }
+
     const key = `${target.scope}:${target.marketplace}`;
     // WR-01: mirror the reinstall.ts:597-610 get-existing-or-construct-new
     // shape so the in-place mutation invariant does not rely on the
@@ -1681,10 +1912,10 @@ function renderUpdateCascadeAndNotify(
       byMp.set(key, {
         name: target.marketplace,
         scope: target.scope,
-        plugins: [outcomeToCascadePluginMessage(target, outcome)],
+        plugins: [outcomeToCascadePluginMessage(target, outcome, probe, cardinality)],
       });
     } else {
-      existing.plugins.push(outcomeToCascadePluginMessage(target, outcome));
+      existing.plugins.push(outcomeToCascadePluginMessage(target, outcome, probe, cardinality));
     }
   }
 
@@ -1699,6 +1930,11 @@ function renderUpdateCascadeAndNotify(
   // `MarketplaceRows<UpdateMsg>` annotation holds without a cast -- a status
   // drift between the producer and the render map is a compile error here.
   const marketplaces: Plural<MarketplaceRows<UpdateMsg>> = [...byMp.values()]
+    // UGRM-01: drop a marketplace group emptied by suppression so no bare
+    // `● mp [scope]` header renders (a group only reaches zero rows if every one
+    // of its plugins was an `unchanged` suppression; the loop `continue` already
+    // prevents creating one, this is the belt-and-braces guard).
+    .filter((g) => g.plugins.length > 0)
     .sort((a, b) =>
       compareByNameThenScope({ name: a.name, scope: a.scope }, { name: b.name, scope: b.scope }),
     )
@@ -1727,11 +1963,52 @@ function renderUpdateCascadeAndNotify(
   //  docs/output-catalog.md:489-568 (single-mp-mixed, failed-with-
   //  rollback-partial, all-up-to-date-noop, bare-multi-mp,
   //  same-mp-both-scopes).
-  // OUT-04 / D-04: the trailing per-operation tally renders only for the bulk
-  // (`@marketplace` / bare) update forms; a single-target `<plugin>@<mp>` update
-  // omits it (the row embeds the outcome). The structural single-vs-plural
-  // signal is the invocation FORM, threaded from `updatePlugins`.
-  notifyWithContext(ctx, pi, UPDATE_CONTEXT, marketplaces, undefined, cardinality);
+  // UGRM-01 / UGRM-02: detect the zero-realized-transition bulk case -- a
+  // `plural` update that updated nothing AND has no surviving error/warning row.
+  // This covers BOTH an empty post-suppression cascade (all up-to-date) and a
+  // non-empty cascade whose only rows are benign info skips (e.g. the
+  // `force-upgradable` decline). The surviving severities are the caller-stamped
+  // per-row `severity` fields (undefined defaults to info).
+  const hasErrorOrWarningRow = marketplaces.some((mp) =>
+    mp.plugins.some((p) => p.severity === "error" || p.severity === "warning"),
+  );
+  if (
+    cardinality === "plural" &&
+    updatedCount === 0 &&
+    !hasErrorOrWarningRow &&
+    !abortedByFailure
+  ) {
+    // Never-silent no-op headline. `emitUpdateNoOpCascade` renders the surviving
+    // body (empty for all-up-to-date) and folds the hard-coded `Plugin update:
+    // nothing to update` line below it. The line can NEVER vanish (a
+    // `tally {count: 0}` override would collapse to `""` in composeTally; this
+    // owns the headline instead). Info severity, no reload-hint.
+    notifyUpdateNoOpWithContext(ctx, pi, UPDATE_CONTEXT, marketplaces);
+    return;
+  }
+
+  // WR-01: on the phase-3a abort path the failure is already reported and the
+  // no-op headline is suppressed above. If suppression also emptied the cascade
+  // body (every accumulated predecessor was `unchanged`), there is nothing left
+  // to render -- emit nothing rather than routing an empty `marketplaces` through
+  // `notifyUpdateWithContext`, which would render `(no marketplaces)`.
+  if (abortedByFailure && marketplaces.length === 0) {
+    return;
+  }
+
+  // OUT-04 / D-04 / UGRM-02: the trailing per-operation tally renders only for
+  // the bulk (`@marketplace` / bare) update forms; a single-target
+  // `<plugin>@<mp>` update omits it (the row embeds the outcome). The structural
+  // single-vs-plural signal is the invocation FORM, threaded from
+  // `updatePlugins`. The updates-only `tally` override owns the success category
+  // (realized transitions only); failure/warning categories still come from the
+  // rows, so a mixed cascade renders `Plugin update: 1 failure, 1 updated`. On a
+  // single-target update the override is unread (`composeTally` returns "" for
+  // `cardinality !== "plural"`).
+  notifyUpdateWithContext(ctx, pi, UPDATE_CONTEXT, marketplaces, cardinality, {
+    verb: "updated",
+    count: updatedCount,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

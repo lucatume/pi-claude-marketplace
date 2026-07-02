@@ -65,7 +65,7 @@ import { parseHooksConfig } from "../../domain/components/hooks.ts";
 import { PLUGIN_ENTRY_VALIDATOR, type PluginEntry } from "../../domain/components/plugin.ts";
 import { loadMarketplaceManifest } from "../../domain/manifest.ts";
 import { asAbsolutePluginRoot } from "../../domain/plugin-root.ts";
-import { requireInstallable, resolveStrict } from "../../domain/resolver.ts";
+import { requireForceInstallable, resolveStrict } from "../../domain/resolver.ts";
 import { locationsFor } from "../../persistence/locations.ts";
 import { loadState } from "../../persistence/state-io.ts";
 import { dropMarketplaceCache } from "../../shared/completion-cache.ts";
@@ -106,7 +106,7 @@ import type { AgentsReplacement, PreparedAgentsStaging } from "../../bridges/age
 import type { CommandsReplacement, PreparedCommandsStaging } from "../../bridges/commands/index.ts";
 import type { McpReplacement, PreparedMcpStaging } from "../../bridges/mcp/index.ts";
 import type { PreparedSkillsStaging, SkillsReplacement } from "../../bridges/skills/index.ts";
-import type { ResolvedPluginInstallable } from "../../domain/resolver.ts";
+import type { MaterializablePlugin } from "../../domain/resolver.ts";
 import type { ScopedLocations } from "../../persistence/locations.ts";
 import type { ExtensionState } from "../../persistence/state-io.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../platform/pi-api.ts";
@@ -146,7 +146,6 @@ export interface ReinstallPluginOptions {
   readonly cwd: string;
   readonly marketplace: string;
   readonly plugin: string;
-  readonly force?: boolean;
   readonly render?: "default" | "none";
   /**
    * WB-01 / WB-02: when true, target
@@ -177,7 +176,6 @@ export interface ReinstallPluginsOptions {
   readonly scope?: Scope;
   readonly cwd: string;
   readonly target: ReinstallPluginsTarget;
-  readonly force?: boolean;
   /**
    * WB-01 / WB-02: when true, target
    * `claude-plugins.local.json` instead of `claude-plugins.json` for
@@ -455,7 +453,6 @@ export async function reinstallPlugins(
           marketplace: target.marketplace,
           plugin: target.plugin,
           render: "none",
-          ...(opts.force === undefined ? {} : { force: opts.force }),
           ...(opts.local === true && { local: true }),
         }),
       );
@@ -1121,7 +1118,7 @@ async function runLockedReinstall(
   locations: ScopedLocations,
   opts: ReinstallPluginOptions,
 ): Promise<LockedSuccess> {
-  const { scope, cwd, marketplace, plugin, force } = opts;
+  const { scope, cwd, marketplace, plugin } = opts;
   const mp = tx.state.marketplaces[marketplace];
   const oldRecord = mp?.plugins[plugin];
   if (mp === undefined || oldRecord === undefined) {
@@ -1152,7 +1149,7 @@ async function runLockedReinstall(
     oldRecord: oldSnapshot,
     agentsSourceDir: generated.agentsSourceDir,
   });
-  const replacements = await replaceAll(handles, force, {
+  const replacements = await replaceAll(handles, {
     locations,
     cwd,
     plugin,
@@ -1262,12 +1259,18 @@ async function loadCachedEntry(
   return entryRaw;
 }
 
+// BFILL-01 / D-68-02: reinstall is force-capable. It resolves through the
+// `requireForceInstallable` gate (admitting both `installable` and the
+// force-degradable `unsupported` arm) so backfill can re-materialize a
+// still-partial plugin in place without throwing `{not-installable}`. The
+// `unavailable` arm is still rejected (NFR-7). Resolution stays cache-only via
+// `resolveStrict` -- no network (NFR-5).
 async function resolveInstallable(
   entry: PluginEntry,
   marketplaceRoot: string,
-): Promise<ResolvedPluginInstallable> {
+): Promise<MaterializablePlugin> {
   const resolved = await resolveStrict(entry, { marketplaceRoot });
-  requireInstallable(resolved, "install");
+  requireForceInstallable(resolved, "install");
   return resolved;
 }
 
@@ -1276,7 +1279,7 @@ async function prepareAllHandles(input: {
   readonly cwd: string;
   readonly marketplace: string;
   readonly plugin: string;
-  readonly installable: ResolvedPluginInstallable;
+  readonly installable: MaterializablePlugin;
   readonly pluginDataDir: string;
   readonly oldRecord: PluginRecord;
   readonly agentsSourceDir: string | null;
@@ -1328,7 +1331,6 @@ async function prepareAllHandles(input: {
 
 async function replaceAll(
   handles: PreparedHandles,
-  force: boolean | undefined,
   hooks: HooksReplaceArgs,
 ): Promise<readonly ReplacementEntry[]> {
   const replacements: ReplacementEntry[] = [];
@@ -1337,10 +1339,12 @@ async function replaceAll(
     replacements.push({ phase: "skills", handle: skills });
     const commands = await replacePreparedCommands(handles.commands);
     replacements.push({ phase: "commands", handle: commands });
-    const agents = await replacePreparedAgents(
-      handles.agents,
-      force === undefined ? {} : { force },
-    );
+    // RINST-01 / D-67-03: reinstall is a pure repair primitive -- overwrite of
+    // collisions and foreign content is UNCONDITIONAL. The agents bridge's
+    // `{ force: true }` gate is always set; there is no command-local `--force`
+    // option to relay. Containment is unchanged (NFR-10): the overwrite is
+    // scoped to this plugin's own staged agent handles.
+    const agents = await replacePreparedAgents(handles.agents, { force: true });
     replacements.push({ phase: "agents", handle: agents });
     // LIFE-01 / D-63-01: 5th cascade slot between agents and mcp. The hooks
     // bridge has no staging dir per D-63-02; writeHookConfig IS the atomic
@@ -1380,7 +1384,7 @@ interface HooksReplaceArgs {
   readonly locations: ScopedLocations;
   readonly cwd: string;
   readonly plugin: string;
-  readonly installable: ResolvedPluginInstallable;
+  readonly installable: MaterializablePlugin;
 }
 
 /**
@@ -1420,7 +1424,7 @@ function updateStateRecord(
   marketplace: string,
   plugin: string,
   oldRecord: PluginRecord,
-  installable: ResolvedPluginInstallable,
+  installable: MaterializablePlugin,
   handles: PreparedHandles,
 ): void {
   const mp = state.marketplaces[marketplace];
@@ -1431,10 +1435,17 @@ function updateStateRecord(
   }
 
   mp.plugins[plugin] = {
+    // D-68-02: SAME recorded version -- reinstall/backfill is a repair/promotion,
+    // never an upgrade.
     version: oldRecord.version,
     resolvedSource: installable.pluginRoot,
+    // BFILL-01: record the REAL compatibility from the resolve, not a hardcoded
+    // `installable: true`. A partial re-materialize (resolved `unsupported`)
+    // persists `installable: false` with the still-unsupported set, so the
+    // force-installed derivation (D-66-01) stays truthful; a full one records
+    // `installable: true` with an empty unsupported set.
     compatibility: {
-      installable: true,
+      installable: installable.state === "installable",
       notes: [...installable.notes],
       supported: [...installable.supported],
       unsupported: [...installable.unsupported],
@@ -1449,7 +1460,7 @@ function updateStateRecord(
 function resourcesFromHandles(
   handles: PreparedHandles,
   plugin?: string,
-  installable?: ResolvedPluginInstallable,
+  installable?: MaterializablePlugin,
 ): PluginRecord["resources"] {
   return {
     skills: handles.skills.result.recorded.map((r) => r.generatedName),

@@ -12,6 +12,7 @@ import { pathSource } from "../../../extensions/pi-claude-marketplace/domain/sou
 import {
   __test_classifyEntityShapeError,
   __test_classifyInstallFailure,
+  __test_composeInstallFailureMessage,
   __test_narrowResolverReasons,
   installPlugin,
 } from "../../../extensions/pi-claude-marketplace/orchestrators/plugin/install.ts";
@@ -132,6 +133,14 @@ async function seedPathMarketplaceWithPlugin(opts: {
    *    tier-1 read finds no version and falls through.
    */
   pluginJsonVersion?: string | null;
+  /**
+   * D-64-06: declare unsupported component kinds in the plugin's own
+   * plugin.json so `resolveStrict` returns `state: "unsupported"` with NO
+   * structural defect (force-degradable). E.g.
+   * `{ themes: "./themes", monitors: "./monitors.json" }`. The referenced paths
+   * need not exist -- the declaration alone drives the `unsupported` arm.
+   */
+  experimental?: object;
   /** Skills to seed -- each `{ sourceName, body? }` becomes <pluginRoot>/skills/<sourceName>/SKILL.md. */
   skills?: { sourceName: string; frontmatterName?: string; body?: string }[];
   /** Commands -- each becomes <pluginRoot>/commands/<sourceName>.md. */
@@ -177,6 +186,12 @@ async function seedPathMarketplaceWithPlugin(opts: {
     pluginManifest.version = "0.0.1";
   } else if (opts.pluginJsonVersion !== null) {
     pluginManifest.version = opts.pluginJsonVersion;
+  }
+
+  // D-64-06: declaring experimental kinds drives `resolveStrict` to the
+  // `unsupported` (force-degradable) arm without a structural defect.
+  if (opts.experimental !== undefined) {
+    pluginManifest.experimental = opts.experimental;
   }
 
   await writeFile(
@@ -485,14 +500,15 @@ test("PI-4: non-path source -> V2 unavailable/{unsupported source}", async () =>
       // `resolvePluginVersion` runs (`failureVersion` is undefined at
       // throw time). PluginUnavailableMessage carries no `cause?` field
       // per D-15-01 -- the reason text carries the explanation; no
-      // cause-chain trailer. Severity is undefined (info) per D-16-11 --
-      // `unavailable` is NOT in the error-severity set (catalog
-      // confirms: only the `failed` discriminator emits `error`).
+      // cause-chain trailer. D-70-02 / SEV-02: the structural `unavailable`
+      // install failure stamps `severity: "error"` (so the leading summary
+      // line fires), but carries NO `--force` hint trailer -- force cannot
+      // degrade-install a structural defect.
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(notifications[0]?.severity, "error");
       assert.equal(
         notifications[0]?.message,
-        "● mp [project]\n  ⊘ hello (unavailable) {unsupported source}",
+        "A plugin operation has failed.\n\n● mp [project]\n  ⊘ hello (unavailable) {unsupported source}",
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -787,19 +803,21 @@ test("PI-9: happy-path install lands skills + commands + agents + mcp + state in
       assert.deepEqual([...record.resources.agents], [`${GENERATED_AGENT_PREFIX}hello-bot`]);
       assert.deepEqual([...record.resources.mcpServers], ["server1"]);
 
-      // V2 byte form matches `docs/output-catalog.md:286-292`
-      // (`success-with-soft-dep`): the default `makeCtx()` mocks pi
-      // without `subagent` or `mcp` tools so both companion extensions
-      // are unloaded; the renderer emits both per-row soft-dep markers
-      // from `dependencies: ["agents", "mcp"]` + the threaded probe
-      // per D-16-14 / D-16-15. The fixture seeds version 1.0.0.
-      // PluginInstalledMessage triggers the reload-hint structurally
-      // per D-16-12.
+      // V2 byte form matches `docs/output-catalog.md` (`success-with-soft-dep`):
+      // the default `makeCtx()` mocks pi without `subagent` or `mcp` tools so
+      // both companion extensions are unloaded; the renderer emits both per-row
+      // soft-dep markers from `dependencies: ["agents", "mcp"]` + the threaded
+      // probe per D-16-14 / D-16-15. The fixture seeds version 1.0.0.
+      // PluginInstalledMessage triggers the reload-hint structurally per D-16-12.
+      // SEV-01: both declared companions are unloaded, so the success row stamps
+      // warning -- the cascade gains the `needs attention` summary line.
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(notifications[0]?.severity, "warning");
       assert.equal(
         notifications[0]?.message,
-        "● mp [project]\n" +
+        "A plugin operation needs attention.\n" +
+          "\n" +
+          "● mp [project]\n" +
           "  ● hello v1.0.0 (installed) {requires pi-subagents, requires pi-mcp}\n" +
           "\n" +
           "/reload to pick up changes",
@@ -910,8 +928,10 @@ test("PI-11 / RH-3: staged agents + pi.getAllTools has no 'subagent' -> success 
       // fires when (declaresAgents AND !piSubagentsLoaded). The renderer
       // composes the marker into the reasons block of the PluginInlineRow
       // per D-13-07.
+      // SEV-01: the declared `pi-subagents` companion is unloaded, so the
+      // success row stamps warning (silent degradation of a clean install).
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(notifications[0]?.severity, "warning");
       assert.match(
         notifications[0]?.message ?? "",
         /\{requires pi-subagents\}/,
@@ -951,8 +971,10 @@ test("PI-12 / RH-4: staged mcp + pi.getAllTools has no 'mcp' -> success message 
 
       // CMC-13 / MSG-SD-2: per-row soft-dep marker `{requires pi-mcp}`
       // fires when (declaresMcp AND !piMcpAdapterLoaded) per D-13-07.
+      // SEV-01: the declared `pi-mcp-adapter` companion is unloaded, so the
+      // success row stamps warning (silent degradation of a clean install).
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(notifications[0]?.severity, "warning");
       assert.match(
         notifications[0]?.message ?? "",
         /\{requires pi-mcp\}/,
@@ -1249,12 +1271,15 @@ test("AS-7: pre-existing foreign agent file under target name -> V2 drops warnin
       const after = await loadState(locations.extensionRoot);
       assert.ok("hello" in (after.marketplaces["mp"]?.plugins ?? {}));
 
-      // D-19-01: no warning notification fires in standalone
-      // mode -- the AS-7 foreign-agent warning surface is dropped. Only
-      // the canonical success notification is emitted, and the
-      // "pre-existing agent file" phrase MUST NOT appear on it.
+      // D-19-01: no AS-7 foreign-agent warning notification fires in standalone
+      // mode -- that warning surface is dropped. Only the canonical success
+      // notification is emitted, and the "pre-existing agent file" phrase MUST
+      // NOT appear on it. SEV-01: the plugin declares an agent while the
+      // `pi-subagents` companion is unloaded, so the canonical success row
+      // independently stamps warning (the missing-companion ladder, not the
+      // dropped AS-7 surface).
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(notifications[0]?.severity, "warning");
       assert.equal(
         (notifications[0]?.message ?? "").includes("pre-existing agent file"),
         false,
@@ -2120,21 +2145,23 @@ test("classifyEntityShapeError dispatches on kind=not-installable -> unavailable
     await import("../../../extensions/pi-claude-marketplace/shared/errors.ts");
   // The resolver's `r.notes` carry the
   // `"contains <kind>"` prefix (via `addUnsupportedKindNotes`); the
-  // carve-out in `narrowResolverReasons` strips the prefix and emits
-  // the bare token as the Reason. HOOK-04 / D-58-02 dropped the
-  // `contains hooks` half of the carve-out (under v1.13 `hooks` is a
-  // supported component kind, so the resolver no longer emits a
-  // `"contains hooks"` note in real traffic; the dead branch was
-  // removed). `contains lspServers` remains the SOLE manifest-field
-  // carve-out and maps to `lsp` per SNM-36 / D-24-04. The test pins
-  // the post-D-58-02 behavior: a synthetic input mixing `contains hooks`
-  // with `contains lspServers` extracts only `lsp` (the `contains hooks`
-  // arm falls through to the permissive `unsupported source` fallback,
-  // but is dedup-suppressed when another permissive arm already fired).
+  // carve-out in `narrowResolverReasons` strips the prefix and routes the
+  // bare token through the shared `narrowUnsupportedKinds` helper.
+  // `contains lspServers` maps to `lsp` (SNM-36 / D-24-04).
+  //
+  // PHOOK-05 / D-71-04: the `hooks` kind is now a force-degradable marker
+  // and renders the single aggregate `unsupported hooks` reason via the SAME
+  // shared helper. A synthetic input mixing `contains hooks` with `contains
+  // lspServers` therefore emits BOTH markers (`unsupported hooks`, `lsp`),
+  // byte-identical to what `list`/`info` derive from the typed `unsupported[]`
+  // list for the same kinds. (`hooks` is not in `UNSUPPORTED_COMPONENT_KINDS`,
+  // so the resolver never emits a real `contains hooks` note -- this synthetic
+  // input pins the shared-helper mapping for cross-surface parity.)
   const err = new PluginShapeError({
     kind: "not-installable",
     plugin: "p",
     reasons: ["contains hooks", "contains lspServers"],
+    forceable: false,
   });
   const row = __test_classifyEntityShapeError(err, {
     plugin: "p",
@@ -2143,7 +2170,7 @@ test("classifyEntityShapeError dispatches on kind=not-installable -> unavailable
   });
   assert.ok(row);
   assert.equal(row.status, "unavailable");
-  assert.deepEqual(row.reasons, ["lsp"]);
+  assert.deepEqual(row.reasons, ["unsupported hooks", "lsp"]);
 });
 
 test("classifyEntityShapeError dispatches on kind=not-installable with source note -> {unsupported source}", async () => {
@@ -2156,6 +2183,7 @@ test("classifyEntityShapeError dispatches on kind=not-installable with source no
     kind: "not-installable",
     plugin: "p",
     reasons: ["source dir does not exist"],
+    forceable: false,
   });
   const row = __test_classifyEntityShapeError(err, {
     plugin: "p",
@@ -2174,6 +2202,379 @@ test("classifyEntityShapeError returns undefined for non-PluginShapeError input 
     scope: "project",
   });
   assert.equal(row, undefined);
+});
+
+test("IN-02 / RSTATE-05: hooks-only unsupported (typed kind, no notes) renders {unsupported hooks} on the failure row", async () => {
+  const { PluginShapeError } =
+    await import("../../../extensions/pi-claude-marketplace/shared/errors.ts");
+  // A partial-hook `unsupported` plugin carries NO `contains hooks` note (hooks
+  // is not an UNSUPPORTED_COMPONENT_KINDS member), so `reasons` is empty; the
+  // typed `hooks` kind on `unsupportedKinds` is the SOLE reason source. The
+  // failure row must read `{unsupported hooks}`, byte-identical to list/info,
+  // NOT the generic `{unsupported source}` fallback.
+  const err = new PluginShapeError({
+    kind: "not-installable",
+    plugin: "p",
+    reasons: [],
+    forceable: true,
+    unsupportedKinds: ["hooks"],
+  });
+  const row = __test_classifyEntityShapeError(err, {
+    plugin: "p",
+    marketplace: "mp",
+    scope: "project",
+  });
+  assert.ok(row);
+  assert.equal(row.status, "unavailable");
+  assert.deepEqual(row.reasons, ["unsupported hooks"]);
+});
+
+test("IN-02 / RSTATE-05: lsp unsupported (typed kind) renders {lsp} on the failure row", async () => {
+  const { PluginShapeError } =
+    await import("../../../extensions/pi-claude-marketplace/shared/errors.ts");
+  const err = new PluginShapeError({
+    kind: "not-installable",
+    plugin: "p",
+    reasons: ["contains lspServers"],
+    forceable: true,
+    unsupportedKinds: ["lspServers"],
+  });
+  const row = __test_classifyEntityShapeError(err, {
+    plugin: "p",
+    marketplace: "mp",
+    scope: "project",
+  });
+  assert.ok(row);
+  assert.equal(row.status, "unavailable");
+  // Deduped: the typed kind and the `contains lspServers` note both map to
+  // `lsp`, so the row renders a single marker.
+  assert.deepEqual(row.reasons, ["lsp"]);
+});
+
+test("IN-02 / RSTATE-05: genuinely unavailable (structural) rows keep their notes-derived reason, unchanged", async () => {
+  const { PluginShapeError } =
+    await import("../../../extensions/pi-claude-marketplace/shared/errors.ts");
+  // The `unavailable` arm carries NO typed `unsupported[]` (empty list on the
+  // throw), so a structural defect keeps its `notes`-sourced reason. This pins
+  // that the IN-02 typed-kind path never perturbs a structural failure row.
+  const err = new PluginShapeError({
+    kind: "not-installable",
+    plugin: "p",
+    reasons: ["source dir does not exist"],
+    forceable: false,
+    unsupportedKinds: [],
+  });
+  const row = __test_classifyEntityShapeError(err, {
+    plugin: "p",
+    marketplace: "mp",
+    scope: "project",
+  });
+  assert.ok(row);
+  assert.equal(row.status, "unavailable");
+  assert.deepEqual(row.reasons, ["unsupported source"]);
+});
+
+test("SEV-02 / D-69-03: classifyEntityShapeError threads forceable from the thrown shape", async () => {
+  const { PluginShapeError } =
+    await import("../../../extensions/pi-claude-marketplace/shared/errors.ts");
+
+  const forceable = __test_classifyEntityShapeError(
+    new PluginShapeError({
+      kind: "not-installable",
+      plugin: "p",
+      reasons: ["contains lspServers"],
+      forceable: true,
+    }),
+    { plugin: "p", marketplace: "mp", scope: "project" },
+  );
+  assert.ok(forceable);
+  assert.equal(forceable.status, "unavailable");
+  assert.equal(forceable.forceable, true);
+
+  const structural = __test_classifyEntityShapeError(
+    new PluginShapeError({
+      kind: "not-installable",
+      plugin: "p",
+      reasons: ["source dir does not exist"],
+      forceable: false,
+    }),
+    { plugin: "p", marketplace: "mp", scope: "project" },
+  );
+  assert.ok(structural);
+  assert.equal(structural.status, "unavailable");
+  assert.equal(structural.forceable, false);
+});
+
+test("SEV-02 / D-69-03: composeInstallFailureMessage points at --force iff the verdict is force-degradable", async () => {
+  const { PluginShapeError } =
+    await import("../../../extensions/pi-claude-marketplace/shared/errors.ts");
+
+  // XSURF-01: force-degradable arm -> the resolver-state-driven `unsupported`
+  // row carries the `--force` hint and renders at error severity (consistent
+  // with how `list` / `info` describe the same plugin).
+  const forceableErr = new PluginShapeError({
+    kind: "not-installable",
+    plugin: "helper",
+    reasons: ["contains lspServers"],
+    forceable: true,
+  });
+  const forceableMsg = __test_composeInstallFailureMessage({
+    err: forceableErr,
+    plugin: "helper",
+    scope: "project",
+    version: undefined,
+    rolledBackPartial: false,
+    rollbackPartials: [],
+    entityErrorRow: __test_classifyEntityShapeError(forceableErr, {
+      plugin: "helper",
+      marketplace: "mp",
+      scope: "project",
+    }),
+  });
+  assert.equal(forceableMsg.status, "unsupported");
+  assert.ok(forceableMsg.status === "unsupported");
+  assert.equal(forceableMsg.forceHint, true);
+  assert.equal(forceableMsg.severity, "error");
+
+  // D-70-02: structural `unavailable` arm -> error severity, but NO `--force`
+  // hint (force cannot degrade-install a structural defect).
+  const structuralErr = new PluginShapeError({
+    kind: "not-installable",
+    plugin: "helper",
+    reasons: ["source dir does not exist"],
+    forceable: false,
+  });
+  const structuralMsg = __test_composeInstallFailureMessage({
+    err: structuralErr,
+    plugin: "helper",
+    scope: "project",
+    version: undefined,
+    rolledBackPartial: false,
+    rollbackPartials: [],
+    entityErrorRow: __test_classifyEntityShapeError(structuralErr, {
+      plugin: "helper",
+      marketplace: "mp",
+      scope: "project",
+    }),
+  });
+  assert.equal(structuralMsg.status, "unavailable");
+  assert.ok(structuralMsg.status === "unavailable");
+  assert.equal(structuralMsg.forceHint, undefined);
+  assert.equal(structuralMsg.severity, "error");
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// PHOOK-04 -- partial-hook `install --force` stages a STRICT SUBSET of the
+// source `hooks.json`: the dropped event / matcher group is absent from the
+// written file, while the supported group is present. The bridge stages
+// `parseHooksConfig.value` (the pure filtered subset), so the staged file can
+// never carry a dropped handler (PHOOK-04 containment invariant). No source
+// change to install.ts / stage.ts -- the subset is inherited from the partition.
+// ───────────────────────────────────────────────────────────────────────────
+
+test("PHOOK-04: install --force stages a strict-subset hooks.json -- dropped Stop event absent, supported PostToolUse group present", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-phook04-event-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "hook-plugin",
+        skills: [{ sourceName: "helper-skill" }],
+        // A supported PostToolUse(Edit) group plus a non-bucket-A `Stop` event.
+        // The partition keeps the PostToolUse group and drops the whole Stop
+        // event (event-level drop, D-71-01).
+        hooksJson: {
+          hooks: {
+            PostToolUse: [
+              { matcher: "Edit", hooks: [{ type: "command", command: "echo posttooluse" }] },
+            ],
+            Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }],
+          },
+        },
+      });
+
+      const { ctx, pi } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hook-plugin",
+        force: true,
+      });
+
+      // Read the staged file the bridge wrote and assert the strict-subset
+      // property: the dropped `Stop` event is ABSENT, the supported
+      // `PostToolUse` group is PRESENT (PHOOK-04 / V5 output containment).
+      // The bridge stages the bare events map (`parseHooksConfig` unwraps the
+      // `{hooks:{...}}` wrapper and returns the filtered subset).
+      const stagedPath = path.join(locations.hooksDir, "hook-plugin", "hooks.json");
+      const staged = JSON.parse(await readFile(stagedPath, "utf8")) as Record<string, unknown>;
+      assert.ok("PostToolUse" in staged, "supported PostToolUse group must be staged");
+      assert.equal("Stop" in staged, false, "dropped Stop event must NOT be staged");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("PHOOK-04 / D-71-02: install --force drops only the unsupportable matcher group within a supported event", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-phook04-matcher-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "hook-plugin",
+        skills: [{ sourceName: "helper-skill" }],
+        // One supported event with a clean Edit group and an unsupportable
+        // regex group: the partition keeps the Edit group and drops only the
+        // `.*` regex group (intra-event matcher-group partition, D-71-02).
+        hooksJson: {
+          hooks: {
+            PreToolUse: [
+              { matcher: "Edit", hooks: [{ type: "command", command: "echo edit" }] },
+              { matcher: ".*", hooks: [{ type: "command", command: "echo regex" }] },
+            ],
+          },
+        },
+      });
+
+      const { ctx, pi } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hook-plugin",
+        force: true,
+      });
+
+      const stagedPath = path.join(locations.hooksDir, "hook-plugin", "hooks.json");
+      const staged = JSON.parse(await readFile(stagedPath, "utf8")) as {
+        PreToolUse: { matcher?: string }[];
+      };
+      // The event survives with ONLY the supportable Edit group; the dropped
+      // `.*` regex group is absent (strict subset within the kept event).
+      assert.equal(staged.PreToolUse.length, 1);
+      assert.equal(staged.PreToolUse[0]?.matcher, "Edit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// SEV-01 / SEV-02 / D-71-06 -- the partial-hook plugin now resolves
+// `unsupported` (force-degradable), so it flows through the Phase 65/69 gates
+// with no severity-layer source change: WITHOUT `--force` it blocks at error
+// severity carrying the `--force` hint (SEV-02); WITH `--force` it degrades to
+// an info `force-installed` row with NO summary line (SEV-01 / D-71-06).
+// ───────────────────────────────────────────────────────────────────────────
+
+test("SEV-01 / SEV-02 / FSTAT-07 / D-71-06: partial-hook install blocks without --force (error + hint), degrades to info force-installed with --force", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-phook-sev-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "hook-plugin",
+        skills: [{ sourceName: "helper-skill" }],
+        hooksJson: {
+          hooks: {
+            PostToolUse: [
+              { matcher: "Edit", hooks: [{ type: "command", command: "echo posttooluse" }] },
+            ],
+            Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }],
+          },
+        },
+      });
+
+      // SEV-02: no `--force`. The force-degradable `unsupported` verdict blocks
+      // the install at error severity and the row points at `--force`. Nothing
+      // is staged and no state record is written (force is never implied).
+      const noForce = makeCtx();
+      await installPlugin({
+        ctx: noForce.ctx,
+        pi: noForce.pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hook-plugin",
+      });
+      assert.equal(noForce.notifications.length, 1);
+      assert.equal(noForce.notifications[0]?.severity, "error");
+      // SEV-02 / XSURF-01 contract: the force-degradable verdict renders the
+      // resolver-state-driven `(unsupported)` row at error severity and carries
+      // the `--force` hint trailer (consistent with how `list` / `info`
+      // describe the same plugin). IN-02 / RSTATE-05: the no-force failure row
+      // renders the typed `{unsupported hooks}` marker -- byte-identical to the
+      // success / list / info surfaces -- because the resolver threads its typed
+      // `unsupported[]` list onto the thrown `PluginShapeError` and the composer
+      // narrows it via the shared `narrowUnsupportedKinds` path (the `hooks`
+      // kind carries no structural `notes` entry, so the typed list is its only
+      // reason source).
+      assert.match(
+        noForce.notifications[0]?.message ?? "",
+        /hook-plugin \(unsupported\) \{unsupported hooks\}/,
+      );
+      assert.match(
+        noForce.notifications[0]?.message ?? "",
+        /Re-run with --force to install the supported components\./,
+      );
+      const stagedPath = path.join(locations.hooksDir, "hook-plugin", "hooks.json");
+      await assert.rejects(readFile(stagedPath, "utf8"), "no-force install must stage nothing");
+      const afterBlocked = await loadState(locations.extensionRoot);
+      assert.equal(
+        "hook-plugin" in (afterBlocked.marketplaces["mp"]?.plugins ?? {}),
+        false,
+        "no-force install must not record the plugin",
+      );
+
+      // SEV-01 / D-71-06: with `--force` the supported components install, the
+      // Stop event degrades, and the success row reads `(force-installed)
+      // {unsupported hooks}` at info severity with NO summary line (the body
+      // begins at the marketplace header, not a `... failed.` / `... attention.`
+      // summary). FSTAT-07: the row reads `force-installed`.
+      const forced = makeCtx();
+      await installPlugin({
+        ctx: forced.ctx,
+        pi: forced.pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hook-plugin",
+        force: true,
+      });
+      assert.equal(forced.notifications.length, 1);
+      const forcedMsg = forced.notifications[0]?.message ?? "";
+      assert.notEqual(forced.notifications[0]?.severity, "error");
+      assert.notEqual(forced.notifications[0]?.severity, "warning");
+      assert.match(forcedMsg, /\(force-installed\)/);
+      assert.match(forcedMsg, /\{unsupported hooks\}/);
+      assert.ok(
+        forcedMsg.startsWith("●"),
+        "info force-installed body starts at the mp header, no summary line",
+      );
+      const afterForced = await loadState(locations.extensionRoot);
+      assert.ok(
+        "hook-plugin" in (afterForced.marketplaces["mp"]?.plugins ?? {}),
+        "force install must record the plugin",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 test('260525-cjr C3: classifyInstallFailure returns the collapsed `status: "failed"` shape carrying the typed Error', async () => {
@@ -2212,6 +2613,7 @@ test('260525-cjr C3: classifyInstallFailure returns the collapsed `status: "fail
     kind: "not-installable",
     plugin: "p",
     reasons: ["hooks"],
+    forceable: false,
   });
   const notInstallable = __test_classifyInstallFailure(notInstallableErr, "formatted");
   assert.equal(notInstallable.status, "failed");
@@ -2222,6 +2624,7 @@ test('260525-cjr C3: classifyInstallFailure returns the collapsed `status: "fail
     kind: "no-longer-installable",
     plugin: "p",
     reasons: ["unsupported source"],
+    forceable: false,
   });
   const noLongerInstallable = __test_classifyInstallFailure(noLongerInstallableErr, "formatted");
   assert.equal(noLongerInstallable.status, "failed");
@@ -2243,18 +2646,18 @@ test('260525-cjr C3: classifyInstallFailure returns the collapsed `status: "fail
 // `unsupported source` fallback runs only when no classifier matched.
 // ───────────────────────────────────────────────────────────────────────────
 
-test("HOOK-04 / D-58-02: narrowResolverReasons drops the dead `contains hooks` carve-out -> permissive fallback `unsupported source`", () => {
-  // Under v1.13, `hooks` is a SUPPORTED component kind
-  // (`SUPPORTED_COMPONENT_KINDS` in `domain/resolver.ts` includes
-  // `"hooks"`), so the resolver no longer emits a
-  // `"contains hooks"` note in real traffic. D-58-02 dropped the
-  // dead branch from `MANIFEST_FIELD_REASONS` / `MANIFEST_FIELD_TO_REASON`;
-  // a synthetic `"contains hooks"` input now misses the carve-out and
-  // falls through to the permissive `unsupported source` fallback.
-  // The real `{unsupported hooks}` reason is sourced through
-  // `shared/probe-classifiers.ts::narrowResolverNotes` against the
-  // `parseHooksConfig` prefix tokens, not through this carve-out.
-  assert.deepEqual([...__test_narrowResolverReasons(["contains hooks"])], ["unsupported source"]);
+test("PHOOK-05 / D-71-04: narrowResolverReasons routes the `contains hooks` token through the shared per-kind helper -> `unsupported hooks`", () => {
+  // `hooks` is a SUPPORTED component kind that, when a parseable hooks.json
+  // drops one or more unsupportable handlers, becomes a force-degradable
+  // `unsupported` marker (D-71-04). The shared `narrowUnsupportedKinds` helper
+  // maps the `hooks` kind to the single aggregate `unsupported hooks` reason,
+  // so a `contains hooks` token narrows to `unsupported hooks` on the install
+  // error surface -- byte-identical to the `list`/`info` per-kind path.
+  //
+  // (`hooks` is not in `UNSUPPORTED_COMPONENT_KINDS`, so the resolver does not
+  // emit a real `contains hooks` note; the degradable signal travels on the
+  // typed `unsupported[]` list. This pins the shared-helper mapping.)
+  assert.deepEqual([...__test_narrowResolverReasons(["contains hooks"])], ["unsupported hooks"]);
 });
 
 test("260525-cjr B2 / C5: narrowResolverReasons -> `contains lspServers` extracts the `lspServers` token and emits the `lsp` Reason (SNM-36)", () => {
@@ -2969,6 +3372,401 @@ test("SURF-05: installPlugin of a hooks-declaring plugin with rewakeMessage AND 
         message.includes("(installed)"),
         `expected clean (installed) row; got:\n${message}`,
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// FORCE-01/03/04/05 -- `--force` degrade gate selection
+// ───────────────────────────────────────────────────────────────────────────
+
+test("FORCE-01: force on an unsupported plugin installs the supported components and skips the unsupported ones", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force01-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        // Supported component (a skill) alongside experimental unsupported
+        // kinds -> the resolver returns the force-degradable `unsupported` arm.
+        skills: [{ sourceName: "tool" }],
+        experimental: { themes: "./themes", monitors: "./monitors.json" },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      // No error notifications: the degrade install succeeded.
+      const errs = notifications.filter((n) => n.severity === "error");
+      assert.equal(errs.length, 0, `unexpected errors: ${JSON.stringify(errs)}`);
+
+      // The supported skill materialized on disk.
+      const skillTarget = path.join(locations.skillsTargetDir, "p1-tool", "SKILL.md");
+      assert.ok(
+        (await readFile(skillTarget, "utf8")).length > 0,
+        "supported skill must materialize",
+      );
+
+      // State record written; supported skill recorded, unsupported kinds
+      // captured in compatibility but NOT materialized as resources.
+      const after = await loadState(locations.extensionRoot);
+      const record = after.marketplaces["mp"]?.plugins["p1"];
+      assert.ok(record !== undefined, "state record must be written on force-degrade");
+      assert.deepEqual([...record.resources.skills], ["p1-tool"]);
+      assert.ok(
+        record.compatibility.unsupported.includes("themes"),
+        `unsupported should include themes: ${record.compatibility.unsupported.join(" / ")}`,
+      );
+      assert.ok(
+        record.compatibility.unsupported.includes("monitors"),
+        `unsupported should include monitors: ${record.compatibility.unsupported.join(" / ")}`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-01: force on a fully-supported plugin is inert and installs as (installed)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force01noop-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        skills: [{ sourceName: "tool" }],
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      const errs = notifications.filter((n) => n.severity === "error");
+      assert.equal(errs.length, 0, `unexpected errors: ${JSON.stringify(errs)}`);
+
+      const after = await loadState(locations.extensionRoot);
+      const record = after.marketplaces["mp"]?.plugins["p1"];
+      assert.ok(record !== undefined, "fully-supported plugin installs under force");
+      assert.deepEqual([...record.resources.skills], ["p1-tool"]);
+      // Inert: no unsupported kinds, identical to a non-force install.
+      assert.deepEqual([...record.compatibility.unsupported], []);
+
+      // `(installed)` row, no `(unavailable)` / `(skipped)` token.
+      const message = notifications.map((n) => n.message).join("\n");
+      assert.ok(message.includes("(installed)"), `expected (installed) row; got:\n${message}`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FSTAT-07 / D-66-04: force install of an unsupported plugin emits a (force-installed) success row", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force-installed-"));
+    try {
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        pluginVersion: "1.0.0",
+        pluginJsonVersion: "1.0.0",
+        skills: [{ sourceName: "tool" }],
+        // D-64-06: experimental unsupported kinds drive the force-degradable
+        // `unsupported` arm; the success row reports (force-installed) with the
+        // dropped-component detail rather than (installed).
+        experimental: { themes: "./themes", monitors: "./monitors.json" },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      // FSTAT-07 / D-66-04: force-installed is a realized install transition --
+      // info severity, reload-hint (TRANSITION_STATUS_LIST membership), and the
+      // ◉ glyph distinct from the clean (installed) row.
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, undefined, "force-installed is info, not error");
+      assert.equal(
+        notifications[0]?.message,
+        "● mp [project]\n" +
+          "  ◉ p1 v1.0.0 (force-installed) {unsupported source}\n" +
+          "\n" +
+          "/reload to pick up changes",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("WR-03: a (force-installed) success row renders soft-dep markers when a staged companion is unloaded", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force-softdep-"));
+    try {
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        pluginVersion: "1.0.0",
+        pluginJsonVersion: "1.0.0",
+        // The force-degradable `unsupported` arm still stages the SUPPORTED
+        // components, so the staged agent populates `dependencies: ["agents"]`.
+        skills: [{ sourceName: "tool" }],
+        agents: [{ sourceName: "bot" }],
+        // D-64-06: experimental unsupported kinds drive the force-degradable
+        // `unsupported` arm -> the row is (force-installed) {unsupported source}.
+        experimental: { themes: "./themes", monitors: "./monitors.json" },
+      });
+
+      // Default probe: getAllTools() returns [] -> pi-subagents is NOT loaded,
+      // so the staged agent's `{requires pi-subagents}` soft-dep marker fires.
+      const { ctx, pi, notifications } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      // SEV-01: the force-degraded install stages an agent while `pi-subagents`
+      // is unloaded -> the missing-companion ladder raises the success row to
+      // warning, so the cascade gains the `needs attention` summary line.
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "warning", "missing companion -> warning");
+      // WR-03: the soft-dep marker shares the brace with the dropped-component
+      // reason -- composeReasons appends `{requires pi-subagents}` AFTER the
+      // typed reason (MSG-GR-4), so `unsupported source` leads.
+      assert.equal(
+        notifications[0]?.message,
+        "A plugin operation needs attention.\n" +
+          "\n" +
+          "● mp [project]\n" +
+          "  ◉ p1 v1.0.0 (force-installed) {unsupported source, requires pi-subagents}\n" +
+          "\n" +
+          "/reload to pick up changes",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// SEV-01 regression guard: the missing-companion warning is conditioned on the
+// probe -- when the declared companion IS loaded, the success row stays info.
+test("SEV-01: install staging agents with pi-subagents loaded stays info (companion present)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-sev01-loaded-"));
+    try {
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "hello",
+        pluginVersion: "1.0.0",
+        pluginJsonVersion: "1.0.0",
+        agents: [{ sourceName: "bot" }],
+      });
+
+      // Probe reports the `pi-subagents` companion loaded -> no missing
+      // companion -> the success row keeps its info stamp (no summary line).
+      const { ctx, pi, notifications } = makeCtx({ getAllTools: () => [{ name: "subagent" }] });
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+      });
+
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(
+        notifications[0]?.message,
+        "● mp [project]\n" + "  ● hello v1.0.0 (installed)\n" + "\n" + "/reload to pick up changes",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-03: without force an unsupported plugin still blocks and writes no state record", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force03-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        skills: [{ sourceName: "tool" }],
+        experimental: { themes: "./themes", monitors: "./monitors.json" },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      // No `force` -> the default `requireInstallable` gate still blocks the
+      // `unsupported` arm.
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+      });
+
+      // A row surfaced (the plugin did not silently install) ...
+      assert.ok(notifications.length >= 1, "a notification must surface on block");
+      // ... and no state record was written.
+      const after = await loadState(locations.extensionRoot);
+      const record = after.marketplaces["mp"]?.plugins["p1"];
+      assert.equal(record, undefined, "unsupported plugin must not be recorded without --force");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-04: the force-degrade path emits no warning-severity notification and no Warning: summary", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force04-"));
+    try {
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        skills: [{ sourceName: "tool" }],
+        experimental: { themes: "./themes", monitors: "./monitors.json" },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      // FORCE-04: no row stamps `warning` severity, so the MAX-reduce summary
+      // never renders a `Warning:` line.
+      const warnings = notifications.filter((n) => n.severity === "warning");
+      assert.equal(warnings.length, 0, `unexpected warnings: ${JSON.stringify(warnings)}`);
+      for (const n of notifications) {
+        assert.ok(
+          !n.message.startsWith("Warning:"),
+          `no summary line may begin with "Warning:": ${n.message}`,
+        );
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-05: force cannot bypass an unavailable (structural) plugin", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force05a-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplaceWithPlugin({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        pluginName: "p1",
+        // Non-path source -> resolver returns the `unavailable` arm, which
+        // `requireForceInstallable` still rejects (FORCE-05).
+        rawSourceOverride: "github:anthropics/some-repo",
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      // Still blocks: an `(unavailable)` row surfaced and no record was written.
+      const message = notifications.map((n) => n.message).join("\n");
+      assert.ok(message.includes("(unavailable)"), `expected (unavailable) row; got:\n${message}`);
+      const warnings = notifications.filter((n) => n.severity === "warning");
+      assert.equal(warnings.length, 0, `force on unavailable must emit no warning`);
+
+      const after = await loadState(locations.extensionRoot);
+      assert.equal(after.marketplaces["mp"]?.plugins["p1"], undefined, "no record on unavailable");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-05: force cannot bypass a missing marketplace", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "install-force05b-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await mkdir(locations.extensionRoot, { recursive: true });
+
+      const { ctx, pi, notifications } = makeCtx();
+      // No marketplace seeded -> the marketplace-absent precondition
+      // short-circuits BEFORE the gate; `--force` cannot conjure a source.
+      await installPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "ghost-mp",
+        plugin: "p1",
+        force: true,
+      });
+
+      assert.ok(notifications.length >= 1, "a notification must surface on missing marketplace");
+      const after = await loadState(locations.extensionRoot);
+      assert.equal(after.marketplaces["ghost-mp"], undefined, "no marketplace record conjured");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

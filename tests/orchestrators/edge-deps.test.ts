@@ -14,12 +14,23 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { loadMarketplaceManifest } from "../../extensions/pi-claude-marketplace/domain/manifest.ts";
+import { resolveStrict } from "../../extensions/pi-claude-marketplace/domain/resolver.ts";
 import { makeLocationsResolver } from "../../extensions/pi-claude-marketplace/orchestrators/edge-deps.ts";
+import {
+  classifyInstalledRecord,
+  classifyManifestEntry,
+} from "../../extensions/pi-claude-marketplace/orchestrators/plugin/plugin-state-classifier.ts";
+import { isRecordedButDisabled } from "../../extensions/pi-claude-marketplace/orchestrators/reconcile/plan.ts";
 import { locationsFor } from "../../extensions/pi-claude-marketplace/persistence/locations.ts";
-import { saveState } from "../../extensions/pi-claude-marketplace/persistence/state-io.ts";
+import {
+  loadState,
+  saveState,
+} from "../../extensions/pi-claude-marketplace/persistence/state-io.ts";
 import { ManifestSoftFailError } from "../../extensions/pi-claude-marketplace/shared/completion-cache.ts";
 
 import type { ExtensionState } from "../../extensions/pi-claude-marketplace/persistence/state-io.ts";
+import type { PluginIndexRow } from "../../extensions/pi-claude-marketplace/shared/completion-cache.ts";
 
 interface HermeticScope {
   readonly cwd: string;
@@ -291,5 +302,350 @@ test("makeLocationsResolver: loadManifestForMarketplace wraps manifest-read fail
       () => resolver.loadManifestForMarketplace("project", "missing-mp"),
       (err: unknown) => err instanceof ManifestSoftFailError,
     );
+  });
+});
+
+test("makeLocationsResolver: an unsafe-named not-installed entry degrades to `unavailable` (resolveStrict throws, classifyNotInstalledPluginRow catch)", async () => {
+  await withHermeticProjectScope(async ({ cwd }) => {
+    // A plugin name containing a path separator passes the string-typed
+    // manifest schema but makes resolveStrict's `assertSafeName` throw with
+    // no I/O. `classifyNotInstalledPluginRow`'s catch degrades the row to
+    // `unavailable` -- the defensive path distinct from a structural
+    // (missing-dir) `unavailable` resolution, which returns without throwing.
+    const srcRoot = await mkdtemp(path.join(tmpdir(), "edge-deps-badname-"));
+    const manifestDir = path.join(srcRoot, ".claude-plugin");
+    await mkdir(manifestDir, { recursive: true });
+    const manifestPath = path.join(manifestDir, "marketplace.json");
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        name: "bad-mp",
+        plugins: [{ name: "bad/name", source: "./bad" }],
+      }),
+      "utf8",
+    );
+
+    const projectLoc = locationsFor("project", cwd);
+    await mkdir(projectLoc.extensionRoot, { recursive: true });
+    const state: ExtensionState = {
+      schemaVersion: 1,
+      marketplaces: {
+        "bad-mp": {
+          name: "bad-mp",
+          scope: "project",
+          source: { kind: "path", raw: srcRoot },
+          addedFromCwd: cwd,
+          manifestPath,
+          marketplaceRoot: srcRoot,
+          plugins: {},
+        },
+      },
+    };
+    await saveState(projectLoc.extensionRoot, state);
+
+    const resolver = makeLocationsResolver(cwd);
+    const rows = await resolver.loadManifestForMarketplace("project", "bad-mp");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.name, "bad/name");
+    assert.equal(rows[0]?.status, "unavailable");
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// LIST-02 / D-67-02: the bucketizer emits the FINER derived statuses via the
+// SHARED classifier (installed | upgradable | force-installed |
+// force-upgradable | available | unsupported | unavailable). The
+// force-upgradable candidate resolve stays no-network (resolveStrict, NFR-5).
+// ──────────────────────────────────────────────────────────────────────────
+
+interface FixturePlugin {
+  readonly name: string;
+  /** Manifest entry (upgrade-candidate) version. */
+  readonly manifestVersion?: string;
+  /** Declare an unsupported component kind (lspServers) on the manifest entry. */
+  readonly declaresUnsupported?: boolean;
+  /** Create the on-disk plugin source tree (default true). `false` -> structural unavailable. */
+  readonly onDisk?: boolean;
+  /** Installed record (state-present). `compatUnsupported` non-empty -> force-installed. */
+  readonly installed?: { readonly version: string; readonly compatUnsupported?: readonly string[] };
+  /**
+   * Mark the installed record recorded-but-disabled (ENBL-02): `enabled: false`
+   * with `installable: true`. The canonical `isRecordedButDisabled` marker.
+   */
+  readonly disabled?: boolean;
+}
+
+/**
+ * Lay out a path-source marketplace (manifest + on-disk plugin trees + state)
+ * in the hermetic project scope and return its roots. Mirrors the inline
+ * fixtures above but parametrized over the finer-status shapes.
+ */
+async function layoutFixtureMarketplace(
+  cwd: string,
+  mpName: string,
+  plugins: readonly FixturePlugin[],
+): Promise<void> {
+  const srcRoot = await mkdtemp(path.join(tmpdir(), `edge-deps-fix-${mpName}-`));
+  const manifestDir = path.join(srcRoot, ".claude-plugin");
+  await mkdir(manifestDir, { recursive: true });
+  const manifestPath = path.join(manifestDir, "marketplace.json");
+
+  const manifestPlugins = plugins.map((p) => ({
+    name: p.name,
+    source: `./plugins/${p.name}`,
+    ...(p.manifestVersion !== undefined && { version: p.manifestVersion }),
+    ...(p.declaresUnsupported === true && { lspServers: { ls: {} } }),
+  }));
+  await writeFile(manifestPath, JSON.stringify({ name: mpName, plugins: manifestPlugins }), "utf8");
+
+  for (const p of plugins) {
+    if (p.onDisk === false) {
+      continue;
+    }
+
+    const pluginRoot = path.join(srcRoot, "plugins", p.name);
+    await mkdir(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+    await writeFile(
+      path.join(pluginRoot, ".claude-plugin", "plugin.json"),
+      JSON.stringify({
+        name: p.name,
+        ...(p.manifestVersion !== undefined && { version: p.manifestVersion }),
+      }),
+      "utf8",
+    );
+  }
+
+  const statePlugins: ExtensionState["marketplaces"][string]["plugins"] = {};
+  for (const p of plugins) {
+    if (p.installed === undefined) {
+      continue;
+    }
+
+    const compatUnsupported = p.installed.compatUnsupported ?? [];
+    statePlugins[p.name] = {
+      version: p.installed.version,
+      resolvedSource: path.join(srcRoot, "plugins", p.name),
+      compatibility: {
+        installable: compatUnsupported.length === 0,
+        notes: [],
+        supported: [],
+        unsupported: [...compatUnsupported],
+      },
+      resources: {
+        skills: [`${p.name}-skill`],
+        prompts: [],
+        agents: [],
+        mcpServers: [],
+        hooks: [],
+      },
+      enabled: p.disabled !== true,
+      installedAt: "2026-06-17T00:00:00Z",
+      updatedAt: "2026-06-17T00:00:00Z",
+    };
+  }
+
+  const projectLoc = locationsFor("project", cwd);
+  await mkdir(projectLoc.extensionRoot, { recursive: true });
+  const state: ExtensionState = {
+    schemaVersion: 2,
+    marketplaces: {
+      [mpName]: {
+        name: mpName,
+        scope: "project",
+        source: { kind: "path", raw: srcRoot },
+        addedFromCwd: cwd,
+        manifestPath,
+        marketplaceRoot: srcRoot,
+        plugins: statePlugins,
+      },
+    },
+  };
+  await saveState(projectLoc.extensionRoot, state);
+}
+
+const FINER_STATUS_FIXTURE: readonly FixturePlugin[] = [
+  // Clean installed at HEAD -> installed.
+  { name: "inst", manifestVersion: "1.0.0", installed: { version: "1.0.0" } },
+  // Clean record, newer clean candidate -> upgradable.
+  { name: "upg", manifestVersion: "2.0.0", installed: { version: "1.0.0" } },
+  // Clean record, newer candidate that resolves unsupported -> force-upgradable.
+  {
+    name: "fup",
+    manifestVersion: "2.0.0",
+    declaresUnsupported: true,
+    installed: { version: "1.0.0" },
+  },
+  // Degraded record (persisted compatibility.unsupported) -> force-installed.
+  {
+    name: "forced",
+    manifestVersion: "1.0.0",
+    installed: { version: "1.0.0", compatUnsupported: ["lspServers"] },
+  },
+  // WR-01: recorded-but-disabled (enabled:false, installable:true) record whose
+  // manifest version drifted (1.0.0 installed vs 2.0.0 manifest). The version
+  // pin is frozen while disabled (ENBL-02), so the shared classifier collapses
+  // it to `installed` -- NOT `upgradable` -- so it never leaks into the
+  // `update --force` candidate set while `list` renders it `(disabled)`.
+  {
+    name: "disabled-drift",
+    manifestVersion: "2.0.0",
+    disabled: true,
+    installed: { version: "1.0.0" },
+  },
+  // WR-02: degraded record (force-installed) with a newer candidate that
+  // resolves CLEAN -> force-installed-upgradable (a supported upgrade promotes
+  // it back to installed; offerable under `update --force`).
+  {
+    name: "forced-upg",
+    manifestVersion: "2.0.0",
+    installed: { version: "1.0.0", compatUnsupported: ["lspServers"] },
+  },
+  // WR-02: degraded record with a newer candidate that ALSO resolves
+  // unsupported -> force-installed-upgradable (force re-applied at the newer
+  // version; still offerable under `update --force`).
+  {
+    name: "forced-upg-unsup",
+    manifestVersion: "2.0.0",
+    declaresUnsupported: true,
+    installed: { version: "1.0.0", compatUnsupported: ["lspServers"] },
+  },
+  // WR-02: degraded record whose newer candidate has no on-disk tree
+  // (structural unavailable) -> stays plain force-installed (nothing
+  // installable to move to; NOT offered under `update --force`).
+  {
+    name: "forced-upg-gone",
+    manifestVersion: "2.0.0",
+    onDisk: false,
+    installed: { version: "1.0.0", compatUnsupported: ["lspServers"] },
+  },
+  // Not-installed, clean on-disk -> available.
+  { name: "avail", manifestVersion: "3.0.0" },
+  // Not-installed, declares unsupported -> unsupported (distinct from unavailable).
+  { name: "unsup", manifestVersion: "3.0.0", declaresUnsupported: true },
+  // Not-installed, no on-disk tree -> structural unavailable.
+  { name: "gone", manifestVersion: "3.0.0", onDisk: false },
+];
+
+test("loadManifestForMarketplace: bucketizer emits the finer derived statuses via the shared classifier (D-67-02)", async () => {
+  await withHermeticProjectScope(async ({ cwd }) => {
+    await layoutFixtureMarketplace(cwd, "finer-mp", FINER_STATUS_FIXTURE);
+
+    const resolver = makeLocationsResolver(cwd);
+    const rows = await resolver.loadManifestForMarketplace("project", "finer-mp");
+    const statusByName = new Map(rows.map((r) => [r.name, r.status]));
+
+    assert.equal(statusByName.get("inst"), "installed");
+    assert.equal(statusByName.get("upg"), "upgradable");
+    assert.equal(statusByName.get("fup"), "force-upgradable");
+    assert.equal(statusByName.get("forced"), "force-installed");
+    // WR-01: a disabled + version-drifted record classifies `installed` (the
+    // frozen-pin collapse), never `upgradable` -- so it cannot leak into the
+    // `update --force` candidate set while `list` renders it `(disabled)`.
+    assert.equal(statusByName.get("disabled-drift"), "installed");
+    // WR-02: a force-installed record with a newer, non-unavailable candidate
+    // derives the distinct `force-installed-upgradable` (offered under
+    // `update --force`); a structural-unavailable candidate keeps it plain
+    // `force-installed`.
+    assert.equal(statusByName.get("forced-upg"), "force-installed-upgradable");
+    assert.equal(statusByName.get("forced-upg-unsup"), "force-installed-upgradable");
+    assert.equal(statusByName.get("forced-upg-gone"), "force-installed");
+    assert.equal(statusByName.get("avail"), "available");
+    // The old `installable ? available : unavailable` collapse is gone:
+    // `unsupported` is now emitted DISTINCTLY from structural `unavailable`.
+    assert.equal(statusByName.get("unsup"), "unsupported");
+    assert.equal(statusByName.get("gone"), "unavailable");
+  });
+});
+
+test("D-67-02 / T-67-08 parity: the bucketizer rows equal the shared classifier on the SAME fixture (no provider-local reclassification)", async () => {
+  await withHermeticProjectScope(async ({ cwd }) => {
+    await layoutFixtureMarketplace(cwd, "parity-mp", FINER_STATUS_FIXTURE);
+
+    const resolver = makeLocationsResolver(cwd);
+    const actual = await resolver.loadManifestForMarketplace("project", "parity-mp");
+    const actualByName = new Map(actual.map((r) => [r.name, r.status]));
+
+    // Independently re-derive the expected status for every manifest entry by
+    // calling the SAME shared classifier against the same no-network
+    // `resolveStrict` inputs. This proves the bucketizer holds NO provider-local
+    // reclassification -- it emits exactly what the shared classifier derives.
+    // (List parity for the disabled-record case -- where `list` applies
+    // `isRecordedButDisabled` ahead of the classifier -- is proven separately in
+    // the WR-01 test below, since `bucketizer == classifier` alone does not
+    // exercise that pre-classifier guard.)
+    const state = await loadState(locationsFor("project", cwd).extensionRoot);
+    const mp = state.marketplaces["parity-mp"];
+    assert.ok(mp);
+    const manifest = await loadMarketplaceManifest(mp.manifestPath);
+    const installedNames = new Set(Object.keys(mp.plugins));
+
+    const expectedByName = new Map<string, PluginIndexRow["status"]>();
+    for (const [name, installed] of Object.entries(mp.plugins)) {
+      const entry = manifest.plugins.find((p) => p.name === name);
+      const upgradable = entry?.version !== undefined && entry.version !== installed.version;
+      let resolved: Awaited<ReturnType<typeof resolveStrict>> | undefined;
+      if (upgradable) {
+        resolved = await resolveStrict(entry, { marketplaceRoot: mp.marketplaceRoot });
+      }
+
+      expectedByName.set(
+        name,
+        classifyInstalledRecord(
+          installed,
+          upgradable ? { upgradable: true, resolved } : { upgradable: false },
+        ),
+      );
+    }
+
+    for (const entry of manifest.plugins) {
+      if (installedNames.has(entry.name)) {
+        continue;
+      }
+
+      let status: PluginIndexRow["status"];
+      try {
+        status = classifyManifestEntry(
+          await resolveStrict(entry, { marketplaceRoot: mp.marketplaceRoot }),
+        );
+      } catch {
+        status = "unavailable";
+      }
+
+      expectedByName.set(entry.name, status);
+    }
+
+    assert.deepEqual(
+      [...actualByName.entries()].sort(),
+      [...expectedByName.entries()].sort(),
+      "bucketizer must emit exactly what the shared classifier derives",
+    );
+  });
+});
+
+test("WR-01: a disabled + version-drifted plugin -- `list` renders `(disabled)`, the bucketizer classifies `installed` (not offered under update --force)", async () => {
+  await withHermeticProjectScope(async ({ cwd }) => {
+    await layoutFixtureMarketplace(cwd, "wr01-mp", FINER_STATUS_FIXTURE);
+
+    // The completion bucketizer routes the disabled guard through the shared
+    // classifier, so a disabled record (version pin frozen, ENBL-02) lands in
+    // `installed` -- NEVER `upgradable`/`force-upgradable`, the only statuses the
+    // `update --force` candidate set (FORCE_UPDATE_STATUSES) admits.
+    const resolver = makeLocationsResolver(cwd);
+    const rows = await resolver.loadManifestForMarketplace("project", "wr01-mp");
+    const disabledRow = rows.find((r) => r.name === "disabled-drift");
+    assert.ok(disabledRow);
+    assert.equal(disabledRow.status, "installed");
+    assert.notEqual(disabledRow.status, "upgradable");
+    assert.notEqual(disabledRow.status, "force-upgradable");
+
+    // The SAME record satisfies the pre-classifier guard `list` applies, so
+    // `list` renders the distinct `(disabled)` token. The two surfaces agree:
+    // disabled on `list`, frozen-`installed` in completion -- never a candidate
+    // for `update --force`. This is the parity `bucketizer == classifier` alone
+    // cannot prove (the reviewer's WR-01 finding).
+    const state = await loadState(locationsFor("project", cwd).extensionRoot);
+    const record = state.marketplaces["wr01-mp"]?.plugins["disabled-drift"];
+    assert.ok(record);
+    assert.equal(isRecordedButDisabled(record), true);
   });
 });

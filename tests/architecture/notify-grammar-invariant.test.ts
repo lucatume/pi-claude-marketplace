@@ -159,35 +159,37 @@ const FIXTURES: readonly GrammarFixture[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// DIFF-02: subject-first row grammar for the 6 new
-// pending-tense `(will *)` tokens. Each rendered row matches
+// DIFF-02: subject-first row grammar for the 4 pending-tense plugin-level
+// `(will *)` tokens. Each rendered row matches
 // `<glyph> <name> [<scope>] (<token>)` with the status token AFTER the
-// subject, never before. The status token is the load-bearing assertion --
-// the row icon + name + optional bracket are exercised by the catalog-uat
-// byte-equality runner.
+// subject, never before. WILL-01 / D-65.1-02 / D-65.1-03: the marketplace
+// level carries no pending `(will *)` token (add is immediate; remove surfaces
+// as per-plugin `will uninstall` child rows under a bare header), so only the
+// four plugin-level tokens remain. The status token is the load-bearing
+// assertion -- the row icon + name + optional bracket are exercised by the
+// catalog-uat byte-equality runner.
 // ---------------------------------------------------------------------------
 
 const WILL_VARIANT_FIXTURES: readonly GrammarFixture[] = [
-  {
-    label: "DIFF-02 / will add marketplace header",
-    pi: piWithBothLoaded(),
-    message: {
-      marketplaces: [{ name: "mp", scope: "user", status: "will add", plugins: [] }],
-    },
-  },
-  {
-    label: "DIFF-02 / will remove marketplace header",
-    pi: piWithBothLoaded(),
-    message: {
-      marketplaces: [{ name: "mp", scope: "user", status: "will remove", plugins: [] }],
-    },
-  },
   {
     label: "DIFF-02 / will install plugin row under list-arm marketplace",
     pi: piWithBothLoaded(),
     message: {
       marketplaces: [
         { name: "mp", scope: "user", plugins: [{ status: "will install", name: "p" }] },
+      ],
+    },
+  },
+  {
+    label: "FSTAT-06 / will force install plugin row (force modifier set)",
+    pi: piWithBothLoaded(),
+    message: {
+      marketplaces: [
+        {
+          name: "mp",
+          scope: "user",
+          plugins: [{ status: "will install", name: "p", force: true }],
+        },
       ],
     },
   },
@@ -227,8 +229,13 @@ const WILL_VARIANT_FIXTURES: readonly GrammarFixture[] = [
 // -- this is the catalog's `plugin-pending-uninstall` / `enable-disable-
 // transitions` shape. The load-bearing invariant is that the status token,
 // when present, ALWAYS follows the subject -- never precedes it.
+// FSTAT-06 / D-66-04: the `will install` token also admits the `will force
+// install` form when the planned install would degrade (resolves
+// `unsupported`). It is a render modifier, not a new closed-set token; there is
+// deliberately no `will force update` analog (the reconcile plan has no update
+// bucket -- D-66-05).
 const WILL_TOKEN_RE =
-  /^(?:[●○⊘◌]) [A-Za-z0-9_-]+(?: \[(?:user|project)\])?(?: \(will (?:add|remove|install|uninstall|enable|disable)\))?$/;
+  /^(?:[●○⊘◌]) [A-Za-z0-9_-]+(?: \[(?:user|project)\])?(?: \(will (?:install|force install|uninstall|enable|disable)\))?$/;
 
 // D-54-01 / ENBL-04: subject-first row grammar for the new
 // `(disabled)` inventory token. Each row matches

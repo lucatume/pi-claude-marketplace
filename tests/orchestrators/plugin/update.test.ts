@@ -497,14 +497,19 @@ test("PUP-6 happy: version bump triggers 3-phase swap; state reflects new versio
       // the plugin declares agents + mcp but the host's `getAllTools()`
       // returns [] (probe sees both companions unloaded). Reload-hint
       // appended by notify() per D-16-12 from the `updated` variant.
+      // SEV-01: the update declares agents + mcp while both companions are
+      // unloaded, so the success row stamps warning (symmetric with the install
+      // success arm) -- the cascade gains the `needs attention` summary line.
       const errs = notifications.filter((n) => n.severity === "error");
       assert.equal(errs.length, 0, `unexpected errors: ${JSON.stringify(errs)}`);
       assert.equal(notifications.length, 1);
-      assert.equal(notifications[0]?.severity, undefined);
+      assert.equal(notifications[0]?.severity, "warning");
       const body = notifications[0]?.message ?? "";
       assert.equal(
         body,
-        "● mp [project]\n" +
+        "A plugin operation needs attention.\n" +
+          "\n" +
+          "● mp [project]\n" +
           "  ● hello v1.0.0 → v1.0.1 (updated) {requires pi-subagents, requires pi-mcp}\n" +
           "\n" +
           "/reload to pick up changes",
@@ -643,25 +648,21 @@ test("PUP-1 @mp form: enumerates all installed plugins in the marketplace, parti
       });
 
       const body = notifications[0]?.message ?? "";
-      // V2 byte form combines `single-mp-mixed`
-      // catalog shape (docs/output-catalog.md:495-504): alpha (updated)
-      // + beta (skipped {up-to-date}) under one marketplace header in
-      // caller-order (D-16-06 -- orchestrator iterates in the
-      // enumerateTargets order; notify() does not sort plugin rows).
-      // Plugin-row `[<scope>]` brackets suppressed by orphan-fold. The
-      // (updated) row has no soft-dep markers (plugin declares no agents
-      // / no mcp; PUP-1 @mp fixture sets only `hasSkill: true`).
-      // OUT-03/D-04: the `@mp` form is a bulk (plural) update, so the trailing
-      // per-operation tally renders between the body and the reload-hint -- the
-      // `updated` + idempotent `(skipped) {up-to-date}` rows are the two
-      // successes.
+      // Catalog `single-mp-mixed` shape: alpha (updated) under one marketplace
+      // header. UGRM-01: the `beta (skipped) {up-to-date}` row is suppressed for
+      // the bulk (`@mp`, plural) form -- only the realized transition renders.
+      // Plugin-row `[<scope>]` brackets suppressed by orphan-fold. The (updated)
+      // row has no soft-dep markers (plugin declares no agents / no mcp; the
+      // @mp fixture sets only `hasSkill: true`). UGRM-02: the trailing tally
+      // counts realized transitions only -- one `updated` row -> `1 updated`
+      // (the verb has no plural-s); the suppressed up-to-date row no longer
+      // inflates the count.
       assert.equal(
         body,
         "● mp [project]\n" +
           "  ● alpha v1.0.0 → v1.0.1 (updated)\n" +
-          "  ⊘ beta (skipped) {up-to-date}\n" +
           "\n" +
-          "Plugin update: 2 successes\n" +
+          "Plugin update: 1 updated\n" +
           "\n" +
           "/reload to pick up changes",
       );
@@ -672,6 +673,55 @@ test("PUP-1 @mp form: enumerates all installed plugins in the marketplace, parti
       // severity arg).
       assert.equal(notifications[0]?.severity, undefined);
       assert.ok(seeded.marketplaceRoot.length > 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── UGRM-02: plural tally counts every realized transition ───────────────────
+
+test("UGRM-02: bulk @mp update with TWO realized transitions tallies `2 updated` (verb invariant, no plural-s)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-tally-2updated-"));
+    try {
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: {
+          // Both bumped -> two realized `updated` transitions, no obstacles.
+          alpha: { version: "1.0.1", hasSkill: true },
+          beta: { version: "1.0.1", hasSkill: true },
+        },
+        installedVersions: { alpha: "1.0.0", beta: "1.0.0" },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "mp" },
+      });
+
+      // UGRM-02: the trailing tally counts realized transitions -- two `updated`
+      // rows -> `2 updated`. The verb has no plural-s (the count carries the
+      // plurality). The realized-transition cascade appends the reload trailer.
+      const body = notifications[0]?.message ?? "";
+      assert.equal(
+        body,
+        "● mp [project]\n" +
+          "  ● alpha v1.0.0 → v1.0.1 (updated)\n" +
+          "  ● beta v1.0.0 → v1.0.1 (updated)\n" +
+          "\n" +
+          "Plugin update: 2 updated\n" +
+          "\n" +
+          "/reload to pick up changes",
+      );
+      // Two benign success rows, no failures/warnings -> info (severity unset).
+      assert.equal(notifications[0]?.severity, undefined);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -898,6 +948,140 @@ test("PUP-6 phase-3 failure: bridge commit throws -> aggregate error carries 'pl
   });
 });
 
+// ─── WR-01: phase-3a abort with up-to-date predecessors -> no spurious no-op ──
+
+test("WR-01: bulk update where an up-to-date plugin precedes a phase-3a failure does NOT emit 'nothing to update'", async () => {
+  // A bulk (`@mp`, plural) update enumerates `aaa` (up-to-date, partition
+  // `unchanged`) BEFORE `zzz` (bumped, but phase-3a-fails on a skill-target
+  // collision). State insertion order (`Object.keys(mp.plugins)`) is the
+  // `installedVersions` key order, so `aaa` is accumulated into `outcomes`
+  // (then bulk-suppressed) before `zzz` aborts the batch.
+  //
+  // The failing plugin fires its own `notifyDirectFailure` and is withheld from
+  // `outcomes`, so the abort path renders a cascade for the already-accumulated
+  // `aaa` outcome. Pre-fix, that all-`unchanged` accumulator passed the no-op
+  // gate (0 updated, 0 error/warning rows in the cascade) and emitted a SECOND
+  // notification reading `Plugin update: nothing to update` -- contradictory,
+  // directly after a failure for the same invocation. The `abortedByFailure`
+  // flag now suppresses that headline.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-wr01-abort-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: {
+          // aaa: manifest version == installed version -> unchanged.
+          aaa: { version: "1.0.0", hasSkill: true },
+          // zzz: bumped -> realized transition attempted, but phase-3a fails.
+          zzz: { version: "1.0.1", hasSkill: true },
+        },
+        // Insertion order seeds state.plugins as [aaa, zzz] so enumeration
+        // accumulates the unchanged `aaa` outcome before `zzz` aborts.
+        installedVersions: { aaa: "1.0.0", zzz: "1.0.0" },
+      });
+
+      // Force the phase-3a failure for `zzz` only: pre-create its skill TARGET
+      // as a FILE so the bridge's `rename(stagingDir -> target)` returns ENOTDIR
+      // (the PUP-6 mechanism). The generated skill name is `<plugin>-<skillDir>`
+      // = `zzz-tool`. `aaa` has no obstacle, so it cleanly partitions unchanged.
+      await mkdir(locations.skillsTargetDir, { recursive: true });
+      await writeFile(path.join(locations.skillsTargetDir, "zzz-tool"), "obstacle");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "mp" },
+      });
+
+      // Exactly one notification: the `zzz` phase-3a failure. The spurious
+      // `nothing to update` headline must NOT be emitted on the abort path.
+      assert.equal(
+        notifications.length,
+        1,
+        `expected exactly one (failure) notification, got ${notifications.length.toString()}: ${notifications.map((n) => n.message).join("\n---\n")}`,
+      );
+      const allText = notifications.map((n) => n.message).join("\n");
+      assert.equal(
+        allText.includes("Plugin update: nothing to update"),
+        false,
+        `must NOT emit the no-op headline after a phase-3a abort:\n${allText}`,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("WR-01: a CLEANLY-UPDATED predecessor before a phase-3a abort stays visible -- the failure notification AND the committed `(updated)` cascade both render", async () => {
+  // Companion of the up-to-date-predecessor WR-01 case above: there `aaa` was
+  // `unchanged` (bulk-suppressed -> empty cascade -> nothing rendered). Here
+  // `aaa` is a REALIZED transition (bumped, commits cleanly) accumulated BEFORE
+  // `zzz` aborts on a skill-target collision. The abort path must still render
+  // the committed `aaa (updated)` row so a successful predecessor update never
+  // vanishes behind the failure.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-wr01-abort-committed-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: {
+          // aaa: bumped, no obstacle -> commits cleanly (realized `updated`).
+          aaa: { version: "1.0.1", hasSkill: true },
+          // zzz: bumped, but phase-3a fails on the pre-created skill-target file.
+          zzz: { version: "1.0.1", hasSkill: true },
+        },
+        // Insertion order seeds state.plugins as [aaa, zzz] so `aaa` is committed
+        // and accumulated into `outcomes` before `zzz` aborts the batch.
+        installedVersions: { aaa: "1.0.0", zzz: "1.0.0" },
+      });
+
+      // Force the phase-3a failure for `zzz` only: pre-create its skill TARGET
+      // (`zzz-tool`) as a FILE so the bridge's `rename(staging -> target)`
+      // returns ENOTDIR. `aaa`'s target (`aaa-tool`) is unobstructed.
+      await mkdir(locations.skillsTargetDir, { recursive: true });
+      await writeFile(path.join(locations.skillsTargetDir, "zzz-tool"), "obstacle");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "mp" },
+      });
+
+      // Exactly two notifications: the `zzz` phase-3a failure (inline
+      // notifyDirectFailure) AND the abort cascade for the committed `aaa`.
+      assert.equal(
+        notifications.length,
+        2,
+        `expected 2 notifications, got ${notifications.length.toString()}: ${notifications.map((n) => n.message).join("\n---\n")}`,
+      );
+      const failure = notifications.find((n) =>
+        n.message.includes('plugin-uninstall + plugin-install for "zzz".'),
+      );
+      assert.ok(failure !== undefined, "the zzz phase-3a failure notification must be present");
+      const cascade = notifications.find((n) =>
+        n.message.includes("● aaa v1.0.0 → v1.0.1 (updated)"),
+      );
+      assert.ok(cascade !== undefined, "the committed aaa (updated) cascade must be present");
+      // The committed predecessor still tallies as a realized transition.
+      assert.match(cascade.message, /Plugin update: 1 updated/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── PUP-7 / WR-04: success populates stagedAgents + stagedMcpServers ─────────
 
 test("WR-04: successful update populates stagedAgents + stagedMcpServers on outcome", async () => {
@@ -948,6 +1132,208 @@ test("WR-04: successful update populates stagedAgents + stagedMcpServers on outc
       assert.deepEqual([...rec.resources.mcpServers], ["server1"]);
 
       assert.ok(seeded.marketplaceRoot.length > 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── SEV-03 / D-69-01: autoupdate cascade TAKES the force path ────────────────
+
+test("SEV-03 / D-69-01: autoupdate cascade (updateSinglePlugin) TAKES the force path -- an `unsupported` candidate degrades to partition='updated' carrying unsupportedKinds (NOT skipped)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-sev03-force-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      // Make the candidate re-resolve `unsupported`: an `lspServers` component
+      // (the `.lsp.json` convention) is a known-but-unsupported kind. The skill
+      // stays supported, so the candidate DEGRADES rather than going
+      // structurally `unavailable` -- the force path can materialize it.
+      await writeFile(
+        path.join(seeded.marketplaceRoot, "plugins", "hello", ".lsp.json"),
+        JSON.stringify({ servers: {} }),
+      );
+
+      const prevCwd = process.cwd();
+      process.chdir(cwd);
+      try {
+        const outcome = await updateSinglePlugin("hello", "mp", "project");
+        assert.equal(outcome.partition, "updated");
+        if (outcome.partition !== "updated") {
+          throw new Error("unreachable: narrowed above");
+        }
+
+        // The dropped kind rides the outcome so the cascade mapper renders
+        // `(force-installed) {lsp}`.
+        assert.deepEqual([...(outcome.forceDegrade?.kinds ?? [])], ["lspServers"]);
+      } finally {
+        process.chdir(prevCwd);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("SEV-03 / FORCE-05: autoupdate cascade does NOT bypass a hard failure -- a github-source (`unavailable`) candidate still returns partition='skipped' {no longer installable}", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-sev03-unavail-"));
+    try {
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        // MM-3 / PR-2: a github-source entry from a path marketplace is
+        // structurally `unavailable` -- `requireForceInstallable` blocks it even
+        // on the force path (force degrades `unsupported`, never `unavailable`).
+        manifestPlugins: {
+          hello: { version: "1.1.0", hasSkill: true, rawSourceOverride: "github:owner/repo" },
+        },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      const prevCwd = process.cwd();
+      process.chdir(cwd);
+      try {
+        const outcome = await updateSinglePlugin("hello", "mp", "project");
+        assert.equal(outcome.partition, "skipped");
+        if (outcome.partition !== "skipped") {
+          throw new Error("unreachable: narrowed above");
+        }
+
+        assert.deepEqual([...outcome.reasons], ["no longer installable"]);
+      } finally {
+        process.chdir(prevCwd);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("XSURF-03 / SEV-04: the manual `update` path (no --force) of a force-upgradable candidate declines with `(force-upgradable) {lsp}` + the --force trailer at warning", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-sev03-manual-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      await writeFile(
+        path.join(seeded.marketplaceRoot, "plugins", "hello", ".lsp.json"),
+        JSON.stringify({ servers: {} }),
+      );
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      // XSURF-03: the manual no-`--force` decline of a force-upgradable
+      // candidate flips to the resolver-state-driven `(force-upgradable)` token
+      // (consistent with how `list` describes the same plugin) carrying the
+      // list-consistent `{lsp}` degrade reason + the update-worded `--force`
+      // trailer. SEV-04: a targeted decline stays warning.
+      assert.equal(notifications.length, 1);
+      assert.equal(
+        notifications[0]?.message ?? "",
+        "A plugin operation needs attention.\n\n● mp [project]\n  ● hello v1.0.0 (force-upgradable) {lsp}\n    Re-run with --force to update with the supported components.",
+      );
+      assert.equal(notifications[0]?.severity, "warning");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("SEV-03 / D-69-01: prior-state read -- a previously-CLEAN plugin (persisted unsupported empty) degraded by the autoupdate cascade carries newlyDegraded=true", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-sev03-newly-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true } },
+        // seedPathMarketplace seeds compatibility.unsupported = [] -> the prior
+        // record is CLEAN, so the degrade is NEWLY introduced.
+        installedVersions: { hello: "1.0.0" },
+      });
+      await writeFile(
+        path.join(seeded.marketplaceRoot, "plugins", "hello", ".lsp.json"),
+        JSON.stringify({ servers: {} }),
+      );
+
+      const prevCwd = process.cwd();
+      process.chdir(cwd);
+      try {
+        const outcome = await updateSinglePlugin("hello", "mp", "project");
+        assert.equal(outcome.partition, "updated");
+        if (outcome.partition !== "updated") {
+          throw new Error("unreachable: narrowed above");
+        }
+
+        assert.equal(outcome.forceDegrade?.newlyDegraded, true);
+      } finally {
+        process.chdir(prevCwd);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("SEV-03 / D-69-01: prior-state read -- an ALREADY force-installed plugin (persisted unsupported non-empty) degraded again carries newlyDegraded=false", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-sev03-already-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      await writeFile(
+        path.join(seeded.marketplaceRoot, "plugins", "hello", ".lsp.json"),
+        JSON.stringify({ servers: {} }),
+      );
+
+      // Pre-stamp the persisted record as ALREADY force-installed: a non-empty
+      // `compatibility.unsupported` is the prior-state the auto-update reads.
+      const locations = locationsFor("project", cwd);
+      const before = await loadState(locations.extensionRoot);
+      const rec = before.marketplaces["mp"]?.plugins["hello"];
+      assert.ok(rec !== undefined);
+      rec.compatibility.unsupported = ["lspServers"];
+      await saveState(locations.extensionRoot, before);
+
+      const prevCwd = process.cwd();
+      process.chdir(cwd);
+      try {
+        const outcome = await updateSinglePlugin("hello", "mp", "project");
+        assert.equal(outcome.partition, "updated");
+        if (outcome.partition !== "updated") {
+          throw new Error("unreachable: narrowed above");
+        }
+
+        assert.equal(outcome.forceDegrade?.newlyDegraded, false);
+      } finally {
+        process.chdir(prevCwd);
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1490,15 +1876,16 @@ test("bare-form both-scopes: plugins in user + project scopes both appear in upd
         // No scope -> bare form enumerates both user and project scopes
       });
 
-      // Both scopes should be enumerated. Both plugins are up-to-date
-      // (same version in manifest as in state), so we expect an "unchanged"
-      // notification that mentions both alpha and beta.
+      // Both scopes are enumerated and both plugins are up-to-date (same version
+      // in manifest as in state). UGRM-01: a bulk (bare-form, plural) update
+      // suppresses every per-plugin `(skipped) {up-to-date}` row and drops the
+      // now-empty marketplace headers, so the cascade body is empty. UGRM-02:
+      // rather than zero output, the orchestrator emits the never-silent no-op
+      // headline `Plugin update: nothing to update` at info severity.
       assert.equal(notifications.length, 1);
       const body = notifications[0]?.message ?? "";
-      // Both plugins are up-to-date -> skipped cascade, info severity
-      assert.match(body, /up-to-date/);
-      assert.match(body, /alpha/);
-      assert.match(body, /beta/);
+      assert.equal(body, "Plugin update: nothing to update");
+      assert.equal(notifications[0]?.severity, undefined);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2859,6 +3246,389 @@ test("LIFE-01 (update): version A (no hooks) -> version B (with hooks) writes th
 
       const written = await readFile(path.join(locations.hooksDir, "hello", "hooks.json"), "utf8");
       assert.deepEqual(JSON.parse(written), newHooksJson);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── FORCE-02/03/04/05: --force degrades an unsupported CANDIDATE ──────────────
+//
+// D-65-04: `update --force` is gated on the RESOLVED CANDIDATE (the synced
+// clone's current entry), not the installed version. An `experimental
+// themes/monitors` declaration on the candidate plugin.json resolves the
+// force-degradable `unsupported` arm (no structural defect) while the
+// supported `skills/` component still materializes.
+
+/**
+ * Overwrite the candidate plugin.json so the resolver resolves the
+ * force-degradable `unsupported` arm: an `experimental` themes/monitors
+ * declaration is an unsupported component kind with no structural defect.
+ * The supported `skills/` dir is left intact so the degraded update still
+ * materializes the skill.
+ */
+async function makeCandidateUnsupported(
+  marketplaceRoot: string,
+  plugin: string,
+  version: string,
+): Promise<void> {
+  const pluginRoot = path.join(marketplaceRoot, "plugins", plugin);
+  await writeFile(
+    path.join(pluginRoot, ".claude-plugin", "plugin.json"),
+    JSON.stringify({
+      name: plugin,
+      version,
+      experimental: { themes: "./themes", monitors: "./monitors.json" },
+    }),
+  );
+}
+
+test("FORCE-02: --force on a candidate that became unsupported degrades (skill materializes, version bumps)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-force02-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.1.0", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      await makeCandidateUnsupported(seeded.marketplaceRoot, "hello", "1.1.0");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+        force: true,
+      });
+
+      // The degraded update committed: state reflects the new version and the
+      // supported skill materialized; the unsupported kinds are simply absent.
+      const after = await loadState(locations.extensionRoot);
+      const record = after.marketplaces["mp"]?.plugins["hello"];
+      assert.ok(record !== undefined);
+      assert.equal(record.version, "1.1.0");
+      assert.deepEqual([...record.resources.skills], ["hello-tool"]);
+      const skillTarget = path.join(locations.skillsTargetDir, "hello-tool", "SKILL.md");
+      assert.ok(
+        (await readFile(skillTarget, "utf8")).length > 0,
+        "supported skill must materialize",
+      );
+
+      // FSTAT-07 / D-66-04: a `--force` update whose candidate re-resolved
+      // `unsupported` reports `(force-installed)` with the ◉ glyph + the
+      // dropped-component detail (the same derived signal the list deriver
+      // reads), not `(updated)`. force-installed is a realized transition --
+      // info severity + reload-hint.
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, undefined, "force-installed is info, not error");
+      assert.equal(
+        notifications[0]?.message,
+        "● mp [project]\n" +
+          "  ◉ hello v1.1.0 (force-installed) {unsupported source}\n" +
+          "\n" +
+          "/reload to pick up changes",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("XSURF-03 / FORCE-03: without --force the force-upgradable candidate declines `(force-upgradable)` + the --force trailer at warning", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-force03-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.1.0", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      await makeCandidateUnsupported(seeded.marketplaceRoot, "hello", "1.1.0");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        // No `force` -> the candidate gate stays `requireInstallable`.
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+      });
+
+      assert.equal(notifications.length, 1);
+      const body = notifications[0]?.message ?? "";
+      // XSURF-03: the targeted no-`--force` decline of a force-upgradable
+      // candidate renders the `(force-upgradable)` token + the update-worded
+      // `--force` trailer; SEV-04 keeps the targeted decline at warning.
+      assert.match(body, /\(force-upgradable\)/);
+      assert.match(body, /Re-run with --force to update with the supported components\./);
+      assert.doesNotMatch(body, /\{no longer installable\}/);
+      assert.equal(notifications[0]?.severity, "warning");
+
+      // State untouched -- the block left the installed version in place.
+      const after = await loadState(locations.extensionRoot);
+      assert.equal(after.marketplaces["mp"]?.plugins["hello"]?.version, "1.0.0");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// SEV-04 / D-69-02 / XSURF-03: a BULK (`@marketplace`) update that skips a
+// force-upgradable candidate the user did not target is benign -> info (contrast
+// FORCE-03, the TARGETED decline that stays warning). Same `(force-upgradable)`
+// per-row token + `--force` trailer; only the severity (and the summary tally)
+// move. The SEV-04 split is now keyed on the force-upgradable STATUS arm, NOT
+// the reason string -- this pair (warning here vs FORCE-03) proves it holds.
+test("XSURF-03 / SEV-04: bulk update skipping a force-upgradable candidate -> info (untargeted decline)", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-sev04-bulk-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.1.0", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      await makeCandidateUnsupported(seeded.marketplaceRoot, "hello", "1.1.0");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        // Bulk `@mp` form -> cardinality "plural" -> the decline is benign info.
+        target: { kind: "marketplace", marketplace: "mp" },
+      });
+
+      assert.equal(notifications.length, 1);
+      const body = notifications[0]?.message ?? "";
+      // UGRM-01/UGRM-02: full-body lock. A bulk update whose only non-`updated`
+      // row is a benign info `(force-upgradable)` decline (0 updated, 0
+      // failures/warnings) renders the cascade BODY (the Phase-73 row +
+      // `--force` trailer) AND the never-silent `Plugin update: nothing to
+      // update` headline below it -- the summary line does NOT vanish. The
+      // degrade reason `{unsupported source}` is the `makeCandidateUnsupported`
+      // (experimental manifest) form sourced through `narrowUnsupportedKinds`.
+      assert.equal(
+        body,
+        "● mp [project]\n" +
+          "  ● hello v1.0.0 (force-upgradable) {unsupported source}\n" +
+          "    Re-run with --force to update with the supported components.\n" +
+          "\n" +
+          "Plugin update: nothing to update",
+      );
+      assert.doesNotMatch(body, /\{no longer installable\}/);
+      // SEV-04: a bulk (untargeted) decline is benign -> info (severity unset).
+      assert.equal(notifications[0]?.severity, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-04: the force-degrade update path emits no warning severity and no `Warning:` summary", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-force04-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.1.0", hasSkill: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+      await makeCandidateUnsupported(seeded.marketplaceRoot, "hello", "1.1.0");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+        force: true,
+      });
+
+      const warnings = notifications.filter((n) => n.severity === "warning");
+      assert.equal(warnings.length, 0, `unexpected warning rows: ${JSON.stringify(warnings)}`);
+      for (const n of notifications) {
+        assert.equal(
+          n.message.startsWith("Warning:"),
+          false,
+          `unexpected Warning: summary: ${n.message}`,
+        );
+      }
+
+      // The success row stays info-level (severity unset == info).
+      assert.equal(notifications[0]?.severity, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-05: --force cannot bypass an unavailable (non-path source) candidate", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-force05-unavail-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        // A github-flavored source resolves `unavailable` (non-path source),
+        // which `requireForceInstallable` still rejects.
+        manifestPlugins: {
+          hello: { version: "1.1.0", hasSkill: true, rawSourceOverride: "github:owner/repo" },
+        },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "mp" },
+        force: true,
+      });
+
+      assert.equal(notifications.length, 1);
+      const body = notifications[0]?.message ?? "";
+      assert.match(body, /\(skipped\) \{no longer installable\}/);
+      assert.equal(notifications[0]?.severity, "warning");
+      const after = await loadState(locations.extensionRoot);
+      assert.equal(after.marketplaces["mp"]?.plugins["hello"]?.version, "1.0.0");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FORCE-05: --force cannot bypass a missing marketplace", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-force05-nomp-"));
+    try {
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "plugin", plugin: "hello", marketplace: "ghost-mp" },
+        force: true,
+      });
+
+      // The missing-marketplace short-circuit fires BEFORE the candidate gate,
+      // so `--force` is inert here.
+      assert.equal(notifications.length, 1);
+      assert.equal(notifications[0]?.severity, "error");
+      assert.equal(
+        notifications[0]?.message,
+        "A marketplace operation has failed.\n\n⊘ ghost-mp [project] (failed) {not added}",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── UGRM-02: tally-override interaction with the warnings + force categories ──
+
+test("UGRM-02 / SEV-01: bulk @mp update of a plugin with an UNLOADED declared companion tallies `1 warning, 1 updated` -> needs attention", async () => {
+  // The realized `(updated)` row raises to WARNING because the plugin declares
+  // an agents companion (`hasAgent: true`) the probe reports unloaded
+  // (`getAllTools() -> []`). The tally-override still counts the realized
+  // transition as `1 updated`, AND the warning-severity row counts as `1
+  // warning` in the INDEPENDENT warnings category -> `1 warning, 1 updated`.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-tally-warn-"));
+    try {
+      await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: { hello: { version: "1.0.1", hasSkill: true, hasAgent: true } },
+        installedVersions: { hello: "1.0.0" },
+      });
+
+      // Default makeCtx probe (`getAllTools() -> []`) reports pi-subagents
+      // UNLOADED, so the declared-agents companion is absent -> the success row
+      // raises to warning (SEV-01).
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "mp" },
+      });
+
+      const body = notifications[0]?.message ?? "";
+      // Warning envelope -> the degraded summary line prepends `needs attention`.
+      assert.match(body, /A plugin operation needs attention\./);
+      // Tally: the warnings category (row severity) AND the updated override
+      // (realized transition) both count the single row.
+      assert.match(body, /Plugin update: 1 warning, 1 updated/);
+      assert.equal(notifications[0]?.severity, "warning");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("UGRM-02 / FSTAT-07: bulk @mp --force counts a force-installed degrade as a realized transition -> `2 updated`, no `nothing to update` headline", async () => {
+  // One clean bump + one force-degrading candidate. Both land in partition
+  // `updated` (the force-installed arm is emitted from the `updated` case), so
+  // the realized-transition count is 2. The never-silent `nothing to update`
+  // headline must be ABSENT -- a force-installed degrade IS a realized update.
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "update-tally-force-2updated-"));
+    try {
+      const seeded = await seedPathMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        marketplaceName: "mp",
+        manifestPlugins: {
+          // clean: bumps cleanly (installable candidate).
+          clean: { version: "1.0.1", hasSkill: true },
+          // degrade: candidate re-resolves `unsupported` -> `--force`
+          // degrade-updates it (force-installed), still a realized transition.
+          degrade: { version: "1.1.0", hasSkill: true },
+        },
+        installedVersions: { clean: "1.0.0", degrade: "1.0.0" },
+      });
+      await makeCandidateUnsupported(seeded.marketplaceRoot, "degrade", "1.1.0");
+
+      const { ctx, pi, notifications } = makeCtx();
+      await updatePlugins({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        target: { kind: "marketplace", marketplace: "mp" },
+        force: true,
+      });
+
+      const body = notifications[0]?.message ?? "";
+      // Both partitions are `updated` -> the tally counts 2 realized transitions.
+      assert.match(body, /Plugin update: 2 updated/);
+      // A force-installed degrade is a realized update, so the no-op headline
+      // must NOT fire.
+      assert.doesNotMatch(body, /nothing to update/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

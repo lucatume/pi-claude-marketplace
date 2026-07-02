@@ -72,8 +72,12 @@ async function withHermeticHome<T>(
       process.env.HOME = originalHome;
     }
 
-    await rm(home, { recursive: true, force: true });
-    await rm(cwd, { recursive: true, force: true });
+    // A best-effort migration persist (write-file-atomic, fired off by
+    // loadState without await) may still be renaming state.json.<rand> into
+    // place when teardown runs; retry removal so the transient tmp entry does
+    // not yield ENOTEMPTY on macOS.
+    await rm(home, { recursive: true, force: true, maxRetries: 10 });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 10 });
   }
 }
 
@@ -1142,6 +1146,153 @@ test("outcomeToCascadePluginMessage: updated outcome -> PluginUpdatedMessage wit
   // `declaresAgents: true` -> "agents" appears in dependencies;
   // `declaresMcp: false` -> "mcp" is absent.
   assert.deepEqual(msg.dependencies, ["agents"]);
+});
+
+test("SEV-03 / D-69-01: updated outcome carrying unsupportedKinds -> PluginForceInstalledMessage (force-installed), info severity, reasons narrowed", () => {
+  // The autoupdate cascade now TAKES the force path, so a candidate that
+  // re-resolved `unsupported` produces an `updated` outcome carrying
+  // `unsupportedKinds`. The marketplace mapper must render `(force-installed)`
+  // with the narrowed dropped-component reason instead of `(updated)`.
+  const outcome: PluginUpdateOutcome = {
+    partition: "updated",
+    name: "degraded-plugin",
+    fromVersion: "0.9.0",
+    toVersion: "1.0.0",
+    stagedAgents: [],
+    stagedMcpServers: [],
+    declaresAgents: false,
+    declaresMcp: false,
+    forceDegrade: { kinds: ["lspServers"], newlyDegraded: false },
+  };
+  const msg = __test_outcomeToCascadePluginMessage(outcome, "user");
+  assert.equal(msg.status, "force-installed");
+  if (msg.status !== "force-installed") {
+    throw new Error("unreachable: narrowed above");
+  }
+
+  assert.equal(msg.name, "degraded-plugin");
+  assert.equal(msg.scope, "user");
+  // `narrowUnsupportedKinds(["lspServers"])` -> the closed-set `lsp` reason.
+  assert.deepEqual(msg.reasons, ["lsp"]);
+  // Single version (the realized toVersion), no version arrow on the force row.
+  assert.equal(msg.version, "1.0.0");
+  // Task-1 default: info (the newly-degraded warning refinement lands with the
+  // prior-state read). force-installed is a realized transition -> reloads.
+  assert.equal(msg.severity, "info");
+  assert.equal(msg.needsReload, true);
+});
+
+test("SEV-03 / D-69-01: a NEWLY-degraded force outcome (newlyDegraded=true) stamps severity warning", () => {
+  const outcome: PluginUpdateOutcome = {
+    partition: "updated",
+    name: "degraded-plugin",
+    fromVersion: "0.9.0",
+    toVersion: "1.0.0",
+    stagedAgents: [],
+    stagedMcpServers: [],
+    declaresAgents: false,
+    declaresMcp: false,
+    forceDegrade: { kinds: ["lspServers"], newlyDegraded: true },
+  };
+  const msg = __test_outcomeToCascadePluginMessage(outcome, "user");
+  assert.equal(msg.status, "force-installed");
+  // A previously-clean plugin silently degraded by the auto-update is
+  // actionable -> warning (drives the `needs attention` summary line).
+  assert.equal(msg.severity, "warning");
+});
+
+test("SEV-03 / D-69-01: an ALREADY-degraded force outcome (newlyDegraded=false) stays severity info", () => {
+  const outcome: PluginUpdateOutcome = {
+    partition: "updated",
+    name: "degraded-plugin",
+    fromVersion: "0.9.0",
+    toVersion: "1.0.0",
+    stagedAgents: [],
+    stagedMcpServers: [],
+    declaresAgents: false,
+    declaresMcp: false,
+    forceDegrade: { kinds: ["lspServers"], newlyDegraded: false },
+  };
+  const msg = __test_outcomeToCascadePluginMessage(outcome, "user");
+  assert.equal(msg.status, "force-installed");
+  // Re-degrading a plugin that was already force-installed is benign -> info.
+  assert.equal(msg.severity, "info");
+});
+
+test("SEV-03: a clean updated outcome (no unsupportedKinds) still renders (updated), not force-installed", () => {
+  const outcome: PluginUpdateOutcome = {
+    partition: "updated",
+    name: "clean-plugin",
+    fromVersion: "0.9.0",
+    toVersion: "1.0.0",
+    stagedAgents: [],
+    stagedMcpServers: [],
+    declaresAgents: false,
+    declaresMcp: false,
+  };
+  const msg = __test_outcomeToCascadePluginMessage(outcome, "user");
+  assert.equal(msg.status, "updated");
+});
+
+test("SEV-03 / D-69-01: the autoupdate cascade RENDERS a force-installed child row (◉ v.. (force-installed) {lsp}) and raises the summary to `needs attention` on a newly-degraded plugin", async () => {
+  // The object-shape tests above assert `__test_outcomeToCascadePluginMessage`
+  // only; this drives the whole `updateMarketplace` cascade so the render map's
+  // `force-installed` arm (UPDATE_CONTEXT -> `forceInstalledRow`) is exercised to
+  // a byte-exact string. A candidate re-resolving `unsupported` degrades in place
+  // on the autoupdate force path -- carried on the `updated` outcome as
+  // `forceDegrade`. `newlyDegraded: true` (prior persisted `unsupported` empty)
+  // raises the row to warning, so the envelope summary reads `needs attention`.
+  await withHermeticHome(async ({ cwd }) => {
+    await seedGithubMarketplace({
+      cwd,
+      name: "auto-mp",
+      ref: "main",
+      autoupdate: true,
+      plugins: { hello: makePluginRecord() },
+    });
+    const { ctx, pi, notifications } = makeCtx();
+    const { gitOps } = makeMockGitOps({
+      remoteRefs: { "refs/remotes/origin/main": "abcdef0000000000000000000000000000000042" },
+    });
+    const pluginUpdate: PluginUpdateFn = async (plugin) =>
+      Promise.resolve<PluginUpdateOutcome>({
+        partition: "updated",
+        name: plugin,
+        fromVersion: "0.0.1",
+        toVersion: "0.0.2",
+        stagedAgents: [],
+        stagedMcpServers: [],
+        declaresAgents: false,
+        declaresMcp: false,
+        forceDegrade: { kinds: ["lspServers"], newlyDegraded: true },
+      });
+
+    await updateMarketplace({
+      ctx,
+      pi,
+      name: "auto-mp",
+      scope: "project",
+      cwd,
+      gitOps,
+      pluginUpdate,
+    });
+
+    const first = notifications[0];
+    assert.ok(first !== undefined);
+    const body = first.message;
+    // Byte-exact force-installed child row under the marketplace header. The ◉
+    // glyph, single realized version, `(force-installed)` token, and `{lsp}`
+    // dropped-component brace mirror the plugin-surface force-installed byte lock
+    // (`narrowUnsupportedKinds(["lspServers"]) -> "lsp"`). The `[project]` scope
+    // bracket is orphan-folded (plugin.scope === mp.scope).
+    const headerIdx = body.indexOf("● auto-mp [project]");
+    const rowIdx = body.indexOf("  ◉ hello v0.0.2 (force-installed) {lsp}");
+    assert.ok(headerIdx >= 0, `marketplace header missing:\n${body}`);
+    assert.ok(rowIdx > headerIdx, `force-installed child row missing/misplaced:\n${body}`);
+    // newlyDegraded -> warning envelope -> the degraded summary variant.
+    assert.equal(first.severity, "warning");
+    assert.match(body, /needs attention/);
+  });
 });
 
 test('outcomeToCascadePluginMessage: unchanged outcome -> PluginSkippedMessage with ["up-to-date"] (glyph flips to ⊘ at render time)', () => {

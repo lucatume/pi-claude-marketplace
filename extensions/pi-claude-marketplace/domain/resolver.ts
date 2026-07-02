@@ -2,7 +2,7 @@
 //
 // Plugin compatibility resolver. Returns the discriminated `ResolvedPlugin`
 // union locked by NFR-7: TypeScript refuses to compile any code that reads
-// `pluginRoot` from a non-installable variant.
+// `pluginRoot` from the structurally-broken `unavailable` variant.
 //
 // Per D-04: TWO distinct functions, no shared branching.
 //   - resolveStrict (MM-5):   union of entry + manifest + implicit + standalone
@@ -10,18 +10,24 @@
 //
 // Type.Union([...]) takes NO `discriminator` option in TypeBox 1.x.
 // Literal-tagged variants ARE the discriminator -- TypeScript narrowing
-// works automatically on `if (r.installable)`.
+// works automatically on `switch (r.state)` / `if (r.state === ...)`.
 //
-// Per D-05: use boolean-literal `installable: true | false` (PRD §6.4
-// verbatim), NOT the string-tag form (e.g. kind discriminator).
+// Per D-64-01: a three-way string-literal discriminant
+// `state: "installable" | "unsupported" | "unavailable"` (supersedes D-05's
+// boolean `installable: true | false`). `installable` and `unsupported` both
+// carry `pluginRoot` + component lists (D-64-06: `unsupported` is the
+// force-degradable arm); `unavailable` is the minimal structural-defect arm
+// and never carries `pluginRoot` (D-64-05, NFR-7). Structural precedence
+// (D-64-07): a plugin that is both structurally broken AND declares
+// unsupported component kinds resolves `unavailable`.
 //
 // HOOK-01: `hooks` is admitted alongside `skills` / `commands` / `agents` /
 // `mcpServers`. The supported-kind tuple is the PUBLIC closed set; the
 // path-validation loop iterates a PRIVATE subset (`SUPPORTED_COMPONENT_PATH_KINDS`)
 // because `hooks` carries no per-entry component-path semantics -- the
 // discovery path is the convention file `<pluginRoot>/hooks/hooks.json`,
-// parsed through `parseHooksConfig` (D-57-04: parse failure flips
-// `installable: false`).
+// parsed through `parseHooksConfig` (D-57-04: a parse failure is structural
+// and resolves `unavailable`).
 
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -32,7 +38,7 @@ import Type from "typebox";
 import { PluginShapeError } from "../shared/errors.ts";
 import { PathContainmentError, assertPathInside } from "../shared/path-safety.ts";
 
-import { parseHooksConfig, type HooksConfig } from "./components/hooks.ts";
+import { parseHooksConfig, type DroppedHook, type HooksConfig } from "./components/hooks.ts";
 import { MCP_SERVERS_VALIDATOR } from "./components/mcp.ts";
 import { PLUGIN_MANIFEST_VALIDATOR, type PluginEntry } from "./components/plugin.ts";
 import { assertSafeName } from "./name.ts";
@@ -55,10 +61,101 @@ const ComponentPathsSchema = Type.Object({
 
 const McpServersFieldSchema = Type.Record(Type.String(), Type.Unknown());
 
-const ResolvedPluginInstallableSchema = Type.Object({
-  installable: Type.Literal(true),
+// D-71-03 / PHOOK-02: the supportability-dropped hook events / matcher groups /
+// handlers carried on the installable + unsupported arms for the `info`
+// enumeration (D-71-05). Mirrors the `DroppedHook` union in
+// `domain/components/hooks.ts`; `event` is typed as a plain string here (rather
+// than the narrower `BucketAEvent`) because the resolver arm only carries the
+// enumeration for downstream rendering, not re-validation.
+const DroppedHookSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("event"), event: Type.String() }),
+  Type.Object({
+    kind: Type.Literal("group"),
+    event: Type.String(),
+    matcher: Type.String(),
+    cond: Type.Union([
+      Type.Literal("regex"),
+      Type.Literal("unmapped-tool"),
+      Type.Literal("no-matcher-support"),
+      Type.Literal("closed-set"),
+    ]),
+  }),
+  Type.Object({
+    kind: Type.Literal("handler"),
+    event: Type.String(),
+    matcher: Type.String(),
+    handlerType: Type.String(),
+  }),
+]);
+
+// TD-2: compile-time drift guard. `DroppedHookSchema` hand-redeclares the
+// `DroppedHook` union from `domain/components/hooks.ts`; this assertion fails
+// `npm run check` if the two diverge. Direction: `DroppedHook` (narrower --
+// `event: BucketAEvent` on the group/handler arms) must stay assignable to the
+// schema's static type (wider -- `event: string`). The reverse never holds
+// because the schema intentionally widens `event`, so this is the only direction
+// that compiles today.
+//
+// This `extends` alone CATCHES: a schema-side required-field addition to an
+// existing arm (the source arm then lacks that field -> not assignable), a
+// schema-side enum NARROWING (e.g. dropping a `cond` literal -> the wider source
+// `cond` is no longer assignable), and a source-side NEW arm (a union member with
+// no schema counterpart is not assignable to the schema union). It does NOT catch
+// a schema-side EXTRA arm (the schema union merely widens; `DroppedHook` stays
+// assignable to it) nor a source-side additive FIELD on an existing arm (excess
+// properties stay assignable). The per-kind key-parity guard below closes the
+// source-side-field gap.
+type _AssertTrue<T extends true> = T;
+// Exported so `noUnusedLocals` treats this compile-time drift guard as consumed
+// without a runtime `void`; the alias is never imported.
+export type _DroppedHookDriftCheck = _AssertTrue<
+  DroppedHook extends Type.Static<typeof DroppedHookSchema> ? true : false
+>;
+
+// TD-2 (strengthening): per-kind KEY parity. For each `kind`, the source arm and
+// the schema arm must carry EXACTLY the same field names -- checked in both
+// directions with tuple-wrapped `keyof` to defeat union distribution. This closes
+// the two gaps the `extends` above misses: a source-side additive field and a
+// schema-side extra arm both change the key set of some arm. Because it compares
+// KEY names only (not value types), the intentional `event` widening
+// (`BucketAEvent` vs `string`) is invisible to it -- no fight. A mismatched arm
+// yields `false`; the nested check below then collapses to `never`, so the
+// tuple-wrapped `_AssertTrue` check below (`[true] extends [never]` -> `false`)
+// fails `npm run check`. (`false` -- not `never` -- on mismatch so the `extends
+// true` chaining stays sound: `never extends true` would spuriously pass.)
+type _DroppedHookArmKeysMatch<K extends DroppedHook["kind"]> = [
+  keyof Extract<DroppedHook, { kind: K }>,
+] extends [keyof Extract<Type.Static<typeof DroppedHookSchema>, { kind: K }>]
+  ? [keyof Extract<Type.Static<typeof DroppedHookSchema>, { kind: K }>] extends [
+      keyof Extract<DroppedHook, { kind: K }>,
+    ]
+    ? true
+    : false
+  : false;
+type _DroppedHookArmKeysDrift =
+  _DroppedHookArmKeysMatch<"event"> extends true
+    ? _DroppedHookArmKeysMatch<"group"> extends true
+      ? _DroppedHookArmKeysMatch<"handler"> extends true
+        ? true
+        : never
+      : never
+    : never;
+// Exported for the same `noUnusedLocals` reason as `_DroppedHookDriftCheck`.
+export type _DroppedHookArmKeysCheck = _AssertTrue<
+  [true] extends [_DroppedHookArmKeysDrift] ? true : false
+>;
+
+// The field set shared by the two force-materializable arms -- `installable`
+// and the force-degradable `unsupported` (D-64-06). Both carry `pluginRoot`
+// plus the full component payload; only the `state` discriminant differs.
+// Extracted into one bag and spread into both schemas so the two arms stay
+// token-identical by construction (spreading `state` first keeps the literal
+// discriminant on each arm; TypeBox key order does not affect the static type).
+const MATERIALIZABLE_FIELDS = {
   name: Type.String(),
-  pluginRoot: Type.String(), // ONLY on installable variant (NFR-7)
+  // pluginRoot is present on installable + unsupported only (NFR-7); D-64-06
+  // lets force degrade the unsupported parts, so both arms expose it.
+  pluginRoot: Type.String(),
   supported: Type.Array(Type.String()),
   unsupported: Type.Array(Type.String()),
   notes: Type.Array(Type.String()),
@@ -66,8 +163,7 @@ const ResolvedPluginInstallableSchema = Type.Object({
   mcpServers: McpServersFieldSchema,
   // HOOK-01: relative path of the discovered hooks/hooks.json when the
   // convention-file probe found a parseable file. Undefined when no hooks
-  // file exists on disk or when parse failed (the not-installable variant
-  // also carries this marker -- see schema below).
+  // file exists on disk or when parse failed.
   hooksConfigPath: Type.Optional(Type.String()),
   // SURF-05 / D-63-08: true iff the parsed hooks.json contains at least one
   // handler declaring `rewakeMessage` or `rewakeSummary` WITHOUT
@@ -76,38 +172,61 @@ const ResolvedPluginInstallableSchema = Type.Object({
   // pushes `"orphan rewake"` into `reasons[]`; the resolver only provides
   // the source data and does NOT emit any user-facing surface itself.
   orphanRewake: Type.Optional(Type.Boolean()),
+  // D-71-03 / PHOOK-02: the supportability-dropped hook handlers, present when
+  // the hooks.json parsed but at least one event / matcher group / handler was
+  // unsupportable. Threaded for the `info` enumeration (D-71-05). Absent when
+  // no hooks.json exists, the parse failed structurally, or nothing dropped.
+  droppedHooks: Type.Optional(Type.Array(DroppedHookSchema)),
+} as const;
+
+const ResolvedPluginInstallableSchema = Type.Object({
+  state: Type.Literal("installable"),
+  ...MATERIALIZABLE_FIELDS,
 });
 
-const ResolvedPluginNotInstallableSchema = Type.Object({
-  installable: Type.Literal(false),
+// D-64-06: the force-degradable arm. Shape-identical to `installable` (carries
+// `pluginRoot` + the full component payload) so the force-install path
+// (a later phase) and the info-surface unsupported-row enumeration can read
+// the same fields; only the `state` tag differs. The declared/discovered
+// unsupported component kinds live in `unsupported[]` with their `contains
+// <kind>` markers in `notes[]`.
+const ResolvedPluginUnsupportedSchema = Type.Object({
+  state: Type.Literal("unsupported"),
+  ...MATERIALIZABLE_FIELDS,
+});
+
+// D-64-05: the minimal structural-defect arm. Carries ONLY `state`, `name`,
+// and the structural `notes`. `pluginRoot` is intentionally absent (NFR-7,
+// compile-enforced -- force can never reach the filesystem root of a
+// structurally-broken plugin); the component lists / `componentPaths` /
+// `mcpServers` / `hooksConfigPath` / `orphanRewake` are dropped because they
+// cannot be reliably enumerated once the manifest/structure is broken.
+const ResolvedPluginUnavailableSchema = Type.Object({
+  state: Type.Literal("unavailable"),
   name: Type.String(),
-  supported: Type.Array(Type.String()),
-  unsupported: Type.Array(Type.String()),
-  notes: Type.Array(Type.String()), // PR-3: contains "contains <name>" entries
-  componentPaths: ComponentPathsSchema,
-  mcpServers: McpServersFieldSchema,
-  // HOOK-01: symmetric with the installable variant so downstream
-  // consumers can read the marker without narrowing on `installable`.
-  hooksConfigPath: Type.Optional(Type.String()),
-  // SURF-05 / D-63-08: symmetric with the installable variant. The
-  // resolver writes this flag only on the parseHooksConfig success branch;
-  // a not-installable plugin (e.g. unsupported-hooks parse failure) never
-  // reaches install row composition, so the flag is effectively unused on
-  // the not-installable arm. Kept symmetric so downstream consumers can
-  // read `r.orphanRewake` without narrowing on `installable`.
-  orphanRewake: Type.Optional(Type.Boolean()),
+  notes: Type.Array(Type.String()), // structural reasons
   // pluginRoot intentionally absent -- NFR-7 enforces non-readability
 });
 
 /** Literal-tagged variants ARE the discriminator. NO options arg. */
 export const ResolvedPluginSchema = Type.Union([
   ResolvedPluginInstallableSchema,
-  ResolvedPluginNotInstallableSchema,
+  ResolvedPluginUnsupportedSchema,
+  ResolvedPluginUnavailableSchema,
 ]);
 
 export type ResolvedPluginInstallable = Type.Static<typeof ResolvedPluginInstallableSchema>;
-export type ResolvedPluginNotInstallable = Type.Static<typeof ResolvedPluginNotInstallableSchema>;
+export type ResolvedPluginUnsupported = Type.Static<typeof ResolvedPluginUnsupportedSchema>;
+export type ResolvedPluginUnavailable = Type.Static<typeof ResolvedPluginUnavailableSchema>;
 export type ResolvedPlugin = Type.Static<typeof ResolvedPluginSchema>;
+
+// NFR-7: the force-materializable union. It names exactly the two arms that
+// carry `pluginRoot` + the full component payload -- `installable` and the
+// force-degradable `unsupported` (D-64-06) -- and EXCLUDES `unavailable`, so
+// no consumer that widens a holder to this union can read `pluginRoot` off a
+// structurally-broken plugin. This is exactly the type `requireForceInstallable`
+// narrows to, and the type the force install/update holders accept.
+export type MaterializablePlugin = ResolvedPluginInstallable | ResolvedPluginUnsupported;
 type StatKind = "file" | "dir" | null;
 type StatKindReader = (p: string) => Promise<StatKind>;
 
@@ -226,6 +345,13 @@ interface PartialResolution {
   // or no handler is orphaned. The cascade-wiring path reads this on the
   // installable variant.
   orphanRewake?: boolean;
+  // D-71-03 / PHOOK-02: set by `applyHooksConfig` on a successful parse whose
+  // partition dropped at least one unsupportable event / matcher group /
+  // handler. Routed alongside the `"hooks"` push into `partial.unsupported`,
+  // so a partial-hook plugin resolves `unsupported` (force-degradable) while
+  // its supported handlers still materialize. Absent when no hooks.json
+  // exists, the parse failed structurally, or nothing dropped.
+  droppedHooks?: DroppedHook[];
 }
 
 function emptyResolution(): PartialResolution {
@@ -241,31 +367,28 @@ function emptyResolution(): PartialResolution {
   };
 }
 
-function notInstallable(
-  name: string,
-  partial: PartialResolution,
-  additionalNotes: string[] = [],
-): ResolvedPluginNotInstallable {
+// D-64-05: the minimal structural-defect arm. Takes only the structural
+// notes; never spreads `pluginRoot` / component lists / `componentPaths` /
+// `mcpServers` so NFR-7 holds by construction.
+function unavailable(name: string, notes: string[]): ResolvedPluginUnavailable {
   return {
-    installable: false,
+    state: "unavailable",
     name,
-    supported: partial.supported,
-    unsupported: partial.unsupported,
-    notes: [...partial.notes, ...additionalNotes],
-    componentPaths: partial.componentPaths,
-    mcpServers: partial.mcpServers,
-    ...(partial.hooksConfigPath !== undefined && { hooksConfigPath: partial.hooksConfigPath }),
-    ...(partial.orphanRewake !== undefined && { orphanRewake: partial.orphanRewake }),
+    notes,
   };
 }
 
-function installable(
+// The non-discriminant payload shared by the two force-materializable arms.
+// Because `ResolvedPluginInstallable` and `ResolvedPluginUnsupported` differ
+// ONLY in `state`, `Omit<..., "state">` is the same structural type for both,
+// so each constructor re-adds its own `state` literal and keeps its precise
+// discriminated-union return type with no cast.
+function materializableFields(
   name: string,
   pluginRoot: string,
   partial: PartialResolution,
-): ResolvedPluginInstallable {
+): Omit<ResolvedPluginInstallable, "state"> {
   return {
-    installable: true,
     name,
     pluginRoot,
     supported: partial.supported,
@@ -275,7 +398,26 @@ function installable(
     mcpServers: partial.mcpServers,
     ...(partial.hooksConfigPath !== undefined && { hooksConfigPath: partial.hooksConfigPath }),
     ...(partial.orphanRewake !== undefined && { orphanRewake: partial.orphanRewake }),
+    ...(partial.droppedHooks !== undefined && { droppedHooks: partial.droppedHooks }),
   };
+}
+
+function installable(
+  name: string,
+  pluginRoot: string,
+  partial: PartialResolution,
+): ResolvedPluginInstallable {
+  return { state: "installable", ...materializableFields(name, pluginRoot, partial) };
+}
+
+// D-64-06: the force-degradable arm. Identical payload to `installable`
+// (including `pluginRoot`); only the `state` tag differs.
+function unsupported(
+  name: string,
+  pluginRoot: string,
+  partial: PartialResolution,
+): ResolvedPluginUnsupported {
+  return { state: "unsupported", ...materializableFields(name, pluginRoot, partial) };
 }
 
 function nestedExperimentalValue(
@@ -410,7 +552,11 @@ async function readManifest(
  * Steps 1-6 are shared between resolveStrict and resolveLoose. Returns
  * either:
  *   - { kind: "ok", pluginRoot, manifest, partial } -- proceed to mode-specific steps
- *   - { kind: "notInstallable", result }            -- short-circuit
+ *   - { kind: "unavailable", result }               -- structural short-circuit
+ *
+ * D-64-07: every preflight short-circuit (bad source kind, path escape,
+ * missing dir, malformed plugin.json) is a STRUCTURAL defect and resolves
+ * `unavailable`.
  */
 async function preflightStages(
   entry: PluginEntry,
@@ -422,7 +568,7 @@ async function preflightStages(
       manifest: Record<string, unknown> | null;
       partial: PartialResolution;
     }
-  | { kind: "notInstallable"; result: ResolvedPluginNotInstallable }
+  | { kind: "unavailable"; result: ResolvedPluginUnavailable }
 > {
   const partial = emptyResolution();
   // Caller bug if name validation throws -- entry came through PLUGIN_ENTRY_VALIDATOR.
@@ -435,8 +581,8 @@ async function preflightStages(
   const unsupportedReason = sourceUnsupportedReason(parsedSource);
   if (unsupportedReason !== undefined) {
     return {
-      kind: "notInstallable",
-      result: notInstallable(entry.name, partial, [unsupportedReason]),
+      kind: "unavailable",
+      result: unavailable(entry.name, [...partial.notes, unsupportedReason]),
     };
   }
 
@@ -446,16 +592,19 @@ async function preflightStages(
 
   if (escapeReason !== undefined) {
     return {
-      kind: "notInstallable",
-      result: notInstallable(entry.name, partial, [escapeReason]),
+      kind: "unavailable",
+      result: unavailable(entry.name, [...partial.notes, escapeReason]),
     };
   }
 
   // PR-2 case 3: source dir does not exist.
   if ((await statKindOf(ctx)(pluginRoot)) !== "dir") {
     return {
-      kind: "notInstallable",
-      result: notInstallable(entry.name, partial, [`source dir does not exist: ${pluginRoot}`]),
+      kind: "unavailable",
+      result: unavailable(entry.name, [
+        ...partial.notes,
+        `source dir does not exist: ${pluginRoot}`,
+      ]),
     };
   }
 
@@ -463,8 +612,8 @@ async function preflightStages(
   const manifestResult = await readManifest(ctx, pluginRoot);
   if (!manifestResult.ok) {
     return {
-      kind: "notInstallable",
-      result: notInstallable(entry.name, partial, [manifestResult.reason]),
+      kind: "unavailable",
+      result: unavailable(entry.name, [...partial.notes, manifestResult.reason]),
     };
   }
 
@@ -499,7 +648,8 @@ function readPathOrArray(value: unknown): readonly unknown[] {
 /**
  * Validate a single component-path ELEMENT. Returns `{ ok: true, relative }`
  * on success (caller adds to componentPaths + supported), or
- * `{ ok: false, reason }` on failure (caller adds note + flips notInstallable).
+ * `{ ok: false, reason }` on failure (caller adds note + feeds the structural
+ * `dirty` accumulator, so `decideResolution` resolves `unavailable`).
  *
  * D-07 narrowing: the resolver accepts a top-level array of strings as
  * legal input (the schema is `Type.Array(Type.String())`). Callers MUST
@@ -670,7 +820,8 @@ async function readStandaloneHooks(
   ctx: ResolveContext,
   pluginRoot: string,
 ): Promise<
-  { ok: true; value?: HooksConfig; relativePath?: string } | { ok: false; reason: string }
+  | { ok: true; value?: HooksConfig; relativePath?: string; dropped?: readonly DroppedHook[] }
+  | { ok: false; reason: string }
 > {
   const hooksPath = path.join(pluginRoot, "hooks", "hooks.json");
   if ((await statKindOf(ctx)(hooksPath)) !== "file") {
@@ -701,7 +852,16 @@ async function readStandaloneHooks(
     return { ok: false, reason: `malformed hooks.json: ${parsed.reason}` };
   }
 
-  return { ok: true, value: parsed.value, relativePath: path.join("hooks", "hooks.json") };
+  // D-71-03 / PHOOK-02: forward `parsed.dropped` so `applyHooksConfig` can
+  // route supportability drops to `partial.unsupported` + `partial.droppedHooks`.
+  // `parsed.value` is the FILTERED supported subset (possibly `{}` for the
+  // Q2 empty-subset edge); the caller decides whether to materialize it.
+  return {
+    ok: true,
+    value: parsed.value,
+    relativePath: path.join("hooks", "hooks.json"),
+    dropped: parsed.dropped,
+  };
 }
 
 /**
@@ -737,15 +897,26 @@ function detectOrphanRewake(parsed: HooksConfig): boolean {
 
 /**
  * HOOK-01 + D-57-04 wiring helper. Probe `hooks/hooks.json`, update the
- * partial resolution, and report whether the result flips installability.
- * Mode-agnostic: both `resolveStrict` and `resolveLoose` call this
- * unchanged (D-57-04 parse-failure semantics do not depend on
+ * partial resolution, and report whether the result feeds the STRUCTURAL
+ * dirty accumulator. Mode-agnostic: both `resolveStrict` and `resolveLoose`
+ * call this unchanged (parse-failure semantics do not depend on
  * entry-vs-manifest declaration mode).
  *
- * SURF-05 / D-63-08: on the parse-SUCCESS branch only, also writes
- * `partial.orphanRewake` from `detectOrphanRewake(parsed)`. The
- * parse-FAILURE branch never sets the flag -- those plugins are flipped
- * `installable: false` upstream and never reach install row composition.
+ * D-71-03 / PHOOK-02 / PHOOK-03: the verdict is now THREE-way, not two.
+ *   - STRUCTURAL failure (invalid JSON S1, schema mismatch S2, or the X1
+ *     table-desync programmer bug) -> push the reason note and return `true`
+ *     so `decideResolution` resolves `unavailable` (structural precedence,
+ *     D-64-07). UNCHANGED arm.
+ *   - SUPPORTABILITY drops on an otherwise-parseable config -> route the
+ *     dropped signal to `partial.unsupported` (kind "hooks") +
+ *     `partial.droppedHooks`, NEVER the structural dirty accumulator, so the
+ *     plugin resolves `unsupported` (force-degradable).
+ *   - The KEPT handlers (the filtered non-empty subset) still materialize:
+ *     push "hooks" to `partial.supported` + record `hooksConfigPath`.
+ *
+ * SURF-05 / D-63-08: on the materialized-subset branch only, writes
+ * `partial.orphanRewake` from `detectOrphanRewake` over the FILTERED subset,
+ * so a dropped handler's orphan-rewake field cannot raise a false marker.
  */
 async function applyHooksConfig(
   ctx: ResolveContext,
@@ -753,23 +924,38 @@ async function applyHooksConfig(
   partial: PartialResolution,
 ): Promise<boolean> {
   const hooksResult = await readStandaloneHooks(ctx, pluginRoot);
+  // D-57-04 / D-64-07: a STRUCTURAL parse failure feeds the structural dirty
+  // accumulator and resolves `unavailable` (structural precedence). Unchanged.
   if (!hooksResult.ok) {
     partial.notes.push(hooksResult.reason);
     return true;
   }
 
-  if (hooksResult.value !== undefined) {
+  // D-71-03 / PHOOK-02: a successful parse may still carry supportability
+  // drops. Route that signal to `partial.unsupported` (kind "hooks") +
+  // `partial.droppedHooks` so `decideResolution` returns `unsupported`. This
+  // mirrors `addUnsupportedKindNotes`, which pushes to `partial.unsupported`;
+  // the dropped-hooks signal NEVER increments the structural dirty accumulator.
+  if (hooksResult.dropped !== undefined && hooksResult.dropped.length > 0) {
+    partial.unsupported.push("hooks");
+    partial.droppedHooks = [...hooksResult.dropped];
+  }
+
+  // D-71-03 / Q2: materialize the KEPT handlers only when the filtered subset
+  // is non-empty. A Stop-only config (every handler dropped) filters to `{}`
+  // -> stage nothing, set no hooksConfigPath, run no orphan probe; the
+  // `droppedHooks` push above still routes it `unsupported`.
+  if (hooksResult.value !== undefined && Object.keys(hooksResult.value).length > 0) {
     partial.supported.push("hooks");
     if (hooksResult.relativePath !== undefined) {
       partial.hooksConfigPath = hooksResult.relativePath;
     }
 
-    // SURF-05 / D-63-08: only SET the flag when true (mirror hooksConfigPath
-    // discipline). Absent-vs-false is intentional: a hooks.json with no
-    // orphan handler leaves `partial.orphanRewake` undefined, the
-    // constructor spread (`partial.orphanRewake !== undefined && { ... }`)
-    // omits the field on the ResolvedPlugin, and consumers read
-    // `r.orphanRewake === true`.
+    // SURF-05 / D-63-08: `detectOrphanRewake` runs over the FILTERED
+    // subset only. Only SET the flag when true (mirror hooksConfigPath
+    // discipline). Absent-vs-false is intentional: a config with no orphan
+    // handler leaves `partial.orphanRewake` undefined, the constructor spread
+    // omits the field, and consumers read `r.orphanRewake === true`.
     if (detectOrphanRewake(hooksResult.value)) {
       partial.orphanRewake = true;
     }
@@ -904,12 +1090,15 @@ export async function resolveStrict(
 ): Promise<ResolvedPlugin> {
   const pre = await preflightStages(entry, ctx);
 
-  if (pre.kind === "notInstallable") {
+  if (pre.kind === "unavailable") {
     return pre.result;
   }
 
   const { pluginRoot, manifest, partial } = pre;
-  let dirty = false; // any "notInstallable" reason found in steps 7-9
+  // D-64-07: `dirty` is the STRUCTURAL accumulator (component-path /
+  // mcp / hooks defects). The unsupported-component signal lives
+  // separately in `partial.unsupported` -- see the decision below.
+  let dirty = false;
 
   // Step 7 (MM-5 + D-07/COMP-01): component paths are the UNION of declared
   // (entry > manifest order) + implicit-by-convention. Implicit-by-convention
@@ -938,15 +1127,40 @@ export async function resolveStrict(
   // Step 9 (PR-3 / PR-4): unsupported components declared explicitly or via
   // Claude Code default locations (.lsp.json, monitors/monitors.json, etc.).
   // `hooks` is no longer in UNSUPPORTED_COMPONENT_KINDS -- HOOK-01 admission
-  // is owned by step 8b.
-  dirty = (await addUnsupportedKindNotes(entry, manifest, pluginRoot, ctx, partial)) || dirty;
+  // is owned by step 8b. D-64-07: this signal does NOT feed `dirty` (it is
+  // not a structural defect); it is read separately via `partial.unsupported`
+  // in the decision below.
+  await addUnsupportedKindNotes(entry, manifest, pluginRoot, ctx, partial);
 
   // Step 10 (PR-5): dependencies stay installable but get a note.
   if ((entry as Record<string, unknown>).dependencies !== undefined) {
     partial.notes.push(`declares dependencies that must be installed manually`);
   }
 
-  return dirty ? notInstallable(entry.name, partial) : installable(entry.name, pluginRoot, partial);
+  return decideResolution(entry.name, pluginRoot, partial, dirty);
+}
+
+/**
+ * D-64-01 / D-64-07: the three-way decision shared by both modes. Structural
+ * precedence -- a structural defect (`structuralDirty`) wins over any
+ * unsupported-component signal, so a both-defects plugin resolves
+ * `unavailable` and never leaks `pluginRoot` through the `unsupported` arm.
+ */
+function decideResolution(
+  name: string,
+  pluginRoot: string,
+  partial: PartialResolution,
+  structuralDirty: boolean,
+): ResolvedPlugin {
+  if (structuralDirty) {
+    return unavailable(name, partial.notes);
+  }
+
+  if (partial.unsupported.length > 0) {
+    return unsupported(name, pluginRoot, partial);
+  }
+
+  return installable(name, pluginRoot, partial);
 }
 
 /**
@@ -958,11 +1172,12 @@ export async function resolveLoose(
 ): Promise<ResolvedPlugin> {
   const pre = await preflightStages(entry, ctx);
 
-  if (pre.kind === "notInstallable") {
+  if (pre.kind === "unavailable") {
     return pre.result;
   }
 
   const { pluginRoot, manifest, partial } = pre;
+  // D-64-07: structural accumulator only (see resolveStrict).
   let dirty = false;
 
   // Step 7 (MM-6 entry-only, D-07 array shape): no implicit-by-convention;
@@ -984,15 +1199,16 @@ export async function resolveLoose(
   // hooks-dispatch work; here the convention file is the sole gate.
   dirty = (await applyHooksConfig(ctx, pluginRoot, partial)) || dirty;
 
-  // Step 9 (PR-3 / PR-4): unsupported components -- same as strict.
-  dirty = (await addUnsupportedKindNotes(entry, manifest, pluginRoot, ctx, partial)) || dirty;
+  // Step 9 (PR-3 / PR-4): unsupported components -- same as strict. D-64-07:
+  // side-effect only (does not feed `dirty`); read via `partial.unsupported`.
+  await addUnsupportedKindNotes(entry, manifest, pluginRoot, ctx, partial);
 
   // Step 10 (PR-5): dependencies stay installable but get a note.
   if ((entry as Record<string, unknown>).dependencies !== undefined) {
     partial.notes.push(`declares dependencies that must be installed manually`);
   }
 
-  return dirty ? notInstallable(entry.name, partial) : installable(entry.name, pluginRoot, partial);
+  return decideResolution(entry.name, pluginRoot, partial, dirty);
 }
 
 /**
@@ -1008,7 +1224,7 @@ export function requireInstallable(
   r: ResolvedPlugin,
   op: "install" | "update" = "install",
 ): asserts r is ResolvedPluginInstallable {
-  if (r.installable) {
+  if (r.state === "installable") {
     return;
   }
 
@@ -1016,5 +1232,46 @@ export function requireInstallable(
     kind: op === "update" ? "no-longer-installable" : "not-installable",
     plugin: r.name,
     reasons: r.notes,
+    // SEV-02 / D-69-03: `unsupported` is force-degradable; `unavailable` is
+    // a structural defect force cannot help -- carry the distinction the
+    // render row uses to condition the `--force` hint.
+    forceable: r.state === "unsupported",
+    // IN-02 / RSTATE-05: thread the typed unsupported-kind list so the
+    // failure-row composer renders per-kind markers (e.g. `unsupported hooks`)
+    // via the same `narrowUnsupportedKinds` path `list`/`info` use. Only the
+    // `unsupported` arm carries the field; `unavailable` keeps an empty list so
+    // its structural reasons stay sourced from `notes` (unchanged).
+    unsupportedKinds: r.state === "unsupported" ? r.unsupported : [],
+  });
+}
+
+/**
+ * D-64-04 (RSTATE-04): the `--force` narrowing gate. Admits both
+ * `installable` and `unsupported` (force can degrade the unsupported parts)
+ * but still rejects `unavailable` (structural defect -- force cannot help,
+ * NFR-7). Throw shape mirrors `requireInstallable`; `r.notes` exists on all
+ * three arms so `reasons` compiles.
+ *
+ * BFILL-01: the reinstall primitive (orchestrators/plugin/reinstall.ts) resolves
+ * through this gate so it can re-materialize a force-installed (`unsupported`)
+ * plugin in place. The `--force` install/update flag plumbing lands in a
+ * later phase.
+ */
+export function requireForceInstallable(
+  r: ResolvedPlugin,
+  op: "install" | "update" = "install",
+): asserts r is ResolvedPluginInstallable | ResolvedPluginUnsupported {
+  if (r.state === "installable" || r.state === "unsupported") {
+    return;
+  }
+
+  throw new PluginShapeError({
+    kind: op === "update" ? "no-longer-installable" : "not-installable",
+    plugin: r.name,
+    reasons: r.notes,
+    // SEV-02 / D-69-03: this gate only ever throws for `unavailable`
+    // (`installable`/`unsupported` return above), which force cannot help --
+    // never forceable.
+    forceable: false,
   });
 }

@@ -1,17 +1,19 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.13
-milestone_name: Claude Hook Bridge
+milestone: force-install
+milestone_name: "Force Install"
 status: Awaiting next milestone
-stopped_at: Completed 63-05-PLAN.md (SURF-01)
-last_updated: "2026-06-19T15:05:39.561Z"
-last_activity: 2026-06-19 — Milestone v1.13 completed and archived
+stopped_at: force-install milestone closed and archived 2026-07-02; shipped as 0.7.0 via PR #77
+last_updated: "2026-07-02T02:05:50.034Z"
+last_activity: 2026-07-02
+last_activity_desc: Milestone force-install completed and archived
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 32
-  completed_plans: 32
+  total_phases: 12
+  completed_phases: 12
+  total_plans: 33
+  completed_plans: 33
   percent: 100
+current_phase: 74
 ---
 
 # Project State
@@ -20,20 +22,20 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-06-08)
 
-**Core value:** A Pi user can run `/claude:plugin install <plugin>@<marketplace>` and, after `/reload`, have every supported Claude plugin component appear as a working Pi-native artefact -- atomically, recoverably, and with soft-dependency degradation that never blocks the install. **Current focus:** Phase 63 — lifecycle-cascade-user-facing-surface-docs
+**Core value:** A Pi user can run `/claude:plugin install <plugin>@<marketplace>` and, after `/reload`, have every supported Claude plugin component appear as a working Pi-native artefact -- atomically, recoverably, and with soft-dependency degradation that never blocks the install. **Current focus:** Phase 74 — bulk-update-grammar-refinement
 
 ## Current Position
 
-Phase: Milestone v1.13 complete
+Phase: Milestone force-install complete
 Plan: —
 Status: Awaiting next milestone
-Last activity: 2026-06-19 — Milestone v1.13 completed and archived
+Last activity: 2026-07-02 — Milestone force-install completed and archived
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 217 (sum of recorded phase counts below; some early v1.0-v1.2 phases were archived without a recorded plan count)
+- Total plans completed: 240 (sum of recorded phase counts below; some early v1.0-v1.2 phases were archived without a recorded plan count)
 
 **Plans by phase:**
 
@@ -129,10 +131,32 @@ Last activity: 2026-06-19 — Milestone v1.13 completed and archived
 | Phase 63 PP05 | 25min | 2 tasks | 2 files |
 | Phase 63 P04 | 55min | 4 tasks | 13 files |
 | Phase 63 P08 | ~35m | 2 tasks | 3 files |
+| Phase 64 P64-01 | 32 | 3 tasks | 18 files |
+| Phase 64 P64-02 | ~20m | 2 tasks | 5 files |
+| Phase 66 P01 | ~30m | 2 tasks | 9 files |
+| Phase 66 P02 | 25m | 2 tasks | 3 files |
+| Phase 66 P03 | 45m | 2 tasks | 10 files |
+| Phase 66 P04 | 55min | 2 tasks | 5 files |
+| Phase 68 P01 | 11min | 2 tasks | 4 files |
+| Phase 68 P02 | 18m | 2 tasks | 3 files |
+| Phase 68 P03 | 6min | 2 tasks | 4 files |
+| Phase 68 P04 | 14min | 2 tasks | 3 files |
+| Phase 69 P01 | 40min | 2 tasks | 7 files |
+| Phase 69 P69-02 | ~75min | 2 tasks | 7 files |
+| Phase 69 P69-03 | ~70min | 2 tasks | 8 files |
+| Phase 69 P04 | ~35min | 1 tasks | 6 files |
+| Phase 71 P01 | 22 | 2 tasks | 6 files |
+| Phase 71 P02 | 12min | 2 tasks | 2 files |
+| Phase 71 P03 | 16min | 2 tasks | 8 files |
+| Phase 71 P4 | 17min | 2 tasks | 4 files |
+| Phase 73 P01 | 28min | 3 tasks | 14 files |
+| Phase 74 P01 | 23min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
 ### Roadmap Evolution
+
+- force-install roadmap (2026-06-27): 7 phases (64-70) created by `gsd-roadmapper`, continuing phase numbering from v1.13 Phase 63 (NOT reset to 1). All 30 requirements mapped exactly once following the brownfield dependency order: RSTATE-01..05 -> Phase 64 (Resolver Three-Way State -- the `installable`/`unsupported`/`unavailable` foundation + `requireInstallable`/`requireForceInstallable` gates + per-kind unsupported reasons; everything downstream depends on this landing first); FORCE-01..05 -> Phase 65 (Force Install & Update -- degrade-not-block on `unsupported`, hard failures still block, no `Warning:` in any force path; depends on the `requireForceInstallable` gate + `unsupported` arm carrying `pluginRoot`); FSTAT-01..07 -> Phase 66 (Derived Force-State, Glyphs & Force-Upgradability -- `force-installed` ◉ / `force-upgradable` ●, will-force preview tokens, info detail; derived, no persisted flag); LIST-01..02 + RINST-01 -> Phase 67 (List Filters, Completion & Reinstall Repair -- `--unsupported` filter + force completion sets, plus reinstall dropping `--force` to always-overwrite; both surface changes grouped as they depend on the FSTAT-derived states); BFILL-01..02 -> Phase 68 (Load-Time Backfill -- re-materialize via reinstall semantics gated on the new `lastReconciledExtensionVersion` state.json stamp; depends on RSTATE + the Phase 67 always-overwrite reinstall path); SEV-01..05 -> Phase 69 (Force-Path Severity -- wires the force-specific severities onto the already-shipped caller-stamped/desired-state notification model, including the unsupported-vs-unavailable error split; depends on FSTAT for the force rows); DOC-01..03 -> Phase 70 (Spec & Documentation Reconcile -- PRD §11 + output-catalog + messaging-style-guide reconciled to the final frozen token set; closing phase). 7 phases sits within standard granularity (5-8). LIST and RINST combined into one surface-changes phase rather than split into two thin phases. Force-state is DERIVED throughout -- the v1.15-era persisted `forceInstalled` sticky flag is out of scope (built and removed; do not rebuild). The byte-level output contract (docs/output-catalog.md, docs/messaging-style-guide.md, PRD §11) is the source of truth for every user-visible-output phase.
 
 - Phase 14.1 inserted after Phase 14: Close gap: CMC-13 -- propagate declaresAgents/Mcp through import cascade rows (URGENT)
 - Phase 14.2 inserted after Phase 14: Address tech debt: CR-01 + retroactive Phase 12 / 14.1 gates (URGENT)
@@ -146,6 +170,8 @@ Last activity: 2026-06-19 — Milestone v1.13 completed and archived
 - v1.11 roadmap (2026-06-08): 1 phase (Phase 50) created by `gsd-roadmapper`, continuing phase numbering from v1.10 Phase 49 (NOT reset to 1). All 5 v1.11 requirements mapped to Phase 50 (Notification Summary-Line Grammar): GRAM-01..05. Single-phase by design -- this is a focused, single-category notification-grammar correctness fix where every requirement converges on one `shared/notify.ts` seam plus a lockstep catalog/fixture byte-rewrite; not over-decomposed. NO split into a type/path-unification wave before the byte-rewrite: the catalog-uat byte-equality gate would go RED between a unification commit and the corrected fixtures, so the `dispatchInfoMessage`/`buildSummaryLine` unification, the failed-subject summary, the new grammar-invariant test, and the corrected `docs/output-catalog.md` (~6 sections) + `catalog-uat` fixtures must land atomically (the v1.3 atomic-supersession lesson, re-applied). Output correction only -- no new commands/flags/REASONS/row bytes; severity routing (`computeSeverity`) and info-severity surfaces unchanged (REQUIREMENTS Out of Scope). Root cause: `dispatchInfoMessage` emits error/warning-severity standalone kinds (`marketplace-not-added`, failed `plugin-info`) body-only -- never prepending `buildSummaryLine` (which returns `""` for them) -- while the cascade arm emits `{summary}\n\n{body}`; the v1.10 catalog encoded the violation as GREEN.
 
 - v1.12 roadmap (2026-06-09): 6 phases (51-56) created by `gsd-roadmapper`, continuing phase numbering from v1.11 Phase 50 (NOT reset to 1). All 24 v1.12 requirements mapped exactly once: CFG-01/02/03 + SPLIT-01/02 -> Phase 51 (Config Schema, Persistence & State Split -- typebox CONFIG_SCHEMA + loadConfig/saveConfig seam mirroring state-io, entry-level base+local merge -> MergedConfig, the absent/unparseable/valid trichotomy that aborts on bad input rather than reading it as empty desired-state, and the STATE_SCHEMA field-relocation that carves desired/user-settings fields out of state.json into the config; ownership-split write seams enforced by architecture test + NFR-10 containment extension); MIG-01/02 -> Phase 52 (First-Run Migration -- generate-only, atomic, idempotent, lossless incl. soft-degraded entries; migrate-before-reconcile ordering rail; migrate-then-reconcile no-op exit gate); DIFF-01/02 -> Phase 53 (Pure Reconcile Planner & Dry-Run Preview -- the pure bidirectional planReconcile foundation colocated with its first user-observable consumer, the read-only no-network/no-write diff command, since DIFF depends on the planner existing and a standalone planner phase would have task-shaped not user-observable criteria; locked subject-first row grammar, any pending-tense tokens land in lockstep with catalog + byte-UAT fixtures); ENBL-01/02/03/04 -> Phase 54 (Enable/Disable Commands -- autoupdate/noautoupdate command shape, disabled keeps config entry + version pin with artefacts not materialized, enable re-materializes from cache no-network NFR-5, three orthogonal facts declared/enabled/available kept distinct on list/info; depends on the Phase 51 state split); RECON-01..06 -> Phase 55 (Load-Time Reconcile Apply, Notification & Wiring -- the highest-integration phase: provenance-scoped add/remove at resources_discover before aggregateDiscoveredResources, per-entry network soft-fail never crossing the boundary NFR-5, reconcile cascade through the existing notify/emitWithSummary seam with NO /reload hint, fixed-point convergence, and cross-process lock coverage of the internal file; depends on the Phase 53 planner AND Phase 54 enable/disable; carries the research-flagged notify-sink feasibility spike since resources_discover has no ctx/pi today); WB-01/02/03/04 + CFG-04 -> Phase 56 (Write-Back Integration & Documentation -- the broadest mechanical surface, landing last on a frozen foundation: targeted entry-level patch re-read under the scope lock inside each command's existing withLockedStateTransaction closure, --local targets the local file and never touches base, import/bootstrap batched multi-entry patch under one lock, plus the README .local gitignore convention; depends on the Phase 51 persistence seam and the Phase 55 apply path). Build order follows the research dependency graph (frozen shapes -> one-way-door migration -> pure planner+dry-run / offline enable-disable -> load wiring -> write-back). Phase 55 is the only phase touching shared/notify.ts / catalog / byte-UAT; its new emission context must land catalog + fixture changes atomically with the renderer/token changes they describe (v1.3 atomic-supersession lesson; same constraint applies to any DIFF-02 / ENBL-04 new status tokens). The research SUMMARY proposed 7 phases; merged its config-schema + state-split into one Phase 51 (both pure-addition schema work on the same shapes) and folded the dry-run preview into the planner phase rather than splitting a thin internal-only planner phase, yielding 6 phases within standard granularity.
+- Phase 65.1 inserted after Phase 65: Reload-deferred will grammar consistency: will-prefix marks only reload-deferred actions; audit+fix marketplace add/remove before force-display phases (URGENT)
+- Phase 71 added: Partial hook force-install: unsupportable hooks degrade under --force (event + matcher level) instead of failing the plugin unavailable
 
 ### Decisions
 
@@ -261,6 +287,36 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - [Phase ?]: [Phase 63] info <plugin> surfaces multi-line hooks: block end-to-end by re-parsing pluginRoot/hooks/hooks.json via composeResolvedComponents. Resolver discards parsed value; info.ts re-opens at message-construction time (Plan 63-05, SURF-01).
 - [Phase ?]: [Phase 63] Plan 04: 5th cascade slot landed at all FOUR sites (install / update / reinstall / cascadeUnstagePlugin) in lockstep + integration test pins the end-to-end install->update->reinstall->uninstall lifecycle. LIFE-01 / LIFE-02 closed. Install row composition now reads resolved.orphanRewake and pushes 'orphan rewake' into PluginInstalledMessage.reasons (SURF-05 wiring complete on the consumer side). Update/reinstall orphan-rewake wiring deferred (PluginUpdatedMessage/PluginReinstalledMessage carry no reasons by design; SURF-05 catalog only documents (installed) byte forms).
 - [Phase ?]: [Phase 63] Plan 04: Reinstall hooks slot is NOT pushed onto replacements[]: hooks bridge has no replace primitive (D-63-02), so writeHookConfig STAYS IN PLACE on a later-step failure. Recovery is via the existing reinstall hint, mirroring update.ts D-03 fail-continue semantics. Mirrors the truthful 'we did not complete the swap' view.
+- [Phase ?]: D-64-01: resolver uses three-way state discriminant (installable/unsupported/unavailable)
+- [Phase ?]: D-64-05/06: unsupported arm keeps pluginRoot + full payload (force-degradable); unavailable arm minimal, compile-strips pluginRoot (NFR-7)
+- [Phase ?]: D-64-04: requireForceInstallable gate admits installable|unsupported, throws on unavailable; no production caller until Phase 65
+- [Phase ?]: D-64-07: structural precedence -- structural defect resolves unavailable over any unsupported-component signal
+- [Phase ?]: D-64-02 realized: single shared render-time helper narrowUnsupportedKinds derives per-kind unsupported markers from the typed unsupported[] list across list/info/install; structural reasons stay on the notes path (D-64-07). RSTATE-05 closed; Phase 64 complete.
+- [Phase ?]: 66-01: force-installed wears the dedicated glyph; force-upgradable reuses the installed glyph (D-66-03)
+- [Phase ?]: 66-01: will-force-install is a render modifier on will-install, not a closed-set token; no will-force-update surface (D-66-05)
+- [Phase ?]: 66-03: info reports (force-installed) + narrowUnsupportedKinds detail for installed+unsupported; unavailable/installable stay (installed) per D-64-05; info never emits force-upgradable
+- [Phase ?]: 66-03: install/update force success rows read (force-installed) on unsupported (info, needsReload via TRANSITION_STATUS_LIST), installed/updated otherwise; no Warning: in any force path (FORCE-04)
+- [Phase ?]: 66-04: reconcile pending stamps a will-install force modifier via an orchestrator-computed no-network resolveStrict force-key set; projection stays sync and pure
+- [Phase ?]: 66-04: will force update is vacuous (reconcile has no update bucket, D-66-05); absence asserted, not built
+- [Phase ?]: BFILL-02: EXTENSION_VERSION checked-in literal drift-guarded against package.json; optional lastReconciledExtensionVersion STATE_SCHEMA field (no schemaVersion bump) threaded through loadState normalization
+- [Phase ?]: 68-02: reinstall resolves via requireForceInstallable so backfill can re-materialize force-installed plugins; persisted compatibility.installable mirrors the resolve state at the SAME version (BFILL-01/D-68-02).
+- [Phase 68]: 68-03: backfill outcomes project to installed (full) / force-installed (partial) rows folded into the single applied cascade (BFILL-01 / D-68-04 / RECON-04)
+- [Phase ?]: 68-04: load-time backfill gates on the lastReconciledExtensionVersion stamp; stamps the running version on gate-open even with zero promotions (D-68-03) via withStateGuard->saveState (SPLIT-02); force-installed plugins re-materialize via reinstallPlugin only when the resolved supported set is a strict superset of the recorded one, folded into the single applyReconcile cascade (RECON-04)
+- [Phase ?]: SEV-02 --force hint renders as a 4-space trailer line, not a REASONS member; closed-set counts stay 22/17/7
+- [Phase ?]: SEV-02 structural unavailable arm kept byte-frozen at info severity; final severity reconcile deferred to Phase 70
+- [Phase ?]: SEV-01 missing-companion warning is a cascade-level change: stamping info->warning prepends the notify summary line, so catalog blocks and byte-form tests moved in lockstep (69-02)
+- [Phase ?]: SEV-04 force-upgradable decline severity follows invocation cardinality (targeted=warning, bulk=info), scoped strictly to the no-longer-installable reason (D-69-02)
+- [Phase ?]: SEV-03 (D-69-01): autoupdate cascade takes the force path; degrading plugin renders (force-installed) not (skipped) {no longer installable}; severity follows prior persisted compatibility.unsupported (empty=warning newly-degraded, non-empty=info already-degraded); manual update --force stays info
+- [Phase ?]: Q1: partial-hook non-command handlers drop at HANDLER granularity; empty group/event omitted
+- [Phase ?]: X1 hooks table-desync surfaces structurally via HooksTableDesyncError caught by parseHooksConfig (stays unavailable)
+- [Phase ?]: Resolver droppedHooks threads partial-hook supportability drops to partial.unsupported; structural defects stay unavailable (D-71-03)
+- [Phase 71]: D-71-04: narrowUnsupportedKinds maps the hooks kind to the existing unsupported hooks REASONS member (closed set stays 32); single aggregate {unsupported hooks} marker across list/info
+- [Phase 71]: D-71-05: info strict reader enumerates dropped handlers at matcher-group granularity event(matcher) (unsupported), re-derived from its own pure parse (lenient->strict flip resolved)
+- [Phase ?]: Phase 71 complete (PHOOK-01..05): partial-hook plugins blocked solely by a non-bucket-A event or unsupported matcher now force-install, staging a strict-subset hooks.json; {unsupported hooks} renders byte-identically across list/info/force-installed surfaces; no-force install blocks with the --force hint
+- [Phase ?]: XSURF-03 update-decline reason sourced via narrowUnsupportedKinds (list-row seam) for byte-parity, not install-path narrowResolverReasons
+- [Phase ?]: XSURF-03 SEV-04 split moved onto the force-upgradable status arm; cascadeSkipSeverity untouched
+- [Phase 74]: UGRM-02 update tally is an opt-in CascadeNotificationMessage.tally override read only by composeTally; other ops byte-identical
+- [Phase 74]: Bulk-update never-silent no-op headline 'Plugin update: nothing to update' is orchestrator-owned via emitUpdateNoOpCascade, not composeTally (count:0 collapses to empty)
 
 ### Pending Todos
 
@@ -310,6 +366,13 @@ Genuinely-open deferral (v1.4.1 scope):
 | state_migration    | Migration tooling for already-installed `hash-<12hex>` plugins whose plugin.json declares a SemVer                                                                                                                                                                                                                                                                                      | out of scope v1.4.1; marketplace update will naturally surface as upgradable post-SNM-34                                                                                                                       | 2026-05-28  |
 | testing            | Coverage sweep: rare failure arms in update/reinstall/install ([.planning/todos/pending/2026-06-12-coverage-sweep-test-rare-failure-arms-in-update-reinstall-in.md](./todos/pending/2026-06-12-coverage-sweep-test-rare-failure-arms-in-update-reinstall-in.md))                                                                                                                       | acknowledged at v1.13 close 2026-06-19; deferred to v1.14+; testing-only, no runtime impact                                                                                                                   | 2026-06-19  |
 
+Acknowledged at force-install close (2026-07-02):
+
+| Category | Item | Status |
+|----------|------|--------|
+| quick_task | 260621-kmm-add-explicit-enabled-boolean-field-to-pl | stale (shipped in 0.6.1) |
+| todo | 2026-06-12-coverage-sweep-test-rare-failure-arms-in-update-reinstall | deferred (testing) |
+
 Resolved / no longer open:
 
 - _v1.3 quick-task frontmatter (7 tasks: 260515-bkt/cmp/tqx/wpe, 260516-02r/08j, 260522-c80): **RESOLVED 2026-06-08.** All seven were archived to `.planning/milestones/v1.4-quick-tasks/` at v1.4 close; `audit-open` no longer scans them and reports clear. The pre-canonical SUMMARY frontmatter is a historical-record detail with no live flag -- no follow-up work._
@@ -321,10 +384,21 @@ _The two former `upstream_finding` rows (pi-tui `@`-precedence tab-completion / 
 - _Tab-completion: **accepted as-is.** `/claude:plugin update @<TAB>` works as is; our `tests/edge/completions/provider.test.ts` provider is correct and passes. No code change and no upstream issue needed._
 - _Label/color: **resolved by design.** The severity color comes from the severity argument of `ctx.ui.notify`, not from the label. v1.10/v1.11 use the correct severity and keep the `Error:`/`Warning:` label, always followed by a non-empty summary message with the cascade as its own separate block (D-29-01/02, GRAM-01..05). "Color requires dropping the label" is moot -- we never want color without the label. The supersession is recorded in `docs/adr/v2-001-structured-notify.md`; the obsolete UXG-03 spike test was deleted._
 
+## Deferred Verification
+
+_RESOLVED 2026-06-30._ All force-install phases (64-74) are executed, verified
+(`status: passed`), and the milestone audit PASSED (42/42 requirements, 12/12
+phases, cross-phase integration clean, 4/4 E2E flows). Phases 73 (cross-surface
+`⊖`/`⊘` unification) and 74 (bulk-update grammar) closed the UAT findings.
+Audit report: `.planning/milestones/force-install-MILESTONE-AUDIT.md`.
+
 ## Session Continuity
 
-Last session: 2026-06-16T14:57:03.081Z
-Stopped At: Completed 63-05-PLAN.md (SURF-01)
+Last session: 2026-06-30T06:22:00.000Z
+Stopped At: force-install milestone closed and archived 2026-07-02; shipped as
+0.7.0 via PR #77. Two pre-existing backlog items acknowledged at close (quick_task
+260621-kmm -- stale, shipped in 0.6.1; coverage-sweep todo -- deferred, testing);
+see the Deferred Items section.
 Resume File: None
 
 ## Operator Next Steps

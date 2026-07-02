@@ -27,9 +27,17 @@ import {
   TOOL_EVENTS,
   type ToolEvent,
 } from "../../domain/components/hook-events.ts";
-import { parseHooksConfig, type HooksConfig } from "../../domain/components/hooks.ts";
+import {
+  parseHooksConfig,
+  type DroppedHook,
+  type HooksConfig,
+} from "../../domain/components/hooks.ts";
 import { loadMarketplaceManifest, type MarketplaceManifest } from "../../domain/manifest.ts";
-import { resolveStrict } from "../../domain/resolver.ts";
+import {
+  resolveStrict,
+  type ResolvedPluginUnavailable,
+  type ResolvedPluginUnsupported,
+} from "../../domain/resolver.ts";
 import { parsePluginSource, type ParsedSource } from "../../domain/source.ts";
 import { loadMergedScopeConfig } from "../../persistence/config-merge.ts";
 import { locationsFor } from "../../persistence/locations.ts";
@@ -42,7 +50,11 @@ import {
 } from "../../shared/notify-context.ts";
 import { notify } from "../../shared/notify.ts";
 import { assertPathInside } from "../../shared/path-safety.ts";
-import { narrowProbeError, narrowResolverNotes } from "../../shared/probe-classifiers.ts";
+import {
+  narrowProbeError,
+  narrowResolverNotes,
+  narrowUnsupportedKinds,
+} from "../../shared/probe-classifiers.ts";
 import { isRecordedButDisabled } from "../reconcile/plan.ts";
 
 import { PLUGIN_INFO_CONTEXT, type PluginInfoCascadeMsg } from "./info.messaging.ts";
@@ -119,12 +131,15 @@ function isLocallyResolvable(src: ParsedSource): boolean {
  * mutate between install and info-render (manifest edit, symlink swap),
  * so a fresh check here prevents `composeResolvedComponents` from
  * walking a directory outside the marketplace root. A containment
- * failure throws `PathContainmentError`; the row builder's outer catch
- * does NOT see it (Finding #6 narrows that try to wrap
- * `composeResolvedComponents` only) -- it propagates to the caller and
- * surfaces via `narrowProbeError`'s generic-Error arm (`unreadable`).
+ * failure throws `PathContainmentError`. This throw is raised BEFORE
+ * `buildNotInstallablePathRowFields`'s inner try (which wraps
+ * `composeResolvedComponents` only), so it propagates past that helper to
+ * the ROW builder. Both row callers -- `buildInstalledRow` and
+ * `buildNotInstalledRow` (WR-02) -- wrap their `buildNonInstallableRowFields`
+ * call in an outer try/catch, so the error surfaces via `narrowProbeError`'s
+ * generic-Error arm (`unreadable`) rather than escaping `getPluginInfo`.
  * The programmer-bug `throw new Error(...)` on the non-path source kind
- * likewise propagates unmasked.
+ * likewise propagates to and is classified by those same outer catches.
  */
 async function derivePluginRootForInfo(
   marketplaceRoot: string,
@@ -287,14 +302,56 @@ function projectHookSummaryEntries(parsed: HooksConfig): readonly HookSummaryEnt
 }
 
 /**
+ * PHOOK-05 / D-71-05: project the partition's `dropped` enumeration to
+ * lenient `HookSummaryEntry` rows so a force-degradable plugin enumerates
+ * the handlers the install path WILL drop. A `kind:"event"` drop (a whole
+ * non-bucket-A event, P1) renders bare `<event> (unsupported)`; a
+ * `kind:"group"` (P2-P5) or `kind:"handler"` (P6) drop renders at
+ * matcher-group granularity `<event>(<matcher>) (unsupported)`. Multiple
+ * handler drops sharing one matcher group collapse to a single line
+ * (matcher-group granularity), so the dropped block mirrors the supported
+ * block's one-line-per-group convention (FSTAT-07 dropped-component detail).
+ */
+function projectDroppedHookEntries(dropped: readonly DroppedHook[]): readonly HookSummaryEntry[] {
+  const entries: HookSummaryEntry[] = [];
+  const seen = new Set<string>();
+  for (const drop of dropped) {
+    const matcher = drop.kind === "event" ? undefined : drop.matcher;
+    const key = `${drop.event} ${matcher ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    entries.push({
+      kind: "lenient",
+      event: drop.event,
+      supported: false,
+      ...(matcher !== undefined && { matcher }),
+    });
+  }
+
+  return entries;
+}
+
+/**
  * Read & re-parse `<pluginRoot>/<resolved.hooksConfigPath>` from disk
  * and project to `HookSummaryEntry[]`. The resolver discards the parsed
  * value (it only records `hooksConfigPath`), so the info renderer must
  * re-open the file at info-render time. Returns `undefined` when the
  * file has no `hooksConfigPath` (the plugin declares no hooks), or
- * when the re-parse fails (the resolver would also have flipped
- * `installable: false`, so this branch is defensive only -- the file
- * was parseable at resolve time).
+ * when the re-parse fails (the resolver would then have resolved
+ * `unavailable`, which carries no `hooksConfigPath`, so this branch is
+ * defensive only -- the file was parseable at resolve time).
+ *
+ * PHOOK-05 / D-71-05: `parseHooksConfig` returns the FILTERED supported
+ * subset as `value` plus the `dropped` enumeration. For a force-degradable
+ * plugin the row records `hooksConfigPath`, so info routes HERE (the strict
+ * reader) rather than the lenient bail reader -- the dropped enumeration
+ * must therefore render on THIS path or it vanishes. The supported entries
+ * render plain (declaration order); the dropped entries render
+ * `(unsupported)`-suffixed afterwards, re-derived from the SAME pure parse
+ * (no separate threading -- the partition is deterministic).
  *
  * I/O failures (EACCES / ENOENT after resolve) PROPAGATE so the row
  * builder's outer catch can classify via the existing `narrowProbeError`
@@ -319,7 +376,9 @@ async function readHookSummaryEntries(
     return undefined;
   }
 
-  return projectHookSummaryEntries(parsed.value);
+  const supported = projectHookSummaryEntries(parsed.value);
+  const dropped = projectDroppedHookEntries(parsed.dropped);
+  return [...supported, ...dropped];
 }
 
 /**
@@ -587,15 +646,16 @@ async function buildBlock(
 
   // (c) Installed bucket.
   if (installed !== undefined) {
-    const row = await buildInstalledRow(
+    const row = await buildInstalledRow({
       pluginName,
-      installedVersion ?? manifestVersion,
+      version: installedVersion ?? manifestVersion,
       description,
       dependencies,
       entry,
       mpRecord,
+      installedRecord: installed,
       parsedSource,
-    );
+    });
     return wrapBlock(marketplace, scope, marketplaceDetails, row);
   }
 
@@ -647,7 +707,8 @@ function wrapBlock(
  *     source with unsupported manifest fields / unsupported hooks).
  */
 async function buildNotInstallablePathRowFields(
-  resolved: { readonly notes: readonly string[] } & Parameters<typeof composeResolvedComponents>[1],
+  resolved: Parameters<typeof composeResolvedComponents>[1],
+  resolverReasons: readonly ContentReason[],
   marketplaceRoot: string,
   parsedSource: ParsedSource,
 ): Promise<
@@ -661,7 +722,6 @@ async function buildNotInstallablePathRowFields(
       readonly componentsResolved: false;
     }
 > {
-  const resolverReasons = narrowResolverNotes(resolved.notes);
   const pluginRoot = await derivePluginRootForInfo(marketplaceRoot, parsedSource);
   // NFR-7 / INFO-05: only `composeResolvedComponents` failures
   // (component-dir EACCES, hooks-file EACCES/EIO, malformed JSON the
@@ -687,37 +747,164 @@ async function buildNotInstallablePathRowFields(
 }
 
 /**
+ * D-64-05: re-derive the component-path map for the MINIMAL `unavailable`
+ * arm, which (unlike `installable` / `unsupported`) does not carry
+ * `componentPaths`. The info surface re-resolves independently from the
+ * marketplace entry's declared component paths plus the conventional
+ * `<pluginRoot>/{skills,commands,agents}` locations; `composeResolvedComponents`
+ * tolerates missing directories (ENOENT -> empty), so a declared-but-absent
+ * or convention-absent directory contributes nothing. This keeps the
+ * `(unavailable)`/`(installed)` path-source rows enumerating on-disk
+ * components without reading the arm's stripped fields (NFR-7).
+ */
+function deriveLenientComponentPaths(entry: MarketplaceManifest["plugins"][number]): {
+  skills: string[];
+  commands: string[];
+  agents: string[];
+} {
+  const out = {
+    skills: ["skills"],
+    commands: ["commands"],
+    agents: ["agents"],
+  };
+  for (const kind of ["skills", "commands", "agents"] as const) {
+    for (const d of asDeclaredList((entry as Record<string, unknown>)[kind])) {
+      if (typeof d === "string" && !out[kind].includes(d)) {
+        out[kind].push(d);
+      }
+    }
+  }
+
+  return out;
+}
+
+/** Normalize a raw entry component field to a flat list (undefined/null -> []). */
+function asDeclaredList(raw: unknown): readonly unknown[] {
+  if (Array.isArray(raw)) {
+    return raw;
+  }
+
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+
+  return [raw];
+}
+
+/**
+ * Build the not-installable row fields for either non-installable arm.
+ * `unsupported` carries the full component payload (read directly);
+ * `unavailable` is minimal, so its component paths are re-derived
+ * independently via `deriveLenientComponentPaths` (D-64-05).
+ *
+ * D-64-02 / RSTATE-05: the per-kind unsupported markers for the `unsupported`
+ * arm derive from the typed `unsupported[]` component-kind list via the shared
+ * render helper; the structural `unavailable` arm's reasons stay on the `notes`
+ * path via `narrowResolverNotes`.
+ */
+function buildNonInstallableRowFields(
+  resolved: ResolvedPluginUnsupported | ResolvedPluginUnavailable,
+  entry: MarketplaceManifest["plugins"][number],
+  marketplaceRoot: string,
+  parsedSource: ParsedSource,
+): ReturnType<typeof buildNotInstallablePathRowFields> {
+  // WR-03: discriminate the union with an exhaustive `switch (resolved.state)`
+  // + `assertNever` so a future fourth `ResolvedPlugin` arm becomes a
+  // compile-time error here rather than silently falling through to the
+  // `unavailable`/`notes` path.
+  switch (resolved.state) {
+    case "unsupported":
+      return buildNotInstallablePathRowFields(
+        resolved,
+        narrowUnsupportedKinds(resolved.unsupported),
+        marketplaceRoot,
+        parsedSource,
+      );
+    case "unavailable":
+      return buildNotInstallablePathRowFields(
+        {
+          componentPaths: deriveLenientComponentPaths(entry),
+          mcpServers: {},
+        },
+        narrowResolverNotes(resolved.notes),
+        marketplaceRoot,
+        parsedSource,
+      );
+    default:
+      return assertNever(resolved);
+  }
+}
+
+/**
+ * WR-02 / D-66-01: build the `(installed)` / `(force-installed)` row for a
+ * NON-PATH source (github / npm / url / git-subdir). INFO-05 defers LIVE
+ * component resolution for these sources to preserve NFR-5 (never fetch), so
+ * `componentsResolved: false` is always emitted. The install-time
+ * `compatibility.unsupported` record, however, was persisted AT INSTALL and is
+ * read OFFLINE here -- the SAME single deriver `list` reads (list.ts
+ * force-installed branch). A recorded-installed non-path plugin whose install
+ * dropped one or more components therefore reports `(force-installed)` here too,
+ * so `info` and `list` never diverge on the derived force state for non-path
+ * sources.
+ */
+function buildNonPathInstalledRow(
+  pluginName: string,
+  version: string | undefined,
+  description: string | undefined,
+  installedRecord: MarketplaceRecord["plugins"][string],
+): PluginInfoRow {
+  const status =
+    installedRecord.compatibility.unsupported.length > 0 ? "force-installed" : "installed";
+  return {
+    status,
+    name: pluginName,
+    ...(version !== undefined && { version }),
+    ...(description !== undefined && { description }),
+    ...(status === "force-installed" && {
+      reasons: narrowUnsupportedKinds(installedRecord.compatibility.unsupported),
+    }),
+    componentsResolved: false,
+  };
+}
+
+/**
  * Build an `(installed)` row. When the source kind is `"path"` (the
  * only locally resolvable kind), run `resolveStrict` to compute the
  * per-kind component arrays + sort them. For all other source kinds,
- * emit `componentsResolved: false` (INFO-05 marker). When `resolveStrict`
- * returns the not-installable variant for a path source,
+ * emit `componentsResolved: false` (INFO-05 marker) via
+ * `buildNonPathInstalledRow`. When `resolveStrict` returns the
+ * not-installable variant for a path source,
  * `buildNotInstallablePathRowFields` still enumerates components from
  * disk so the row exposes the `{<reason>}` brace alongside the per-kind
  * component lines instead of `not resolved`.
  */
-async function buildInstalledRow(
-  pluginName: string,
-  version: string | undefined,
-  description: string | undefined,
-  dependencies: readonly string[] | undefined,
-  entry: MarketplaceManifest["plugins"][number],
-  mpRecord: MarketplaceRecord,
-  parsedSource: ParsedSource,
-): Promise<PluginInfoRow> {
+async function buildInstalledRow(opts: {
+  pluginName: string;
+  version: string | undefined;
+  description: string | undefined;
+  dependencies: readonly string[] | undefined;
+  entry: MarketplaceManifest["plugins"][number];
+  mpRecord: MarketplaceRecord;
+  installedRecord: MarketplaceRecord["plugins"][string];
+  parsedSource: ParsedSource;
+}): Promise<PluginInfoRow> {
+  const {
+    pluginName,
+    version,
+    description,
+    dependencies,
+    entry,
+    mpRecord,
+    installedRecord,
+    parsedSource,
+  } = opts;
   if (!isLocallyResolvable(parsedSource)) {
-    return {
-      status: "installed",
-      name: pluginName,
-      ...(version !== undefined && { version }),
-      ...(description !== undefined && { description }),
-      componentsResolved: false,
-    };
+    return buildNonPathInstalledRow(pluginName, version, description, installedRecord);
   }
 
   try {
     const resolved = await resolveStrict(entry, { marketplaceRoot: mpRecord.marketplaceRoot });
-    if (resolved.installable) {
+    if (resolved.state === "installable") {
       return {
         status: "installed",
         name: pluginName,
@@ -729,17 +916,26 @@ async function buildInstalledRow(
       };
     }
 
-    // resolveStrict returned NotInstallable but the state record says
+    // resolveStrict returned a non-installable arm but the state record says
     // installed -- the marketplace clone changed, OR the manifest now
-    // declares an unsupported field (`hooks` / `lspServers`). Status
-    // stays `installed` because the state record confirms the install.
-    const fields = await buildNotInstallablePathRowFields(
+    // declares an unsupported field (`lspServers`) or a structural defect
+    // (malformed hooks/manifest). FSTAT-07 / D-66-04: an `unsupported`
+    // re-resolve of a recorded-installed plugin is the derived
+    // `force-installed` state -- the install was force-completed with one or
+    // more components dropped, so it reports `(force-installed)` with the
+    // dropped-component detail. `unavailable` keeps `(installed)` (D-64-05:
+    // only `unsupported` maps to force-installed); info never emits
+    // `force-upgradable` (that is a list-inventory-only concept).
+    // `unsupported` reads its component payload directly; `unavailable`
+    // re-derives independently (D-64-05).
+    const fields = await buildNonInstallableRowFields(
       resolved,
+      entry,
       mpRecord.marketplaceRoot,
       parsedSource,
     );
     return {
-      status: "installed",
+      status: resolved.state === "unsupported" ? "force-installed" : "installed",
       name: pluginName,
       ...(version !== undefined && { version }),
       ...(description !== undefined && { description }),
@@ -764,8 +960,66 @@ async function buildInstalledRow(
 }
 
 /**
+ * Build the not-installed row for a PATH source whose resolver returned a
+ * non-installable arm (`unsupported` / `unavailable`). Enumerates components
+ * from disk via `buildNonInstallableRowFields`.
+ *
+ * USTAT-01 / D-64-01: de-collapse the row status by resolver STATE -- a
+ * force-installable `unsupported` plugin renders the distinct `(unsupported)` /
+ * `⊖` token (byte-consistent with the list surface), while a structural
+ * `unavailable` keeps `(unavailable)` / `⊘`. Severity is unchanged (token
+ * rename only).
+ *
+ * WR-02: `buildNonInstallableRowFields` -> `derivePluginRootForInfo` can throw
+ * `PathContainmentError` (NFR-10) for a not-installed path source whose `source`
+ * escapes the marketplace root -- BEFORE the inner try that wraps
+ * `composeResolvedComponents` only. Mirror `buildInstalledRow`'s outer catch so
+ * the unreadable case renders an `(unavailable)` row via `narrowProbeError`
+ * instead of throwing uncaught out of `getPluginInfo`.
+ */
+async function buildNotInstalledPathRow(
+  resolved: ResolvedPluginUnsupported | ResolvedPluginUnavailable,
+  opts: {
+    pluginName: string;
+    version: string | undefined;
+    description: string | undefined;
+    entry: MarketplaceManifest["plugins"][number];
+    mpRecord: MarketplaceRecord;
+    parsedSource: ParsedSource;
+  },
+): Promise<PluginInfoRow> {
+  const { pluginName, version, description, entry, mpRecord, parsedSource } = opts;
+  try {
+    const fields = await buildNonInstallableRowFields(
+      resolved,
+      entry,
+      mpRecord.marketplaceRoot,
+      parsedSource,
+    );
+    return {
+      status: resolved.state === "unsupported" ? "unsupported" : "unavailable",
+      name: pluginName,
+      ...(version !== undefined && { version }),
+      ...(description !== undefined && { description }),
+      ...fields,
+    };
+  } catch (err) {
+    // The probe-error catch arm stays `unavailable` (structural).
+    const reasons: readonly ContentReason[] = [narrowProbeError(err)];
+    return {
+      status: "unavailable",
+      name: pluginName,
+      ...(version !== undefined && { version }),
+      ...(description !== undefined && { description }),
+      reasons,
+      componentsResolved: false,
+    };
+  }
+}
+
+/**
  * Build the row for a plugin that is NOT in the state's installed
- * bucket. `resolveStrict` decides between `(available)` and
+ * bucket. `resolveStrict` decides between `(available)`, `(unsupported)`, and
  * `(unavailable)`; the per-kind component arrays follow the same
  * INFO-05 source-kind gate as the installed row.
  */
@@ -798,37 +1052,45 @@ async function buildNotInstalledRow(
     };
   }
 
-  if (!resolved.installable) {
+  if (resolved.state !== "installable") {
     if (!isLocallyResolvable(parsedSource)) {
-      const resolverReasons = narrowResolverNotes(resolved.notes);
+      // XSURF-02 / IN-01: derive the token AND its reason source from
+      // `resolved.state`, mirroring the path-source arm and the list surface,
+      // instead of hardcoding `unavailable`. The `resolved.state !==
+      // "installable"` guard above narrows to `unsupported | unavailable`, so
+      // `resolved.unsupported` is reachable on the `unsupported` arm. Today
+      // non-path sources never resolve `unsupported` (no-network), so this is
+      // latent-divergence repair -- existing non-path `unavailable` rows stay
+      // byte-unchanged.
+      const reasons =
+        resolved.state === "unsupported"
+          ? narrowUnsupportedKinds(resolved.unsupported)
+          : narrowResolverNotes(resolved.notes);
       return {
-        status: "unavailable",
+        status: resolved.state === "unsupported" ? "unsupported" : "unavailable",
         name: pluginName,
         ...(version !== undefined && { version }),
         ...(description !== undefined && { description }),
-        ...(resolverReasons.length > 0 && { reasons: resolverReasons }),
+        ...(reasons.length > 0 && { reasons }),
         componentsResolved: false,
       };
     }
 
-    // Path source whose resolver returned not-installable: enumerate
-    // components from disk against the not-installable variant.
-    const fields = await buildNotInstallablePathRowFields(
-      resolved,
-      mpRecord.marketplaceRoot,
+    // Path source whose resolver returned a non-installable arm: enumerate
+    // components from disk. `unsupported` reads its component payload
+    // directly; `unavailable` re-derives independently (D-64-05).
+    return buildNotInstalledPathRow(resolved, {
+      pluginName,
+      version,
+      description,
+      entry,
+      mpRecord,
       parsedSource,
-    );
-    return {
-      status: "unavailable",
-      name: pluginName,
-      ...(version !== undefined && { version }),
-      ...(description !== undefined && { description }),
-      ...fields,
-    };
+    });
   }
 
   // Non-path sources reach the `(unavailable)` arm above because
-  // `resolveStrict` returns `installable: false` for them -- so by the
+  // `resolveStrict` returns a structural `unavailable` for them -- so by the
   // time control gets here the source is path-resolvable and
   // `composeResolvedComponents` is safe to call without an external-
   // source short-circuit.

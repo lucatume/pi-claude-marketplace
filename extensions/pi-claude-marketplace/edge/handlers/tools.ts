@@ -156,17 +156,28 @@ interface PluginRow {
  * `manual recovery`) are unreachable on this surface and an exhaustive
  * `assertNever`-style throw guards the invariant.
  */
-function projectRowStatus(status: PluginNotificationMessage["status"]): ToolPluginStatus {
+export function projectRowStatus(status: PluginNotificationMessage["status"]): ToolPluginStatus {
   switch (status) {
     // RLD-04 / D-08: the list orchestrator emits the steady-state inventory
     // row as `installed`; it projects to the same `installed` tool surface as
     // the cascade transition and the `upgradable` list row.
+    // FSTAT-02 / FSTAT-04 / D-66-03: both derived force states flatten to the
+    // `installed` tool surface -- a force-installed plugin is recorded-installed
+    // (degraded, but present), and a force-upgradable plugin is currently a
+    // clean install, so the LLM-tool projection treats both as installed.
     case "installed":
     case "upgradable":
+    case "force-installed":
+    case "force-upgradable":
       return "installed";
     case "available":
       return "available";
     case "unavailable":
+      return "unavailable";
+    case "unsupported":
+      // USTAT-02 / D-64-01: a not-installed, force-installable plugin projects
+      // onto the coarse `unavailable` tool bucket -- the LLM-tool surface has no
+      // distinct `unsupported` bucket (mirrors `disabled` -> `unavailable`).
       return "unavailable";
     case "disabled":
       // D-54-01 / ENBL-04: a disabled plugin is recorded but its artefacts
@@ -310,14 +321,22 @@ function pluginScopeOrFallback(
   switch (p.status) {
     // RLD-04 / D-08: the `installed` inventory row joins `upgradable` as a
     // scope-bearing list-surface variant.
+    // FSTAT-02 / FSTAT-04 / D-66-03: the derived force states are scope-bearing
+    // list-surface variants (each carries the optional `scope?`), so they join
+    // the orphan-fold scope arm.
     case "installed":
     case "upgradable":
     case "disabled":
+    case "force-installed":
+    case "force-upgradable":
       // D-54-01 / ENBL-04: disabled rows carry an explicit `scope?` (the
       // SNM-11 carve-out applies only to `available` / `unavailable`).
       return p.scope ?? marketplaceScope;
     case "available":
     case "unavailable":
+    case "unsupported":
+      // USTAT-01 / SNM-11: the `unsupported` row carries no `scope` field (the
+      // carve-out applies to `available` / `unavailable` / `unsupported`).
       return marketplaceScope;
     case "updated":
     case "reinstalled":
@@ -342,7 +361,9 @@ function pluginScopeOrFallback(
  * omit `reasons` entirely (omit when undefined or empty).
  */
 function pluginReasons(p: PluginNotificationMessage): readonly string[] | undefined {
-  if (p.status === "unavailable" || p.status === "upgradable") {
+  if (p.status === "unavailable" || p.status === "unsupported" || p.status === "upgradable") {
+    // USTAT-01: the `unsupported` row carries the same per-kind reason braces as
+    // the `unavailable` row, so surface them on the tool details too.
     return p.reasons.length > 0 ? p.reasons : undefined;
   }
 
@@ -363,14 +384,20 @@ function pluginVersion(p: PluginNotificationMessage): string | undefined {
     case "upgradable":
     case "available":
     case "unavailable":
+    case "unsupported":
     case "reinstalled":
     case "uninstalled":
     case "failed":
     case "skipped":
     case "manual recovery":
     case "disabled":
+    case "force-installed":
+    case "force-upgradable":
       // D-54-01 / ENBL-04: disabled row carries optional `version?` -- the
-      // recorded state record preserves the pinned version (ENBL-02).
+      // recorded state record preserves the pinned version (ENBL-02). FSTAT-02 /
+      // FSTAT-04 / D-66-03: the derived force states carry the same optional
+      // `version?` slot as the other list-surface inventory variants. USTAT-01:
+      // the `unsupported` row carries the same optional `version?` slot.
       return p.version;
     case "updated":
       // The updated variant has `from`/`to` instead of a single `version`;

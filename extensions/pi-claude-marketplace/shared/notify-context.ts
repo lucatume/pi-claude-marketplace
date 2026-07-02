@@ -1,6 +1,7 @@
 import {
   emitContextCascade,
   emitReconcileAppliedContextCascade,
+  emitUpdateNoOpCascade,
   type CascadeNotificationMessage,
   type MarketplaceNotificationMessage,
   type PluginNotificationMessage,
@@ -171,6 +172,79 @@ export function notifyWithContext<
   };
 
   emitContextCascade(ctx, pi, message, (p, probe, mpScope) =>
+    dispatchRow(context, p, probe, mpScope),
+  );
+}
+
+/**
+ * UGRM-02 / WR-02: the bulk-`update` cascade emitter that owns the OPT-IN,
+ * update-scoped `tally` success-category override. Mirrors `notifyWithContext`
+ * but additionally threads `{ verb: "updated", count: <updatedCount> }` onto the
+ * envelope, where `composeTally` reads it in place of the legacy info-row
+ * success math.
+ *
+ * The override lives on a dedicated wrapper -- NOT a trailing positional param
+ * on `notifyWithContext` -- so it is structurally unreachable from every other
+ * op (install / reinstall / marketplace / import). A non-update caller cannot
+ * mis-position an argument into the `tally` slot, because the slot does not
+ * exist on the seam those callers use. This keeps their byte-frozen summaries
+ * safe by construction rather than by convention.
+ */
+export function notifyUpdateWithContext<
+  Status extends string,
+  Msg extends PluginNotificationMessage & { status: Status },
+>(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  context: CommandContext<Status, Msg>,
+  rows: readonly MarketplaceRows<Msg>[],
+  cardinality: "single" | "plural",
+  tally: { readonly verb: string; readonly count: number },
+): void {
+  // Same type-safe widening as `notifyWithContext`: `MarketplaceRows<Msg>` is a
+  // genuine subtype of `MarketplaceNotificationMessage[]` (no cast).
+  const marketplaces: readonly MarketplaceNotificationMessage[] = rows;
+  const message: CascadeNotificationMessage = {
+    marketplaces,
+    label: context.Messaging.label,
+    cardinality,
+    tally,
+  };
+
+  emitContextCascade(ctx, pi, message, (p, probe, mpScope) =>
+    dispatchRow(context, p, probe, mpScope),
+  );
+}
+
+/**
+ * UGRM-01 / UGRM-02: the bulk-`update` never-silent no-op emitter. Used when a
+ * bulk update realized ZERO transitions (0 updated, 0 failures, 0 warnings):
+ * either an empty post-suppression cascade (all up-to-date) or a non-empty
+ * cascade whose only surviving rows are benign info skips (e.g. a
+ * `(force-upgradable)` decline). Renders the surviving rows through the command's
+ * render map and folds the hard-coded `Plugin update: nothing to update` headline
+ * below them, so the summary line can never vanish. NO `cardinality` / `tally` --
+ * the headline is a fixed constant owned by `emitUpdateNoOpCascade`, not the
+ * `composeTally` success math.
+ */
+export function notifyUpdateNoOpWithContext<
+  Status extends string,
+  Msg extends PluginNotificationMessage & { status: Status },
+>(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  context: CommandContext<Status, Msg>,
+  rows: readonly MarketplaceRows<Msg>[],
+): void {
+  // Same type-safe widening as `notifyWithContext`: `MarketplaceRows<Msg>` is a
+  // genuine subtype of `MarketplaceNotificationMessage[]` (no cast).
+  const marketplaces: readonly MarketplaceNotificationMessage[] = rows;
+  const message: CascadeNotificationMessage = {
+    marketplaces,
+    label: context.Messaging.label,
+  };
+
+  emitUpdateNoOpCascade(ctx, pi, message, (p, probe, mpScope) =>
     dispatchRow(context, p, probe, mpScope),
   );
 }

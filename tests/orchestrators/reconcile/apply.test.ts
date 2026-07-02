@@ -35,6 +35,7 @@ import test, { mock } from "node:test";
 import { applyReconcile } from "../../../extensions/pi-claude-marketplace/orchestrators/reconcile/apply.ts";
 import { isDeclaredEnabled } from "../../../extensions/pi-claude-marketplace/persistence/config-io.ts";
 import { loadState } from "../../../extensions/pi-claude-marketplace/persistence/state-io.ts";
+import { EXTENSION_VERSION } from "../../../extensions/pi-claude-marketplace/shared/extension-version.ts";
 import { fixtureMarketplaceDir, makeMockGitOps } from "../../helpers/git-mock.ts";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -366,11 +367,19 @@ test("CR-01 (config key != manifest name): first apply records the MANIFEST name
 
 test("RECON-05 (back-to-back no-op): two consecutive applyReconcile calls against unchanged config + state -> config bytes unchanged, ZERO notify on the second call (silent empty-steady-state)", async () => {
   await withHermeticHome(async ({ cwd }) => {
-    const { configPath, statePath } = await setupProjectScope(cwd, {
-      schemaVersion: 1,
-      marketplaces: {},
-      plugins: {},
-    });
+    const { configPath, statePath } = await setupProjectScope(
+      cwd,
+      {
+        schemaVersion: 1,
+        marketplaces: {},
+        plugins: {},
+      },
+      // BFILL-02: seed the CURRENT extension-version stamp so the backfill gate
+      // is closed -- this is the true steady state (already reconciled by this
+      // version). An absent stamp would legitimately open the gate and stamp
+      // once on the first load, which is the gate-close write, not WR-05 churn.
+      { schemaVersion: 2, marketplaces: {}, lastReconciledExtensionVersion: EXTENSION_VERSION },
+    );
 
     // Capture the baseline.
     const beforeConfig = await readFile(configPath, "utf8");
@@ -923,13 +932,23 @@ test("I6 / PR #51: classifyOrchestratorThrow maps PluginShapeError.kind and Stat
   // import/execute.ts::importWarningReason for the "uninstallable" warning).
   assert.equal(
     classifyOrchestratorThrow(
-      new PluginShapeError({ kind: "not-installable", plugin: "p", reasons: ["hooks"] }),
+      new PluginShapeError({
+        kind: "not-installable",
+        plugin: "p",
+        reasons: ["hooks"],
+        forceable: false,
+      }),
     ),
     "no longer installable",
   );
   assert.equal(
     classifyOrchestratorThrow(
-      new PluginShapeError({ kind: "no-longer-installable", plugin: "p", reasons: ["lsp"] }),
+      new PluginShapeError({
+        kind: "no-longer-installable",
+        plugin: "p",
+        reasons: ["lsp"],
+        forceable: false,
+      }),
     ),
     "no longer installable",
   );
@@ -1115,12 +1134,16 @@ test("Y3 / PR #51: a recorded-but-disabled plugin declared enabled in config dri
   });
 });
 
-test("S8 / PR #51: MarketplaceBlock.status is narrowed to the closed 5-status union and the defensive runtime throw is deleted", async () => {
+test("S8 / PR #51: MarketplaceBlock.status is narrowed to the closed 3-status union and the defensive runtime throw is deleted", async () => {
   // MarketplaceBlock is module-internal so the pin is source-shape oriented:
-  // the new `ReconcileBlockStatus` alias must exist and list exactly the 5
-  // statuses the preview / applied projections assign, and the previous
-  // defensive `throw new Error("unexpected reconcile marketplace status: ...")`
-  // arm at `blockToMarketplaceMessage` must be gone (the narrowed type is the
+  // the new `ReconcileBlockStatus` alias must exist and list exactly the 3
+  // statuses the preview / applied projections assign. WILL-01 / WILL-03 /
+  // D-65.1-02 / D-65.1-03: the pending list no longer assigns any marketplace-
+  // level status (add is immediate; remove surfaces as per-plugin will-uninstall
+  // child rows under a bare header), so only the apply-cascade transition tokens
+  // remain. The previous defensive
+  // `throw new Error("unexpected reconcile marketplace status: ...")` arm at
+  // `blockToMarketplaceMessage` must be gone (the narrowed type is the
   // structural gate now).
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(
@@ -1129,8 +1152,8 @@ test("S8 / PR #51: MarketplaceBlock.status is narrowed to the closed 5-status un
   );
   assert.match(
     src,
-    /type ReconcileBlockStatus = Extract<[\s\S]*?"will add"[\s\S]*?"will remove"[\s\S]*?"added"[\s\S]*?"removed"[\s\S]*?"failed"[\s\S]*?>/,
-    "S8: ReconcileBlockStatus must narrow to exactly the 5 statuses the projection assigns",
+    /type ReconcileBlockStatus = Extract<[\s\S]*?"added"[\s\S]*?"removed"[\s\S]*?"failed"[\s\S]*?>/,
+    "S8: ReconcileBlockStatus must narrow to exactly the 3 statuses the projection assigns",
   );
   assert.ok(
     src.includes("status?: ReconcileBlockStatus"),

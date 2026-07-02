@@ -39,10 +39,13 @@ import path from "node:path";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { UPDATE_CONTEXT } from "../../extensions/pi-claude-marketplace/orchestrators/plugin/update.messaging.ts";
+import { notifyUpdateNoOpWithContext } from "../../extensions/pi-claude-marketplace/shared/notify-context.ts";
 import {
   notify,
   type NotificationMessage,
 } from "../../extensions/pi-claude-marketplace/shared/notify.ts";
+import { narrowUnsupportedKinds } from "../../extensions/pi-claude-marketplace/shared/probe-classifiers.ts";
 
 // ---------------------------------------------------------------------------
 // Catalog extraction (D-17-05 + D-17-06)
@@ -200,6 +203,15 @@ interface CatalogFixture {
   readonly message: NotificationMessage;
   readonly pi: MockPi;
   readonly expectedSeverity?: "warning" | "error";
+  // UGRM-01/UGRM-02: an optional emit override for catalog states whose
+  // user-visible output is produced by the ORCHESTRATOR, not by `notify()`. The
+  // bulk-`update` never-silent no-op headline (`all-up-to-date-noop`,
+  // `skip-force-upgradable-bulk`) is emitted via `emitUpdateNoOpCascade` -- the
+  // `notify()` renderer alone (with a `tally {count: 0}` override) would collapse
+  // the headline to `""`. When `emit` is present the driver calls it instead of
+  // `notify()`, then byte-pairs the resulting `ctx.ui.notify` call against the
+  // catalog block exactly as it does for the renderer path.
+  readonly emit?: (ctx: MockCtx, pi: MockPi) => void;
 }
 
 type FixtureMap = Readonly<Record<string, Readonly<Record<string, CatalogFixture>>>>;
@@ -243,6 +255,28 @@ type FixtureMap = Readonly<Record<string, Readonly<Record<string, CatalogFixture
 //     dependencies / scope / version / cause / rollbackPartial fields).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// USTAT-01 / D-64-01: the list/info render now de-collapses by resolver STATE.
+// A not-installed plugin that resolves `unsupported` (force-installable: lsp,
+// unsupported component kind, or a parseable-but-unsupportable `hooks.json`)
+// renders the distinct `(unsupported)` / `⊖` token; a STRUCTURALLY malformed
+// plugin (invalid JSON / `type:"command"` missing `command`) stays
+// `(unavailable)` / `⊘`. Classify each fixture below by its modeled resolver
+// state, NOT by its reason brace -- the same `{unsupported hooks}` brace can
+// appear on both arms (the structural arm via `narrowResolverNotes`, the
+// force-degradable arm via `narrowUnsupportedKinds`):
+//   - list `single-mp-mixed`: `epsilon` carries `lsp` -> unambiguously resolver
+//     `unsupported` -> modeled as `status: "unsupported"` -> `⊖ (unsupported)`;
+//     `delta` models the structural malformed-`hooks.json` arm -> stays
+//     `status: "unavailable"` -> `⊘ (unavailable)`. The catalog thus documents
+//     BOTH de-collapsed byte forms on the list surface.
+//   - info `unavailable-single-scope` carries `componentsResolved: false` --
+//     the malformed-structural case (a force-degradable plugin resolves,
+//     setting `componentsResolved: true`, and renders `force-installed`), so it
+//     keeps its `(unavailable) {unsupported hooks}` bytes.
+// The filter buckets (`--unsupported` / `--unavailable`) are unchanged; only the
+// rendered token splits.
+// ---------------------------------------------------------------------------
 const FIXTURES: FixtureMap = {
   // -------------------------------------------------------------------------
   // /claude:plugin list -- list-surface; mp.status === undefined.
@@ -278,7 +312,7 @@ const FIXTURES: FixtureMap = {
               },
               { status: "unavailable", name: "delta", reasons: ["unsupported hooks"] },
               {
-                status: "unavailable",
+                status: "unsupported",
                 name: "epsilon",
                 reasons: ["unsupported hooks", "lsp"],
               },
@@ -639,6 +673,86 @@ const FIXTURES: FixtureMap = {
         ],
       },
     },
+
+    // FSTAT-02 / D-66-03: list-surface inventory row for a recorded-installed
+    // plugin currently re-resolving `unsupported`. The derived `force-installed`
+    // token wears the dedicated `◉` glyph, distinct from the clean `●`
+    // `(installed)` row. Severity `info` (the row omits `severity`).
+    "force-installed-inventory": {
+      pi: piWithBothLoaded(),
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            details: { autoupdate: true },
+            plugins: [
+              {
+                status: "force-installed",
+                name: "degraded-plugin",
+                version: "1.0.0",
+                reasons: ["lsp"],
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // FSTAT-02 / PHOOK-04 / PHOOK-05 / D-71-04: list-surface inventory row for
+    // a recorded-installed partial-hook plugin re-resolving `unsupported` with
+    // one or more hook events / matcher groups dropped. The force-degradable
+    // `hooks` kind rides the SINGLE aggregate `{unsupported hooks}` brace (no
+    // per-handler fan-out on the list row -- D-71-04); the
+    // `event(matcher) (unsupported)` breakdown lives on `info` (D-71-05). The
+    // brace is sourced via `narrowUnsupportedKinds` (typed kind), distinct from
+    // the structural `narrowResolverNotes` path an `unavailable` malformed-hooks
+    // row uses.
+    "force-installed-inventory-hooks": {
+      pi: piWithBothLoaded(),
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            details: { autoupdate: true },
+            plugins: [
+              {
+                status: "force-installed",
+                name: "hook-plugin",
+                version: "1.0.0",
+                reasons: ["unsupported hooks"],
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // FSTAT-04 / D-66-02 / D-66-03: list-surface inventory row for a
+    // currently-clean installed plugin whose newer no-network candidate would
+    // newly degrade it. The derived `force-upgradable` token REUSES the `●`
+    // glyph (the row is clean today), mirroring the `upgradable` precedent.
+    "force-upgradable-inventory": {
+      pi: piWithBothLoaded(),
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            details: { autoupdate: true },
+            plugins: [
+              {
+                status: "force-upgradable",
+                name: "clean-plugin",
+                version: "1.0.0",
+                reasons: ["unsupported source"],
+              },
+            ],
+          },
+        ],
+      },
+    },
   },
 
   // -------------------------------------------------------------------------
@@ -667,8 +781,13 @@ const FIXTURES: FixtureMap = {
       },
     },
 
+    // SEV-01: both declared companions are unloaded, so the otherwise-clean
+    // install row stamps `warning` (silent degradation) and the cascade carries
+    // the `needs attention` summary line. The per-row bytes are unchanged from
+    // the info form -- only the severity / summary line moves.
     "success-with-soft-dep": {
       pi: piWithNothingLoaded(),
+      expectedSeverity: "warning",
       message: {
         marketplaces: [
           {
@@ -677,7 +796,7 @@ const FIXTURES: FixtureMap = {
             plugins: [
               {
                 status: "installed",
-                severity: "info",
+                severity: "warning",
                 needsReload: true,
                 name: "helper",
                 version: "1.0.0",
@@ -722,8 +841,12 @@ const FIXTURES: FixtureMap = {
     // markers AFTER the typed `reasons[]`, so the brace renders as
     // `{orphan rewake, requires pi-subagents}`. Probe with only `mcp`
     // loaded so the `agents` soft-dep marker fires.
+    // SEV-01: the declared `agents` companion is unloaded, so the success row
+    // stamps `warning` even though the install succeeded -- the cascade carries
+    // the `needs attention` summary line (per-row bytes unchanged).
     "success-with-orphan-rewake-and-soft-dep": {
       pi: piWithMcpLoaded(),
+      expectedSeverity: "warning",
       message: {
         marketplaces: [
           {
@@ -732,7 +855,7 @@ const FIXTURES: FixtureMap = {
             plugins: [
               {
                 status: "installed",
-                severity: "info",
+                severity: "warning",
                 needsReload: true,
                 name: "helper",
                 version: "1.0.0",
@@ -745,8 +868,75 @@ const FIXTURES: FixtureMap = {
       },
     },
 
+    // WR-03: a `--force` install succeeds with one or more components dropped
+    // (the resolver's `unsupported` arm) -- the success row is
+    // `(force-installed)`. The force-degradable arm still stages the SUPPORTED
+    // components, so the row carries `dependencies`; with the `agents` companion
+    // extension unloaded the soft-dep marker fires in the SAME brace AFTER the
+    // dropped-component reason (MSG-GR-4), rendering `{lsp, requires
+    // pi-subagents}`. Probe with only `mcp` loaded so the `agents` marker fires.
+    // SEV-01: the unloaded `agents` companion is a silent degradation
+    // independent of the dropped components, so the force-installed success row
+    // stamps `warning` and the cascade carries the `needs attention` summary
+    // line. The direct `--force` opt-in itself stays benign info -- the warning
+    // is the missing companion, not the force degrade.
+    "success-force-installed-with-soft-dep": {
+      pi: piWithMcpLoaded(),
+      expectedSeverity: "warning",
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            plugins: [
+              {
+                status: "force-installed",
+                severity: "warning",
+                needsReload: true,
+                name: "helper",
+                version: "1.0.0",
+                dependencies: ["agents"],
+                reasons: ["lsp"],
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // SEV-02 / D-69-03 / XSURF-01: force-degradable install failure -- the row
+    // renders the resolver-state-driven `(unsupported)` token (consistent with
+    // list / info), carries the `--force` hint trailer, and renders at error
+    // severity.
     "failure-unsupported-features": {
       pi: piWithBothLoaded(),
+      expectedSeverity: "error",
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            plugins: [
+              {
+                status: "unsupported",
+                name: "helper",
+                reasons: ["unsupported hooks", "lsp"],
+                forceHint: true,
+                severity: "error",
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // SEV-02 / D-69-03 / D-70-02: structurally `unavailable` install failure --
+    // force cannot degrade-install a structural defect, so the row carries NO
+    // `--force` hint, but it still stamps error severity (the leading summary
+    // line fires) because an install failure must read as an error.
+    "failure-structural-unavailable": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "error",
       message: {
         marketplaces: [
           {
@@ -756,7 +946,8 @@ const FIXTURES: FixtureMap = {
               {
                 status: "unavailable",
                 name: "helper",
-                reasons: ["unsupported hooks", "lsp"],
+                reasons: ["unsupported source"],
+                severity: "error",
               },
             ],
           },
@@ -1261,12 +1452,17 @@ const FIXTURES: FixtureMap = {
   // /claude:plugin update -- multi-plugin cascade; version-arrow rows.
   // -------------------------------------------------------------------------
   "/claude:plugin update": {
+    // UGRM-01: the bulk-update up-to-date `beta` row is suppressed at the
+    // orchestrator, so the fixture omits it. UGRM-02: the `tally` override owns
+    // the success category (one realized `updated` row -> `1 updated`); the
+    // failure category still folds in from the rows -> `1 failure, 1 updated`.
     "single-mp-mixed": {
       pi: piWithBothLoaded(),
       expectedSeverity: "error",
       message: {
         label: "Plugin update",
         cardinality: "plural",
+        tally: { verb: "updated", count: 1 },
         marketplaces: [
           {
             name: "official",
@@ -1282,13 +1478,6 @@ const FIXTURES: FixtureMap = {
                 dependencies: [],
               },
               {
-                status: "skipped",
-                name: "beta",
-                reasons: ["up-to-date"],
-                severity: "info",
-                needsReload: false,
-              },
-              {
                 status: "failed",
                 severity: "error",
                 needsReload: false,
@@ -1301,12 +1490,17 @@ const FIXTURES: FixtureMap = {
       },
     },
 
+    // UGRM-02: the override carries a 0 success count (zero `updated` rows), so
+    // `composeTally` drops the success category and the failure math is
+    // unchanged -- the summary stays byte-identical at `Plugin update: 1
+    // failure`. Proves the override does not perturb a failure-only cascade.
     "failed-with-rollback-partial": {
       pi: piWithBothLoaded(),
       expectedSeverity: "error",
       message: {
         label: "Plugin update",
         cardinality: "plural",
+        tally: { verb: "updated", count: 0 },
         marketplaces: [
           {
             name: "official",
@@ -1334,44 +1528,35 @@ const FIXTURES: FixtureMap = {
       },
     },
 
+    // UGRM-01/UGRM-02: an all-up-to-date bulk update suppresses every per-plugin
+    // row (and drops the now-empty marketplace headers), leaving an empty
+    // cascade. The never-silent `Plugin update: nothing to update` headline is
+    // emitted by the ORCHESTRATOR (`notifyUpdateNoOpWithContext` ->
+    // `emitUpdateNoOpCascade`), NOT the `notify()` renderer -- so this fixture
+    // drives the orchestrator no-op seam via `emit`. Info severity, no
+    // reload-hint.
     "all-up-to-date-noop": {
       pi: piWithBothLoaded(),
-      // UXG-02 / D-28-06: every reason is `up-to-date` (in BENIGN_REASONS), so
-      // this all-benign skip cascade computes INFO -- no `expectedSeverity`.
       message: {
         label: "Plugin update",
         cardinality: "plural",
-        marketplaces: [
-          {
-            name: "official",
-            scope: "user",
-            plugins: [
-              {
-                status: "skipped",
-                name: "alpha",
-                reasons: ["up-to-date"],
-                severity: "info",
-                needsReload: false,
-              },
-              {
-                status: "skipped",
-                name: "beta",
-                reasons: ["up-to-date"],
-                severity: "info",
-                needsReload: false,
-              },
-            ],
-          },
-        ],
+        marketplaces: [],
+      },
+      emit: (ctx, pi) => {
+        notifyUpdateNoOpWithContext(ctx as never, pi as never, UPDATE_CONTEXT, []);
       },
     },
 
+    // UGRM-01: the up-to-date `beta` row is suppressed. UGRM-02: two realized
+    // `updated` rows (`helper` + `alpha`) -> `tally` count 2; the one `failed`
+    // row composes ahead -> `1 failure, 2 updated`.
     "bare-multi-mp": {
       pi: piWithBothLoaded(),
       expectedSeverity: "error",
       message: {
         label: "Plugin update",
         cardinality: "plural",
+        tally: { verb: "updated", count: 2 },
         marketplaces: [
           {
             name: "local-mp",
@@ -1402,13 +1587,6 @@ const FIXTURES: FixtureMap = {
                 dependencies: [],
               },
               {
-                status: "skipped",
-                name: "beta",
-                reasons: ["up-to-date"],
-                severity: "info",
-                needsReload: false,
-              },
-              {
                 status: "failed",
                 severity: "error",
                 needsReload: false,
@@ -1421,11 +1599,15 @@ const FIXTURES: FixtureMap = {
       },
     },
 
+    // UGRM-02: two realized `updated` rows across the per-scope blocks -> `tally`
+    // count 2 -> `Plugin update: 2 updated` (no suppression -- no up-to-date
+    // rows here; only the verb/count grammar changes).
     "same-mp-both-scopes": {
       pi: piWithBothLoaded(),
       message: {
         label: "Plugin update",
         cardinality: "plural",
+        tally: { verb: "updated", count: 2 },
         marketplaces: [
           {
             name: "official",
@@ -1466,9 +1648,12 @@ const FIXTURES: FixtureMap = {
     // to per composeVersionArrow's asymmetry; D-23-05).
     "hash-version-arrow": {
       pi: piWithBothLoaded(),
+      // UGRM-02: one realized `updated` row -> `tally` count 1 -> `Plugin
+      // update: 1 updated`.
       message: {
         label: "Plugin update",
         cardinality: "plural",
+        tally: { verb: "updated", count: 1 },
         marketplaces: [
           {
             name: "official",
@@ -1486,6 +1671,97 @@ const FIXTURES: FixtureMap = {
             ],
           },
         ],
+      },
+    },
+
+    // SEV-04 / D-69-02 / XSURF-03: a TARGETED `update <plugin>@<marketplace>`
+    // that declines a force-upgradable candidate (no `--force`) is actionable
+    // -> warning. The decline flips to the `force-upgradable` token (consistent
+    // with how `list` describes the same plugin) carrying the list-consistent
+    // degrade reason + the update-worded `--force` trailer (forceHint). Single
+    // cardinality, so no trailing tally; the cascade carries the `needs
+    // attention` summary line.
+    "decline-force-upgradable-targeted": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "warning",
+      message: {
+        label: "Plugin update",
+        cardinality: "single",
+        marketplaces: [
+          {
+            name: "mp",
+            scope: "project",
+            plugins: [
+              {
+                status: "force-upgradable",
+                severity: "warning",
+                needsReload: false,
+                forceHint: true,
+                name: "hello",
+                version: "1.0.0",
+                reasons: ["lsp"],
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // SEV-04 / D-69-02 / XSURF-03: a BULK `update @<marketplace>` that skips the
+    // same force-upgradable candidate the user did NOT target is benign -> info.
+    // Same `force-upgradable` token + `--force` trailer as the targeted form; no
+    // summary line; the plural tally counts the info skip among its successes.
+    // UGRM-01/UGRM-02: a bulk update whose only non-`updated` row is a benign
+    // info `(force-upgradable)` decline (partition `skipped`, 0 updated, 0
+    // failures/warnings) is a zero-realized-transition cascade. The Phase-73
+    // `(force-upgradable) {lsp}` body row + `--force` trailer still render, but
+    // the headline is the never-silent `Plugin update: nothing to update`
+    // constant -- emitted by the ORCHESTRATOR (`notifyUpdateNoOpWithContext`),
+    // NOT by composeTally (which would collapse a `tally {count: 0}` override to
+    // `""`, dropping the line = the byte-drift defect). So this fixture drives
+    // the orchestrator no-op seam via `emit`, keeping the Phase-73 row as the
+    // body. Info severity, no reload-hint.
+    "skip-force-upgradable-bulk": {
+      pi: piWithBothLoaded(),
+      message: {
+        label: "Plugin update",
+        cardinality: "plural",
+        marketplaces: [
+          {
+            name: "mp",
+            scope: "project",
+            plugins: [
+              {
+                status: "force-upgradable",
+                severity: "info",
+                needsReload: false,
+                forceHint: true,
+                name: "hello",
+                version: "1.0.0",
+                reasons: ["lsp"],
+              },
+            ],
+          },
+        ],
+      },
+      emit: (ctx, pi) => {
+        notifyUpdateNoOpWithContext(ctx as never, pi as never, UPDATE_CONTEXT, [
+          {
+            name: "mp",
+            scope: "project",
+            plugins: [
+              {
+                status: "force-upgradable",
+                severity: "info",
+                needsReload: false,
+                forceHint: true,
+                name: "hello",
+                version: "1.0.0",
+                reasons: ["lsp"],
+              },
+            ],
+          },
+        ]);
       },
     },
 
@@ -2479,6 +2755,70 @@ const FIXTURES: FixtureMap = {
       },
     },
 
+    // SEV-03 / D-69-01: the autoupdate cascade TAKES the force path, so a
+    // candidate re-resolving `unsupported` renders `(force-installed) {dropped
+    // kinds}` (◉ glyph, via the shared `forceInstalledRow`) instead of
+    // declining with `(skipped) {no longer installable}`. ALREADY-degraded case:
+    // the persisted `compatibility.unsupported` was non-empty before the
+    // auto-update, so re-degrading is benign -> INFO (no `expectedSeverity`).
+    // force-installed is a realized transition -> reload-hint fires.
+    "autoupdate-force-installed-already-degraded": {
+      pi: piWithBothLoaded(),
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            status: "updated",
+            plugins: [
+              {
+                status: "force-installed",
+                name: "degraded-plugin",
+                scope: "user",
+                version: "1.0.0",
+                dependencies: [],
+                reasons: ["lsp"],
+                severity: "info",
+                needsReload: true,
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // SEV-03 / D-69-01: the SAME `(force-installed)` autoupdate row, but the
+    // auto-update NEWLY degrades a previously-clean plugin (the persisted
+    // `compatibility.unsupported` was empty before the update). A silent
+    // automatic degradation is actionable -> `warning` + the `needs attention`
+    // summary line. The per-row bytes are identical to the already-degraded
+    // info fixture above; only the stamped severity moves.
+    "autoupdate-force-installed-newly-degraded": {
+      pi: piWithBothLoaded(),
+      expectedSeverity: "warning",
+      message: {
+        marketplaces: [
+          {
+            name: "official",
+            scope: "user",
+            status: "updated",
+            plugins: [
+              {
+                status: "force-installed",
+                name: "degraded-plugin",
+                scope: "user",
+                version: "1.0.0",
+                dependencies: [],
+                reasons: ["lsp"],
+                severity: "warning",
+                needsReload: true,
+              },
+            ],
+          },
+        ],
+      },
+    },
+
     "mp-failure-network": {
       pi: piWithBothLoaded(),
       expectedSeverity: "error",
@@ -2902,6 +3242,9 @@ const FIXTURES: FixtureMap = {
       // body line so the byte form cannot drift from the catalog state.
       message: { kind: "reconcile-pending-empty" },
     },
+    // WILL-01 / D-65.1-02: marketplace add is immediate (no `will add` token);
+    // the child install is the reload-deferred work, rendered under a bare
+    // list-arm header (no marketplace status).
     "mp-add-plugin-install": {
       pi: piWithBothLoaded(),
       message: {
@@ -2909,8 +3252,23 @@ const FIXTURES: FixtureMap = {
           {
             name: "new-mp",
             scope: "user",
-            status: "will add",
             plugins: [{ status: "will install", name: "new-plugin" }],
+          },
+        ],
+      },
+    },
+    // FSTAT-06 / D-66-04: a pending child install whose no-network candidate
+    // resolves `unsupported` carries the `force` modifier, rendering
+    // `(will force install)` in place of `(will install)`. A render modifier,
+    // not a new token; no `will force update` analog exists (D-66-05).
+    "mp-add-plugin-force-install": {
+      pi: piWithBothLoaded(),
+      message: {
+        marketplaces: [
+          {
+            name: "new-mp",
+            scope: "user",
+            plugins: [{ status: "will install", name: "degraded-plugin", force: true }],
           },
         ],
       },
@@ -2923,6 +3281,27 @@ const FIXTURES: FixtureMap = {
             name: "mp",
             scope: "user",
             plugins: [{ status: "will uninstall", name: "old-plugin" }],
+          },
+        ],
+      },
+    },
+    // WILL-03 / D-65.1-03: removing a marketplace that still has installed
+    // plugins is reload-deferred ONLY for its plugin-uninstall cascade --
+    // de-registration itself is immediate (no `will remove` marketplace token).
+    // The pending preview renders the bare list-arm header (no marketplace
+    // status) plus one `(will uninstall)` row per recorded plugin, byte-identical
+    // to the surviving `plugin-pending-uninstall` form above.
+    "marketplace-remove-with-installed-plugins": {
+      pi: piWithBothLoaded(),
+      message: {
+        marketplaces: [
+          {
+            name: "old-mp",
+            scope: "user",
+            plugins: [
+              { status: "will uninstall", name: "p1" },
+              { status: "will uninstall", name: "p2" },
+            ],
           },
         ],
       },
@@ -3161,6 +3540,66 @@ const FIXTURES: FixtureMap = {
         ],
       },
     },
+
+    // BFILL-01 / SEV-05 / D-69-04: a load-time backfill promotion row carries
+    // the re-resolved dropped-component kinds as a factual {reasons} brace
+    // through the shared narrowUnsupportedKinds seam (lspServers -> lsp). The
+    // marketplace was already added, so its header is bare (no status token).
+    // SEV-03 / A3: a benign promotion stays info -- no expectedSeverity.
+    "backfill-force-installed": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "reconcile-applied-cascade",
+        label: "Reconcile",
+        cardinality: "plural",
+        marketplaces: [
+          {
+            name: "local-mp",
+            scope: "user",
+            plugins: [
+              {
+                status: "force-installed",
+                name: "hello",
+                version: "1.0.0",
+                dependencies: [],
+                reasons: ["lsp"],
+                severity: "info",
+                needsReload: true,
+              },
+            ],
+          },
+        ],
+      },
+    },
+
+    // SEV-05 / D-69-04: a backfill force-installed row whose dropped-kind set is
+    // empty renders brace-less -- byte-identical to the pre-SEV-05 form (the
+    // change is additive; rows without reasons do not gain a brace).
+    "backfill-force-installed-no-reasons": {
+      pi: piWithBothLoaded(),
+      message: {
+        kind: "reconcile-applied-cascade",
+        label: "Reconcile",
+        cardinality: "plural",
+        marketplaces: [
+          {
+            name: "local-mp",
+            scope: "user",
+            plugins: [
+              {
+                status: "force-installed",
+                name: "hello",
+                version: "1.0.0",
+                dependencies: [],
+                reasons: [],
+                severity: "info",
+                needsReload: true,
+              },
+            ],
+          },
+        ],
+      },
+    },
   },
 };
 
@@ -3213,7 +3652,14 @@ test("catalog UAT: every <!-- catalog-state: --> annotation pairs byte-equal wit
     // Fresh ctx per iteration -- mock.fn() accumulates calls across
     // invocations, so reusing it would leak state across fixtures.
     const ctx = makeCtx();
-    notify(ctx as never, fixture.pi as never, fixture.message);
+    // UGRM-01/UGRM-02: orchestrator-emitted no-op states route through the
+    // fixture's `emit` override (`emitUpdateNoOpCascade`); every other state
+    // drives the `notify()` renderer directly.
+    if (fixture.emit !== undefined) {
+      fixture.emit(ctx, fixture.pi);
+    } else {
+      notify(ctx as never, fixture.pi as never, fixture.message);
+    }
 
     assert.equal(
       ctx.ui.notify.mock.calls.length,
@@ -3283,6 +3729,126 @@ test("catalog UAT: every <!-- catalog-state: --> annotation pairs byte-equal wit
       .join("\n\n");
     assert.fail(`catalog UAT failures (${failures.length}):\n${formatted}`);
   }
+});
+
+// XSURF-03 cross-surface byte-parity: the `update`-decline `force-upgradable`
+// reason brace MUST be byte-identical to the `list (force-upgradable)` reason
+// brace for the SAME degrade kinds. This is what justifies sourcing the
+// update-decline reason via the SAME `narrowUnsupportedKinds` seam the `list`
+// row uses (rather than the install-path `narrowResolverReasons`, which also
+// folds in note-derived reasons and could diverge). The assertion renders both
+// rows through `notify()` and compares the `(force-upgradable) {…}` segment.
+test("XSURF-03: update-decline force-upgradable reason brace === list force-upgradable brace (same kinds)", () => {
+  // Both surfaces source the degrade reason from the shared kind-narrowing seam.
+  const kinds = ["lspServers", "themes"];
+  const reasons = narrowUnsupportedKinds(kinds);
+
+  // The list-inventory row (no forceHint -> no trailer).
+  const listCtx = makeCtx();
+  notify(listCtx as never, piWithBothLoaded() as never, {
+    marketplaces: [
+      {
+        name: "mp",
+        scope: "project",
+        plugins: [{ status: "force-upgradable", name: "hello", version: "1.0.0", reasons }],
+      },
+    ],
+  });
+
+  // The update-decline row (forceHint -> update trailer + warning severity).
+  const declineCtx = makeCtx();
+  notify(declineCtx as never, piWithBothLoaded() as never, {
+    label: "Plugin update",
+    cardinality: "single",
+    marketplaces: [
+      {
+        name: "mp",
+        scope: "project",
+        plugins: [
+          {
+            status: "force-upgradable",
+            name: "hello",
+            version: "1.0.0",
+            reasons,
+            forceHint: true,
+            severity: "warning",
+            needsReload: false,
+          },
+        ],
+      },
+    ],
+  });
+
+  const extractBrace = (s: string): string => {
+    const m = /\(force-upgradable\) (\{[^}]*\})/.exec(s);
+    assert.ok(m, `expected a (force-upgradable) {…} brace in:\n${s}`);
+    return m[1]!;
+  };
+
+  const listBody = listCtx.ui.notify.mock.calls[0]!.arguments[0] as string;
+  const declineBody = declineCtx.ui.notify.mock.calls[0]!.arguments[0] as string;
+
+  assert.equal(
+    extractBrace(declineBody),
+    extractBrace(listBody),
+    "the update-decline reason brace must be byte-identical to the list force-upgradable brace",
+  );
+});
+
+test("UGRM-02 scope discipline: a non-update bulk cascade keeps `N successes` (no tally override)", () => {
+  // A reinstall cascade carries NO `tally` override, so `composeTally` runs the
+  // legacy info-row success math: two `reinstalled` rows + one idempotent
+  // `(skipped) {up-to-date}` row are the three at-desired-state successes. The
+  // update-scoped UGRM-02 override must NOT leak into other ops -- this proves
+  // install / reinstall / marketplace / import keep `N success(es)`.
+  const ctx = makeCtx();
+  notify(ctx as never, piWithBothLoaded() as never, {
+    label: "Plugin reinstall",
+    cardinality: "plural",
+    marketplaces: [
+      {
+        name: "official",
+        scope: "user",
+        plugins: [
+          {
+            status: "reinstalled",
+            severity: "info",
+            needsReload: true,
+            name: "alpha",
+            version: "1.0.0",
+            dependencies: [],
+          },
+          {
+            status: "reinstalled",
+            severity: "info",
+            needsReload: true,
+            name: "gamma",
+            version: "1.0.0",
+            dependencies: [],
+          },
+          {
+            status: "skipped",
+            name: "beta",
+            reasons: ["up-to-date"],
+            severity: "info",
+            needsReload: false,
+          },
+        ],
+      },
+    ],
+  });
+
+  const body = ctx.ui.notify.mock.calls[0]!.arguments[0] as string;
+  assert.match(
+    body,
+    /Plugin reinstall: 3 successes/,
+    "reinstall must keep the at-desired-state `N successes` grammar (no UGRM-02 override)",
+  );
+  assert.doesNotMatch(
+    body,
+    /\bupdated\b/,
+    "the update-scoped `updated` verb must not leak into a reinstall summary",
+  );
 });
 
 test("catalog UAT inverse walk: every FIXTURES (section,state) has a matching catalog annotation (no orphan/stale fixture)", async () => {

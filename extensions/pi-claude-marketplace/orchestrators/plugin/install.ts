@@ -100,10 +100,15 @@ import { parseHooksConfig } from "../../domain/components/hooks.ts";
 import { PLUGIN_ENTRY_VALIDATOR } from "../../domain/components/plugin.ts";
 import { loadMarketplaceManifest } from "../../domain/manifest.ts";
 import { asAbsolutePluginRoot } from "../../domain/plugin-root.ts";
-import { requireInstallable, resolveStrict } from "../../domain/resolver.ts";
+import {
+  requireForceInstallable,
+  requireInstallable,
+  resolveStrict,
+} from "../../domain/resolver.ts";
 import { loadConfig } from "../../persistence/config-io.ts";
 import { writeBatchedConfigEntries } from "../../persistence/config-write-back.ts";
 import { locationsFor } from "../../persistence/locations.ts";
+import { softDepStatus } from "../../platform/pi-api.ts";
 import { dropMarketplaceCache } from "../../shared/completion-cache.ts";
 import { hookDebugLog } from "../../shared/debug-log.ts";
 import {
@@ -114,8 +119,10 @@ import {
   PluginShapeError,
 } from "../../shared/errors.ts";
 import { notifyWithContext } from "../../shared/notify-context.ts";
+import { companionSeverity } from "../../shared/notify-reasons.ts";
 import { notify } from "../../shared/notify.ts";
 import { PathContainmentError } from "../../shared/path-safety.ts";
+import { narrowUnsupportedKinds } from "../../shared/probe-classifiers.ts";
 import { runPhases, type Phase, type RollbackPartial } from "../../transaction/phase-ledger.ts";
 import { withLockedStateTransaction } from "../../transaction/with-state-guard.ts";
 
@@ -135,7 +142,7 @@ import type { PreparedCommandsStaging } from "../../bridges/commands/index.ts";
 import type { PreparedMcpStaging } from "../../bridges/mcp/index.ts";
 import type { PreparedSkillsStaging } from "../../bridges/skills/index.ts";
 import type { PluginEntry } from "../../domain/components/plugin.ts";
-import type { ResolvedPluginInstallable } from "../../domain/resolver.ts";
+import type { MaterializablePlugin } from "../../domain/resolver.ts";
 import type { ScopeConfig } from "../../persistence/config-io.ts";
 import type { ScopedLocations } from "../../persistence/locations.ts";
 import type { ExtensionState } from "../../persistence/state-io.ts";
@@ -144,8 +151,8 @@ import type { Dependency } from "../../shared/concerns/soft-dep.ts";
 import type {
   ContentReason,
   PluginFailedMessage,
-  PluginInstalledMessage,
   PluginUnavailableMessage,
+  PluginUnsupportedMessage,
   StatusToken,
 } from "../../shared/notify.ts";
 import type { Scope } from "../../shared/types.ts";
@@ -166,6 +173,10 @@ interface EntityErrorRow {
   readonly scope?: Scope;
   readonly status: Extract<StatusToken, "failed" | "unavailable">;
   readonly reasons: readonly ContentReason[];
+  // SEV-02 / D-69-03: carried from the thrown PluginShapeError's `forceable`
+  // discriminant on the `unavailable` arm -- `true` when the resolver verdict
+  // is force-degradable `unsupported`, so the composed row points at `--force`.
+  readonly forceable?: boolean;
 }
 
 /**
@@ -255,6 +266,14 @@ export interface InstallPluginOptions {
    */
   readonly mapModel?: boolean;
   /**
+   * D-65-03: when true, the install preflight selects `requireForceInstallable`
+   * instead of `requireInstallable`, widening the gate to admit the
+   * `unsupported` arm so its supported components materialize (the unsupported
+   * ones are skipped naturally; FORCE-01). The edge handler sets this when the
+   * user supplies `--force`. Both gates still reject `unavailable` (FORCE-05).
+   */
+  readonly force?: boolean;
+  /**
    * D-54-01 / ENBL-02: when set, bypasses `resolvePluginVersion` and pins
    * the install ledger to this exact version string. Used ONLY by
    * `setPluginEnabled` (the enable branch) to preserve the recorded state
@@ -288,7 +307,10 @@ interface InstallCtx {
   readonly cwd: string;
   readonly marketplace: string;
   readonly plugin: string;
-  readonly resolved: ResolvedPluginInstallable;
+  // NFR-7 / D-65-03: widened to the force-materializable union so the
+  // `unsupported` arm (admitted under --force) flows through the same
+  // materialize phases. Excludes `unavailable` (no pluginRoot).
+  readonly resolved: MaterializablePlugin;
   readonly version: string;
   readonly pluginDataDir: string;
   // Prep handles populated by each phase.do before that phase's commit.
@@ -342,6 +364,8 @@ export interface InstallLedgerOptions {
   readonly plugin: string;
   /** AG-7 opt-in `--map-model` flag (see InstallPluginOptions.mapModel). */
   readonly mapModel?: boolean;
+  /** D-65-03 `--force` gate-selection flag (see InstallPluginOptions.force). */
+  readonly force?: boolean;
   /** ENBL-02 version pin (see InstallPluginOptions.pinVersionOverride). */
   readonly pinVersionOverride?: string;
   /**
@@ -465,16 +489,29 @@ export async function runInstallLedger(
 
   const entry: PluginEntry = entryRaw;
 
-  // PI-4: resolveStrict + requireInstallable. Per D-04, the
-  // strict resolver consumes the array-shape componentPaths (D-07 /
-  // COMP-01) and either returns an installable variant or surfaces
-  // disqualification notes. requireInstallable narrows the discriminated
-  // union and throws on the not-installable variant.
+  // PI-4: resolveStrict + gate. Per D-04, the strict resolver consumes the
+  // array-shape componentPaths (D-07 / COMP-01) and either returns an
+  // installable variant or surfaces disqualification notes. The gate below
+  // branches on `opts.force`: the default path calls `requireInstallable`
+  // (admits only `installable`); `--force` calls `requireForceInstallable`
+  // (also admits the force-degradable `unsupported` arm). Both narrow the
+  // discriminated union and throw on the structural `unavailable` variant.
   const resolved = await resolveStrict(entry, { marketplaceRoot: sourceMp.marketplaceRoot });
-  requireInstallable(resolved, "install");
-  // After requireInstallable, `resolved` is narrowed to the installable
-  // variant; pluginRoot etc. are reachable.
-  const installable: ResolvedPluginInstallable = resolved;
+  // D-65-03 / FORCE-01/03/05: `--force` widens the gate to admit the
+  // force-degradable `unsupported` arm; the default gate still blocks it. Both
+  // gates reject `unavailable` (FORCE-05), so `--force` never bypasses a hard
+  // structural failure.
+  if (opts.force === true) {
+    requireForceInstallable(resolved, "install");
+  } else {
+    requireInstallable(resolved, "install");
+  }
+
+  // After the gate, `resolved` is narrowed to the force-materializable union
+  // (`installable | unsupported`); pluginRoot etc. are reachable. The
+  // `unsupported` arm carries only supported kinds in componentPaths, so the
+  // shared materialize phases degrade it naturally (D-65-02, no force branch).
+  const installable: MaterializablePlugin = resolved;
 
   // Generated-name discovery (PI-6 input). Walks the bridges' discover.ts
   // to enumerate source artefacts under componentPaths, then applies the
@@ -769,7 +806,14 @@ export async function runInstallLedger(
         version: c.version,
         resolvedSource: c.resolved.pluginRoot,
         compatibility: {
-          installable: true,
+          // INV-1 / D-66-01 / BFILL-01: record the REAL compatibility from the
+          // resolve, not a hardcoded `true`. A `--force` install of an
+          // `unsupported` plugin persists `installable: false` with the still-
+          // unsupported set (mirrors reinstall.ts::updateStateRecord), so the
+          // force-installed derivation stays truthful AND load-time backfill
+          // (which keys on `!compatibility.installable`) can later promote it
+          // when its supported set grows. A clean install persists `true`.
+          installable: c.resolved.state === "installable",
           notes: [...c.resolved.notes],
           supported: [...c.resolved.supported],
           unsupported: [...c.resolved.unsupported],
@@ -946,6 +990,7 @@ export async function installPlugin(opts: InstallPluginOptions): Promise<Install
           marketplace,
           plugin,
           ...(opts.mapModel !== undefined && { mapModel: opts.mapModel }),
+          ...(opts.force !== undefined && { force: opts.force }),
           ...(opts.pinVersionOverride !== undefined && {
             pinVersionOverride: opts.pinVersionOverride,
           }),
@@ -1358,16 +1403,59 @@ export async function installPlugin(opts: InstallPluginOptions): Promise<Install
       reasons.push("orphan rewake");
     }
 
-    const installedRow: PluginInstalledMessage = {
-      status: "installed",
-      name: plugin,
-      dependencies,
-      version: installCtx.version,
-      ...(reasons.length > 0 && { reasons }),
-      // D-03/D-06: realized install transition -> info, reloads Pi resources.
-      severity: "info",
-      needsReload: true,
-    };
+    // FSTAT-07 / D-66-04: when the live resolved state is `unsupported`, the
+    // install was force-completed with one or more components dropped -- the
+    // success row reports `(force-installed)` carrying the dropped-component
+    // detail via the shared `narrowUnsupportedKinds` helper. This reads the
+    // LIVE resolved state of the just-completed install -- NOT the persisted
+    // `compatibility.unsupported` record the `list` / non-path `info` derivers
+    // read; the two agree here only because the install just wrote that record.
+    // A fully-supported install stays `(installed)` (FSTAT-03 -- no lingering
+    // force state). force-installed is a realized transition
+    // (TRANSITION_STATUS_LIST), so it stamps the same info-severity + reload as
+    // installed. WR-03: the force-degradable `unsupported` arm still stages the
+    // SUPPORTED components, so the row threads `dependencies` -- the soft-dep
+    // `{requires pi-subagents}` / `{requires pi-mcp}` markers fire on a degraded
+    // install exactly as on a clean one (where the signal is most relevant).
+    // SEV-01: an otherwise-successful install whose DECLARED soft-dep companion
+    // is unloaded silently degrades a clean install -> raise the desired-state
+    // severity from info to warning. A staged agent declares a `pi-subagents`
+    // companion; a staged mcp server declares `pi-mcp-adapter`. `softDepStatus`
+    // is the single sanctioned companion probe -- the same one the renderer uses
+    // for the `{requires pi-...}` marker that already renders the detail, so this
+    // is a metadata-only stamp (the per-row bytes do not change; the cascade
+    // gains the warning summary line). A loaded companion -- or no declared
+    // companion -- keeps the info stamp. Applies to BOTH the clean `installed`
+    // and degraded `force-installed` success arms.
+    const successSeverity = companionSeverity(
+      {
+        declaresAgents: installCtx.stagedAgentNames.length > 0,
+        declaresMcp: installCtx.stagedMcpServerNames.length > 0,
+      },
+      softDepStatus(pi),
+    );
+    const installedRow: InstallMsg =
+      installCtx.resolved.state === "unsupported"
+        ? {
+            status: "force-installed",
+            name: plugin,
+            dependencies,
+            version: installCtx.version,
+            reasons: [...reasons, ...narrowUnsupportedKinds(installCtx.resolved.unsupported)],
+            severity: successSeverity,
+            needsReload: true,
+          }
+        : {
+            status: "installed",
+            name: plugin,
+            dependencies,
+            version: installCtx.version,
+            ...(reasons.length > 0 && { reasons }),
+            // D-03/D-06: realized install transition -> reloads Pi resources.
+            // SEV-01: info, raised to warning above on a missing companion.
+            severity: successSeverity,
+            needsReload: true,
+          };
     // notify() call mirrors the recipe at
     // orchestrators/plugin/uninstall.ts; install.ts substitutes
     // "installed" + dependencies[] + per-D-19-03 failure branches
@@ -1427,6 +1515,46 @@ export async function installPlugin(opts: InstallPluginOptions): Promise<Install
 // cause-chain composition (e.g. to disambiguate a same-named plugin
 // across marketplaces), add it back here with a comment marking the
 // dependency.
+/**
+ * SEV-02 / D-69-03 / D-70-02 / XSURF-01: build the install-failure row,
+ * branching on the three-way `forceable` discriminant the resolver stamped on
+ * the throw. BOTH arms render at error severity (so the leading summary line
+ * fires) -- an install failure must read as an error, not a benign info row.
+ * The force-degradable arm surfaces as the resolver-state-driven `unsupported`
+ * token (XSURF-01: consistent with how `list` / `info` describe the same
+ * plugin) and ALSO carries the `--force` hint trailer (force can degrade-install
+ * it). The structural arm stays the `unavailable` token with NO hint (force
+ * cannot degrade-install a structural defect). The split keys on
+ * `entityErrorRow.forceable`, NOT the reason brace -- `{unsupported source}`
+ * appears on both arms; only the resolver verdict distinguishes them. Neither
+ * message carries a `cause?` field per D-15-01 -- the reason text carries the
+ * explanation.
+ */
+function composeNotInstallableMessage(
+  plugin: string,
+  version: string | undefined,
+  entityErrorRow: EntityErrorRow,
+): PluginUnavailableMessage | PluginUnsupportedMessage {
+  if (entityErrorRow.forceable === true) {
+    return {
+      status: "unsupported",
+      name: plugin,
+      reasons: entityErrorRow.reasons,
+      ...(version !== undefined && version !== "" && { version }),
+      severity: "error" as const,
+      forceHint: true,
+    };
+  }
+
+  return {
+    status: "unavailable",
+    name: plugin,
+    reasons: entityErrorRow.reasons,
+    ...(version !== undefined && version !== "" && { version }),
+    severity: "error" as const,
+  };
+}
+
 function composeInstallFailureMessage(args: {
   err: unknown;
   plugin: string;
@@ -1485,13 +1613,7 @@ function composeInstallFailureMessage(args: {
   // field per D-15-01 -- the reason text carries the explanation.
   if (entityErrorRow !== undefined) {
     if (entityErrorRow.status === "unavailable") {
-      const unavailable: PluginUnavailableMessage = {
-        status: "unavailable",
-        name: plugin,
-        reasons: entityErrorRow.reasons,
-        ...(version !== undefined && version !== "" && { version }),
-      };
-      return unavailable;
+      return composeNotInstallableMessage(plugin, version, entityErrorRow);
     }
 
     const failed: PluginFailedMessage = {
@@ -1603,7 +1725,10 @@ function classifyEntityShapeError(
         // `.kind === "not-installable" | "no-longer-installable"`
         // guarantees `.reasons` is present -- no `?? []` fallback
         // needed.
-        reasons: narrowResolverReasons(err.shape.reasons),
+        reasons: narrowResolverReasons(err.shape.reasons, err.shape.unsupportedKinds),
+        // SEV-02 / D-69-03: thread the three-way distinction the resolver
+        // stamped on the throw so the composer conditions the `--force` hint.
+        forceable: err.shape.forceable,
       };
     default:
       return assertNever(err.shape);
@@ -1633,20 +1758,21 @@ function classifyEntityShapeError(
 const MANIFEST_FIELD_REASONS: ReadonlySet<string> = new Set(["lspServers"]);
 const MANIFEST_FIELD_NOTE_PREFIX = "contains ";
 
-// SNM-36 / D-24-04 detection-vs-emission seam: the DETECTION token stays
-// camelCase (matches the resolver note derived from the JSON manifest key);
-// the EMITTED closed-set Reason is the user-rendered value. `lspServers`
-// detects but renders as `lsp`.
-const MANIFEST_FIELD_TO_REASON: Readonly<Record<string, ContentReason>> = {
-  lspServers: "lsp",
-};
-
 /**
  * Extract the bare manifest-field token from a resolver `"contains <kind>"`
  * note and map it to the emitted closed-set `Reason`. Returns `undefined`
- * when the note does not start with the prefix or the token has no mapping.
- * Detection token (camelCase) and emitted Reason can differ -- see the
- * SNM-36 / D-24-04 seam note above.
+ * when the note does not start with the prefix or the token is not a
+ * recognized per-kind unsupported marker.
+ *
+ * SNM-36 / D-24-04 detection-vs-emission seam: the DETECTION token stays
+ * camelCase (matches the resolver note derived from the JSON manifest key);
+ * the EMITTED closed-set Reason is the user-rendered value. `lspServers`
+ * detects but renders as `lsp`.
+ *
+ * D-64-02 / RSTATE-05: the token -> Reason mapping is the single shared
+ * render helper `narrowUnsupportedKinds`, so the install error surface emits
+ * the same per-kind marker `list` and `info` do (SURF-01 cross-surface
+ * parity); install no longer carries its own per-kind mapping table.
  */
 function manifestFieldTokenFromNote(note: string): ContentReason | undefined {
   if (!note.startsWith(MANIFEST_FIELD_NOTE_PREFIX)) {
@@ -1660,9 +1786,10 @@ function manifestFieldTokenFromNote(note: string): ContentReason | undefined {
     return undefined;
   }
 
-  // EMIT: map the detected camelCase token to its closed-set Reason.
-  // Typed lookup -- no cast needed (D-24-04 / D-24-05 seam).
-  return MANIFEST_FIELD_TO_REASON[token];
+  // EMIT: map the detected camelCase token to its closed-set Reason via the
+  // shared render helper (D-64-02). The detection gate above admits only
+  // `lspServers`, so this always resolves to `lsp`.
+  return narrowUnsupportedKinds([token])[0];
 }
 
 /**
@@ -1675,16 +1802,32 @@ function manifestFieldTokenFromNote(note: string): ContentReason | undefined {
  *      cross-surface parity (HOOK-03 / LIFE-01 / SURF-01)
  *   1. manifest-field carve-out (`contains lspServers`) -- HOOK-04 / D-58-02
  *      dropped the dead `contains hooks` half (hooks is supported under v1.13)
+ *   1b. any other `contains <kind>` note (e.g. `monitors`, `themes`) routes its
+ *      bare token through the shared `narrowUnsupportedKinds` helper so the
+ *      install surface emits the same per-kind marker set as `list`/`info`
+ *      (CR-01 / SURF-01 / D-64-02) instead of dropping non-`lspServers` kinds
  *   2. "source" substring -> `unsupported source`
  *   3. errno-like substrings (EACCES / EPERM / ENOENT / SyntaxError)
  *   4. permissive fallback: `unsupported source`
  * Steps 3-4 are defensive for notes already serialised by deeper helpers;
  * the preferred path is typed errno-bearing Errors dispatched at the
  * orchestrator catch site via `.code`.
+ *
+ * IN-02 / RSTATE-05: `unsupportedKinds` is the resolver's typed `unsupported[]`
+ * component-kind list (carried on the thrown `PluginShapeError`). It is narrowed
+ * FIRST, through the shared `narrowUnsupportedKinds` helper, so the failure row
+ * renders the same per-kind markers `list`/`info` do. This is the ONLY reason
+ * source for a `hooks`-only unsupported plugin (which carries no `contains hooks`
+ * note), and it is deduped against the note-derived markers (e.g. a `lspServers`
+ * plugin yields one `lsp`, sourced from both the note and the typed kind). The
+ * permissive `unsupported source` fallback fires only when BOTH sources are empty.
  */
 // eslint-disable-next-line sonarjs/cognitive-complexity
-function narrowResolverReasons(reasons: readonly string[]): readonly ContentReason[] {
-  const out: ContentReason[] = [];
+function narrowResolverReasons(
+  reasons: readonly string[],
+  unsupportedKinds: readonly string[] = [],
+): readonly ContentReason[] {
+  const out: ContentReason[] = [...narrowUnsupportedKinds(unsupportedKinds)];
   for (const reason of reasons) {
     if (reason === "") {
       continue;
@@ -1713,6 +1856,19 @@ function narrowResolverReasons(reasons: readonly string[]): readonly ContentReas
     const manifestFieldToken = manifestFieldTokenFromNote(reason);
     if (manifestFieldToken !== undefined) {
       out.push(manifestFieldToken);
+      continue;
+    }
+
+    // CR-01 / SURF-01 / D-64-02: a `contains <kind>` note for a kind OTHER than
+    // the `lspServers` carve-out handled above (e.g. `monitors`, `themes`) is
+    // still a per-kind unsupported component marker. Route its bare token
+    // through the SAME shared helper `list`/`info` consume so a multi-kind
+    // `unsupported` plugin emits a byte-identical marker set on every surface.
+    // Previously these notes were dropped here whenever an earlier note had
+    // already populated `out` (the empty-array fallback then did not fire), so
+    // `install` rendered fewer markers than `list`/`info` for the same plugin.
+    if (reason.startsWith(MANIFEST_FIELD_NOTE_PREFIX)) {
+      out.push(...narrowUnsupportedKinds([reason.slice(MANIFEST_FIELD_NOTE_PREFIX.length)]));
       continue;
     }
 
@@ -1767,4 +1923,5 @@ function classifyInstallFailure(err: unknown, formattedCause: string): InstallPl
  */
 export { classifyEntityShapeError as __test_classifyEntityShapeError };
 export { classifyInstallFailure as __test_classifyInstallFailure };
+export { composeInstallFailureMessage as __test_composeInstallFailureMessage };
 export { narrowResolverReasons as __test_narrowResolverReasons };

@@ -185,7 +185,7 @@ export function redactAbsolutePaths(text: string): string {
  * tuple; the bare-token render shape (no icon, no scope brackets) is a
  * renderer concern that branches at emission time.
  *
- * DIFF-02 (D-53-02): the 6 `"will *"` entries are the pending-tense tokens
+ * DIFF-02 (D-53-02): the 4 `"will *"` entries are the pending-tense tokens
  * emitted by `/claude:plugin pending` rows. They are STRUCTURALLY EXCLUDED
  * from `shouldEmitReloadHint`'s trigger set (pending rows are
  * pre-transition; `/reload to pick up changes` is grammatically false for
@@ -211,13 +211,27 @@ export const STATUS_TOKENS = [
   "manual recovery",
   "no marketplaces",
   "no plugins",
-  "will add",
-  "will remove",
   "will install",
   "will uninstall",
   "will enable",
   "will disable",
   "disabled",
+  // FSTAT-02 / FSTAT-04 / D-66-03: derived force-state realized tokens. Both
+  // are appended LAST (below the reload-hint trigger window, like "disabled"):
+  // `force-installed` (◉) is a recorded-installed plugin currently re-resolving
+  // `unsupported`; `force-upgradable` (●) is a currently-clean installed plugin
+  // whose newer cache candidate would NEWLY degrade. The `will force install`
+  // pending case is a render MODIFIER on `will install`, NOT a token, so the set
+  // grows by exactly 2 (D-66-05).
+  "force-installed",
+  "force-upgradable",
+  // USTAT-02 / D-64-01: the not-installed, force-installable `unsupported`
+  // render token. Appended LAST (below the reload-hint trigger window, like
+  // `disabled` and the force-state tokens). Distinct from `unavailable`: a
+  // plugin resolving `unsupported` has no structural defect -- it would
+  // degrade-install (drop unsupported components) under `--force`. Maps to the
+  // dedicated `ICON_UNSUPPORTED` (`⊖`) glyph.
+  "unsupported",
 ] as const;
 
 export type StatusToken = (typeof STATUS_TOKENS)[number];
@@ -386,15 +400,32 @@ export const PLUGIN_STATUSES = [
   "will enable",
   "will disable",
   "disabled",
+  // FSTAT-02 / FSTAT-04 / D-66-03: derived force-state realized tokens,
+  // appended last (mirrors the STATUS_TOKENS ordering). `force-installed`
+  // stamps `needsReload: true` on the install/update success cascade (a
+  // realized transition like `installed`); `force-upgradable` is a
+  // list-inventory-only row (`needsReload: false`).
+  "force-installed",
+  "force-upgradable",
+  // USTAT-02 / D-64-01: the not-installed, force-installable `unsupported`
+  // plugin-status member. REQUIRED here (not just in STATUS_TOKENS) because
+  // `PluginInfoRowBase.status` derives via `Extract<PluginStatus, ...>`; without
+  // this entry `Extract<PluginStatus, "unsupported">` resolves to `never`. This
+  // is an inventory/list-surface row (no realized transition), so it stamps no
+  // reload-hint trigger -- like `available` / `unavailable`.
+  "unsupported",
 ] as const;
 
 /**
  * Runtime tuple of every marketplace status literal; the derived
  * `MarketplaceStatus` union is the SNM-05 closed set.
  * `"autoupdate enabled"` / `"autoupdate disabled"` / `"skipped"` support the
- * autoupdate-flip surface; the 2 trailing `"will *"` entries are the DIFF-02
- * pending-tense tokens. Order is normative -- the 4 leading entries
- * retain their position to match the `renderMpHeader` switch-arm ordering.
+ * autoupdate-flip surface. Marketplace add/remove are immediate (WILL-01 /
+ * D-65.1-02 / D-65.1-03): de-registration carries no `will` token and the
+ * reload-deferred plugin-uninstall cascade is surfaced as per-plugin
+ * `will uninstall` child rows, so this set carries no marketplace-level
+ * `will *` token. Order is normative -- the 4 leading entries retain their
+ * position to match the `renderMpHeader` switch-arm ordering.
  *
  * Pattern: closed-set `as const` tuple + `(typeof X)[number]` literal-union.
  */
@@ -406,8 +437,6 @@ export const MARKETPLACE_STATUSES = [
   "autoupdate enabled",
   "autoupdate disabled",
   "skipped",
-  "will add",
-  "will remove",
 ] as const;
 
 /**
@@ -656,6 +685,39 @@ export interface PluginUnavailableMessage extends MessageBase {
   readonly reasons: readonly ContentReason[];
   readonly version?: string;
   readonly description?: string;
+  // SEV-02 / D-69-03: set on the install-failure surface when the resolver
+  // verdict is `unsupported` (force-degradable). The renderer appends a
+  // 4-space-indented `--force` hint trailer below the row pointing the user
+  // at the flag that can degrade-install the plugin. Absent on the
+  // structural `unavailable` arm (force cannot help) and on every list /
+  // inventory surface, which render byte-frozen.
+  readonly forceHint?: boolean;
+}
+
+/**
+ * `(unsupported)` -- row for a not-installed, force-installable plugin
+ * (USTAT-01 / D-64-01 / XSURF-01). The manifest is structurally sound but
+ * carries components Pi cannot install (lsp / hooks / unsupported source), so
+ * the plugin would degrade-install under `--force`. Mirrors
+ * `PluginUnavailableMessage` (carries REQUIRED `reasons`; NO `scope` (SNM-11);
+ * no `dependencies`; PL-4 optional `description`). The list / info inventory
+ * rows OMIT `forceHint` and render byte-frozen with no `--force` trailer; the
+ * install-failure surface (XSURF-01) sets `forceHint: true` so the renderer
+ * appends the SEV-02 `--force` hint trailer. Uses the dedicated
+ * `ICON_UNSUPPORTED` (`⊖`) glyph. `extends MessageBase` (optional severity,
+ * defaults to info -- this is a token rename, not a severity change).
+ */
+export interface PluginUnsupportedMessage extends MessageBase {
+  readonly status: "unsupported";
+  readonly name: string;
+  readonly reasons: readonly ContentReason[];
+  readonly version?: string;
+  readonly description?: string;
+  // SEV-02 / XSURF-01: set on the install-failure surface when the resolver
+  // verdict is `unsupported` (force-degradable). The renderer appends a
+  // 4-space-indented `--force` hint trailer below the row. Absent on every
+  // list / info inventory surface, which render byte-frozen.
+  readonly forceHint?: boolean;
 }
 
 /**
@@ -672,6 +734,61 @@ export interface PluginUpgradableMessage extends MessageBase {
   readonly version?: string;
   readonly scope?: Scope;
   readonly description?: string;
+}
+
+/**
+ * `(force-installed)` -- FSTAT-02 / D-66-03 row for a recorded-installed plugin
+ * that currently re-resolves `unsupported` (installed with components dropped).
+ * Surfaces on the list inventory surface AND the install/update success cascade.
+ * Modeled on `PluginUpgradableMessage`: carries REQUIRED `reasons` (the dropped-
+ * component / degradation detail). Uses the dedicated `ICON_FORCE_INSTALLED`
+ * (`◉`) glyph. PL-4: optional `description` on the list surface, truncated at
+ * column 66.
+ *
+ * WR-03: optional `dependencies?: readonly Dependency[]`. The force-degradable
+ * `unsupported` resolver arm still materializes the SUPPORTED components, so a
+ * force-installed plugin can legitimately stage agents / mcp servers. When the
+ * install/update success cascade builds this row it threads the staged
+ * dependencies so the `{requires pi-subagents}` / `{requires pi-mcp}` soft-dep
+ * markers fire on a degraded install exactly as on a clean `(installed)` row --
+ * the signal is most relevant precisely on a degraded install. The
+ * list/info INVENTORY force rows OMIT `dependencies` (the inventory surface
+ * carries no soft-dep markers), so they render unchanged.
+ */
+export interface PluginForceInstalledMessage extends MessageBase {
+  readonly status: "force-installed";
+  readonly name: string;
+  readonly reasons: readonly ContentReason[];
+  readonly dependencies?: readonly Dependency[];
+  readonly version?: string;
+  readonly scope?: Scope;
+  readonly description?: string;
+}
+
+/**
+ * `(force-upgradable)` -- FSTAT-04 / D-66-02 / D-66-03 row for a currently-clean
+ * installed plugin whose newer no-network cache candidate would NEWLY degrade
+ * it. Emitted on the list inventory surface AND, per XSURF-03, on the manual
+ * update-decline surface (a no-`--force` update of a force-upgradable plugin
+ * declines rather than degrading; the declined row reuses this token to read
+ * consistently with `list`). REUSES `ICON_INSTALLED` (`●`) because the row is
+ * currently clean, mirroring the `upgradable` arm. Carries REQUIRED `reasons`;
+ * no `dependencies`. The list inventory row OMITS `forceHint` and renders
+ * byte-frozen; the update-decline row sets `forceHint: true` (and carries the
+ * pre-update version) so the renderer appends the update-worded `--force` hint
+ * trailer. PL-4: optional `description`, truncated at column 66.
+ */
+export interface PluginForceUpgradableMessage extends MessageBase {
+  readonly status: "force-upgradable";
+  readonly name: string;
+  readonly reasons: readonly ContentReason[];
+  readonly version?: string;
+  readonly scope?: Scope;
+  readonly description?: string;
+  // SEV-04 / XSURF-03: set on the manual update-decline surface. The renderer
+  // appends a 4-space-indented update-worded `--force` hint trailer below the
+  // row. Absent on the list inventory row, which renders byte-frozen.
+  readonly forceHint?: boolean;
 }
 
 /**
@@ -742,6 +859,13 @@ export interface PluginWillInstallMessage extends MessageBase {
   readonly status: "will install";
   readonly name: string;
   readonly scope?: Scope;
+  // FSTAT-06 / D-66-04: render-time modifier. When `true`, the row renders
+  // `(will force install)` -- the planned install would degrade (resolves
+  // `unsupported`) and proceed under the force path -- instead of
+  // `(will install)`. A modifier, NOT a new closed-set token (D-66-05): the
+  // `will force update` analog is VACUOUS (the reconcile plan has no update
+  // bucket), so no force-update render path exists.
+  readonly force?: boolean;
 }
 
 /**
@@ -795,6 +919,7 @@ export type PluginNotificationMessage =
   | PluginUninstalledMessage
   | PluginAvailableMessage
   | PluginUnavailableMessage
+  | PluginUnsupportedMessage
   | PluginUpgradableMessage
   | PluginFailedMessage
   | PluginSkippedMessage
@@ -803,7 +928,9 @@ export type PluginNotificationMessage =
   | PluginWillUninstallMessage
   | PluginWillEnableMessage
   | PluginWillDisableMessage
-  | PluginDisabledMessage;
+  | PluginDisabledMessage
+  | PluginForceInstalledMessage
+  | PluginForceUpgradableMessage;
 
 /**
  * Common fields shared by every arm of the per-status
@@ -884,24 +1011,6 @@ interface MpSkipped extends MpCommon {
 }
 
 /**
- * `(will add)` marketplace block (DIFF-02). Pending-list row for a marketplace
- * declared in config but not yet recorded. Never carries `reasons` /
- * `details` -- pending-list rows are pre-transition.
- */
-interface MpWillAdd extends MpCommon {
-  readonly status: "will add";
-}
-
-/**
- * `(will remove)` marketplace block (DIFF-02). Pending-list row for a marketplace
- * recorded in state but no longer declared. Never carries `reasons` /
- * `details`.
- */
-interface MpWillRemove extends MpCommon {
-  readonly status: "will remove";
-}
-
-/**
  * List / inventory marketplace block (status omitted). Modeled as
  * `status?: undefined` so the many status-omitted construction sites compile
  * unchanged and the renderer's `case undefined:` narrows to this arm.
@@ -930,8 +1039,6 @@ export type MarketplaceNotificationMessage =
   | MpAutoupdateEnabled
   | MpAutoupdateDisabled
   | MpSkipped
-  | MpWillAdd
-  | MpWillRemove
   | MpList;
 
 /**
@@ -976,6 +1083,17 @@ export interface CascadeNotificationMessage {
   // trailing tally renders IFF `cardinality === "plural"` -- NOT a render-time
   // row-count heuristic. Absent defaults to no tally.
   readonly cardinality?: "single" | "plural";
+  // UGRM-02 / OUT-03 / D-04: an OPT-IN, update-scoped override of the trailing
+  // tally's SUCCESS category. When present, `composeTally` renders the success
+  // count as `<count> <verb>` (e.g. `2 updated`) instead of deriving it from the
+  // info-severity row count, so the `update` headline reports realized
+  // transitions only. The failure / warning categories are unchanged (still
+  // computed from `countRowsBySeverity`). Absent on every other op
+  // (install / reinstall / marketplace / import), so their summaries stay
+  // byte-identical. Read ONLY by `composeTally`. A `count` of 0 contributes no
+  // success category (the never-silent no-op headline is the orchestrator's job,
+  // not `composeTally`'s).
+  readonly tally?: { readonly verb: string; readonly count: number };
 }
 
 /**
@@ -1061,7 +1179,15 @@ export type PluginInfoRow =
  * `MarketplaceNotAddedMessage` variant, never by this row field.
  */
 interface PluginInfoRowBase {
-  readonly status: Extract<PluginStatus, "installed" | "available" | "unavailable" | "failed">;
+  // FSTAT-07 / D-66-04: `force-installed` widens the info row status set so an
+  // installed plugin re-resolving `unsupported` reports `(force-installed)` on
+  // the info surface. `force-upgradable` is deliberately omitted -- it is a
+  // list-inventory-only concept (an installed plugin's info is force-installed
+  // or installed, never force-upgradable).
+  readonly status: Extract<
+    PluginStatus,
+    "installed" | "available" | "unavailable" | "unsupported" | "failed" | "force-installed"
+  >;
   readonly name: string;
   readonly version?: string;
   readonly scope?: Scope;
@@ -1300,10 +1426,33 @@ export const ICON_UNINSTALLABLE = "⊘";
  * (`⊘`), which marks the error / blocked-state rows
  * (`(unavailable)`, `(failed)`, `(skipped) {already disabled}`,
  * `(manual recovery)`). Mirrors the realized + pending-tense precedent
- * already in the grammar (`●` for `(installed)` / `(will add)`,
- * `○` for `(available)` / `(will remove)`).
+ * already in the grammar (`●` for `(installed)` / `(will install)`,
+ * `○` for `(available)` / `(will uninstall)`).
  */
 export const ICON_DISABLED = "◌";
+
+/**
+ * FSTAT-02 / D-66-03: dedicated glyph for a `force-installed` row -- a
+ * recorded-installed plugin that currently re-resolves `unsupported` (installed
+ * with one or more components dropped). DISTINCT from `ICON_INSTALLED` (`●`) so
+ * the degraded install is visually separable from a clean `(installed)` row.
+ * `force-upgradable` deliberately REUSES `ICON_INSTALLED` (the row is currently
+ * clean -- only its candidate would degrade), mirroring the `upgradable`
+ * precedent.
+ */
+export const ICON_FORCE_INSTALLED = "◉";
+
+/**
+ * USTAT-02 / D-64-01: dedicated glyph for a not-installed, force-installable
+ * `unsupported` row (`⊖` U+2296, circled minus) -- a plugin whose manifest is
+ * sound but carries components Pi cannot install (lsp / hooks / unsupported
+ * source), so it would degrade-install under `--force`. Stays in the circled-
+ * operator family with `ICON_UNINSTALLABLE` (`⊘`) but reads "diminished /
+ * components dropped" rather than "blocked". DISTINCT from `⊘`
+ * (`ICON_UNINSTALLABLE`, reserved for unavailable / blocked / failed / manual-
+ * recovery) and from `◉` (`ICON_FORCE_INSTALLED`, the *installed*-degraded row).
+ */
+export const ICON_UNSUPPORTED = "⊖";
 
 /**
  * PL-4 column-66 description truncation. Strings longer than 66 chars are
@@ -1405,9 +1554,6 @@ function wrapDescription(text: string, indentCol: number, wrapCol: number): stri
  *                           `... <no autoupdate> {already no autoupdate}`
  *                           (marker-as-outcome + idempotence brace, no
  *                           `(skipped)` token).
- *   "will add"           -> `${ICON_INSTALLED} ${name} [${scope}] (will add)`
- *   "will remove"        -> `${ICON_AVAILABLE} ${name} [${scope}] (will remove)`
- *                           (DIFF-02 pending-tense arms.)
  *   undefined (list-surface):
  *     SUB-BRANCH A (mp.details === undefined): `${ICON_INSTALLED} ${name} [${scope}]`
  *     SUB-BRANCH B (mp.details !== undefined): `${ICON_INSTALLED} ${name} [${scope}]`
@@ -1417,10 +1563,12 @@ function wrapDescription(text: string, indentCol: number, wrapCol: number): stri
  *       NOT rendered on the list surface (UXG-01 -- the raw ISO timestamp is
  *       noise and meaningless for path-source marketplaces).
  *
- * The only ICON_AVAILABLE (○) marketplace arm is the pending
- * `"will remove"` (the marketplace-level analog of an uninstall); every
- * other arm is either ok (●) or failure-class (⊘). The other open-circle
- * uses are the available / uninstalled / will-uninstall PLUGIN rows that
+ * No marketplace arm renders ICON_AVAILABLE (○): every arm is either ok (●)
+ * or failure-class (⊘). Marketplace add/remove are immediate (WILL-01 /
+ * D-65.1-02 / D-65.1-03), so they carry no marketplace-level pending token --
+ * a remove's reload-deferred plugin-uninstall cascade renders as ○ PLUGIN
+ * `will uninstall` child rows under a bare (●) header. The open-circle uses
+ * are the available / uninstalled / will-uninstall PLUGIN rows that
  * `renderPluginRow` owns.
  *
  * The `"skipped"` arm reuses the file-private `composeReasons` helper to
@@ -1490,18 +1638,6 @@ function renderMpHeader(mp: MarketplaceNotificationMessage, probe: SoftDepStatus
         ? `${ICON_INSTALLED} ${mp.name} [${mp.scope}] (skipped)`
         : `${ICON_INSTALLED} ${mp.name} [${mp.scope}] (skipped) ${reasonsBrace}`;
     }
-
-    case "will add":
-      // DIFF-02 / D-53-02: pending-tense row for a marketplace
-      // declared in config but not yet recorded. Reuses ICON_INSTALLED (no
-      // new icon constant).
-      return `${ICON_INSTALLED} ${mp.name} [${mp.scope}] (will add)`;
-    case "will remove":
-      // DIFF-02: pending-tense row for a marketplace recorded in
-      // state but no longer declared. Reuses ICON_AVAILABLE (`○`) -- the
-      // same glyph the (uninstalled) plugin row carries, because a
-      // `will remove` is the marketplace-level analog of an uninstall.
-      return `${ICON_AVAILABLE} ${mp.name} [${mp.scope}] (will remove)`;
 
     case undefined: {
       // List-surface case. mp.details is OPTIONAL and INDEPENDENT of mp.status.
@@ -1776,6 +1912,47 @@ export function pluginRow(
 }
 
 /**
+ * WR-03: SOLE composition site for the `(force-installed)` row -- shared by the
+ * central `renderPluginRow` switch AND the install / update command-local
+ * render maps, so the bytes stay identical across surfaces (D-11 "call, never
+ * duplicate"). Uses the dedicated `ICON_FORCE_INSTALLED` (`◉`) glyph; the
+ * reasons brace carries the dropped-component detail. Unlike `pluginRow` it
+ * threads the optional `dependencies` so the `{requires pi-subagents}` /
+ * `{requires pi-mcp}` soft-dep markers compose into the SAME brace AFTER the
+ * dropped-component reasons (MSG-GR-4) -- exactly like the `installed` arm. The
+ * force-degradable `unsupported` arm still stages the SUPPORTED components, so a
+ * force-install/update success row legitimately carries `dependencies` and the
+ * marker is most relevant precisely there. The list/info INVENTORY force rows
+ * omit `dependencies`, so the markers never fire (the row renders
+ * byte-identically to a bare `(force-installed)` row).
+ */
+export function forceInstalledRow(
+  p: {
+    readonly name: string;
+    readonly scope?: Scope;
+    readonly version?: string;
+    readonly reasons: readonly ContentReason[];
+    readonly dependencies?: readonly Dependency[];
+  },
+  mpScope: Scope,
+  probe: SoftDepStatus,
+): string {
+  return joinTokens([
+    ICON_FORCE_INSTALLED,
+    p.name,
+    renderScopeBracket(p.scope, mpScope),
+    renderVersion(p.version),
+    "(force-installed)",
+    composeReasons(
+      p.reasons,
+      p.dependencies?.includes("agents") ?? false,
+      p.dependencies?.includes("mcp") ?? false,
+      probe,
+    ),
+  ]);
+}
+
+/**
  * WR-03: SOLE composition site for the soft-dep-bearing
  * `installed` / `updated` / `reinstalled` plugin rows. Folds the
  * 7 command-arm copies that each repeated the same
@@ -1910,8 +2087,28 @@ function renderPluginRow(
         "(unavailable)",
         composeReasons(p.reasons, false, false, probe),
       ]);
+    case "unsupported":
+      // USTAT-01 / D-64-01: not-installed, force-installable row. Clones the
+      // `unavailable` arm, swapping the glyph (`⊘` -> `⊖`) and token
+      // (`(unavailable)` -> `(unsupported)`). MSG-PL-6 / SNM-11 carve-out:
+      // `unsupported` has NO `scope?` field, so the scope bracket is omitted.
+      return joinTokens([
+        ICON_UNSUPPORTED,
+        p.name,
+        renderScopeBracket(undefined, mpScope),
+        renderVersion(p.version),
+        "(unsupported)",
+        composeReasons(p.reasons, false, false, probe),
+      ]);
     case "upgradable":
       return pluginRow(ICON_INSTALLED, p, mpScope, "(upgradable)", probe);
+    case "force-installed":
+      return forceInstalledRow(p, mpScope, probe);
+    case "force-upgradable":
+      // FSTAT-04 / D-66-02 / D-66-03: currently-clean installed plugin whose
+      // newer candidate would newly degrade. REUSES ICON_INSTALLED (`●`) -- the
+      // row is clean today -- exactly like the `upgradable` arm above.
+      return pluginRow(ICON_INSTALLED, p, mpScope, "(force-upgradable)", probe);
     case "skipped":
       return pluginRow(ICON_UNINSTALLABLE, p, mpScope, "(skipped)", probe);
     case "failed":
@@ -1923,12 +2120,15 @@ function renderPluginRow(
       // DIFF-02 / D-53-02: pending-tense row for a plugin declared in
       // config but not yet recorded. Reuses ICON_INSTALLED. No `version`
       // slot (the install hasn't happened yet); no reasons (pending rows are
-      // pre-transition).
+      // pre-transition). FSTAT-06 / D-66-04: the `force` modifier renders
+      // `(will force install)` when the planned install would degrade
+      // (resolves `unsupported`); there is deliberately NO `will force update`
+      // analog -- the reconcile plan has no update bucket (D-66-05).
       return joinTokens([
         ICON_INSTALLED,
         p.name,
         renderScopeBracket(p.scope, mpScope),
-        "(will install)",
+        p.force === true ? "(will force install)" : "(will install)",
       ]);
     case "will uninstall":
       // DIFF-02: pending-tense row for a plugin recorded in state but
@@ -1959,8 +2159,8 @@ function renderPluginRow(
       // `enabled: false`. Uses ICON_DISABLED (`◌`) -- the same glyph the
       // realized `(disabled)` inventory row uses; this mirrors the precedent
       // that realized + pending-tense rows for the same row class share a
-      // glyph (`●` for `(installed)` / `(will add)`, `○` for `(available)` /
-      // `(will remove)`).
+      // glyph (`●` for `(installed)` / `(will install)`, `○` for
+      // `(available)` / `(will uninstall)`).
       return joinTokens([
         ICON_DISABLED,
         p.name,
@@ -2041,6 +2241,39 @@ function renderPluginRow(
 
 /** Reload-hint trailer literal. */
 const RELOAD_HINT_TRAILER = "/reload to pick up changes";
+
+/**
+ * UGRM-01 / UGRM-02 never-silent no-op headline for a bulk `update` that
+ * realized ZERO transitions (all targets up-to-date, OR the only surviving rows
+ * are benign info skips such as a `(force-upgradable)` decline). Hard-coded so
+ * the byte form cannot drift from `docs/output-catalog.md`'s `all-up-to-date-noop`
+ * / `skip-force-upgradable-bulk` states -- mirrors the `reconcile-pending-empty`
+ * byte-lock precedent. Emitted in PLACE of the `composeTally` success line
+ * (which collapses a `tally {count: 0}` override to `""`), so the summary line
+ * never vanishes.
+ */
+const UPDATE_NO_OP_HEADLINE = "Plugin update: nothing to update";
+
+/**
+ * SEV-02 / D-69-03 `--force` hint trailer literal, rendered below a
+ * force-degradable `unsupported` install-failure row. References the user's
+ * own `--force` flag only -- no plugin / marketplace interpolation (T-69-01).
+ * D-70-01: this byte form is FROZEN as the reconciled DOC contract and is
+ * locked byte-for-byte in docs/output-catalog.md and
+ * docs/messaging-style-guide.md. Do not change the wording.
+ */
+const FORCE_INSTALL_HINT_TRAILER = "Re-run with --force to install the supported components.";
+
+/**
+ * XSURF-03 update-worded `--force` hint trailer literal, rendered below a
+ * force-upgradable manual update-decline row. The update-worded analog of
+ * `FORCE_INSTALL_HINT_TRAILER`. References the user's own `--force` flag only
+ * -- no plugin / marketplace interpolation (T-73-01). This byte form is FROZEN
+ * as a reconciled DOC contract and is locked byte-for-byte in
+ * docs/output-catalog.md and docs/messaging-style-guide.md. Do not change the
+ * wording.
+ */
+const FORCE_UPDATE_HINT_TRAILER = "Re-run with --force to update with the supported components.";
 
 /**
  * SEV-03: the desired-state tri-state contract every producer stamps on a row:
@@ -2379,6 +2612,7 @@ function composeTally(message: {
   readonly label?: string;
   readonly cardinality?: "single" | "plural";
   readonly marketplaces: readonly MarketplaceNotificationMessage[];
+  readonly tally?: { readonly verb: string; readonly count: number };
 }): string {
   if (message.cardinality !== "plural" || message.label === undefined) {
     return "";
@@ -2386,24 +2620,9 @@ function composeTally(message: {
 
   const errorCount = countRowsBySeverity(message.marketplaces, "error");
   const warningCount = countRowsBySeverity(message.marketplaces, "warning");
-  const successCount = countRowsBySeverity(message.marketplaces, "info");
 
   const failures = errorCount.plugins + errorCount.marketplaces;
   const warnings = warningCount.plugins + warningCount.marketplaces;
-  // OUT-03 / OUT-06 / D-03: the tally counts OPERATION rows uniformly across the
-  // plugin and marketplace subjects. A BARE marketplace header -- one carrying
-  // neither a `status` (a realized mp outcome: `added` / `updated` / `removed` /
-  // `failed` / `skipped`) NOR a stamped `severity` -- is a pure grouping label
-  // (bookkeeping, not an operation), so it must not inflate the success count. A
-  // marketplace row WITH a `status` IS a real mp-level operation and counts (an
-  // import `added` block, a `marketplace remove` `removed` block). The `info`
-  // count from `countRowsBySeverity` includes bare headers via its `?? "info"`
-  // default, so subtract them; plugin rows always represent an operation and
-  // always count.
-  const bareHeaders = message.marketplaces.filter(
-    (mp) => mp.severity === undefined && mp.status === undefined,
-  ).length;
-  const successes = successCount.plugins + successCount.marketplaces - bareHeaders;
 
   const parts: string[] = [];
 
@@ -2415,8 +2634,35 @@ function composeTally(message: {
     parts.push(tallyCategory(warnings, "warning", "warnings"));
   }
 
-  if (successes > 0) {
-    parts.push(tallyCategory(successes, "success", "successes"));
+  if (message.tally === undefined) {
+    // OUT-03 / OUT-06 / D-03: the default tally counts OPERATION rows uniformly
+    // across the plugin and marketplace subjects. A BARE marketplace header --
+    // one carrying neither a `status` (a realized mp outcome: `added` /
+    // `updated` / `removed` / `failed` / `skipped`) NOR a stamped `severity` --
+    // is a pure grouping label (bookkeeping, not an operation), so it must not
+    // inflate the success count. A marketplace row WITH a `status` IS a real
+    // mp-level operation and counts (an import `added` block, a `marketplace
+    // remove` `removed` block). The `info` count from `countRowsBySeverity`
+    // includes bare headers via its `?? "info"` default, so subtract them;
+    // plugin rows always represent an operation and always count.
+    const successCount = countRowsBySeverity(message.marketplaces, "info");
+    const bareHeaders = message.marketplaces.filter(
+      (mp) => mp.severity === undefined && mp.status === undefined,
+    ).length;
+    const successes = successCount.plugins + successCount.marketplaces - bareHeaders;
+
+    if (successes > 0) {
+      parts.push(tallyCategory(successes, "success", "successes"));
+    }
+  } else if (message.tally.count > 0) {
+    // UGRM-02: the update-scoped override OWNS the success category -- the count
+    // is realized transitions only (the orchestrator's `updated`-partition
+    // tally), rendered with a verb that has no plural-s (`1 updated`, `2
+    // updated`). The info-row `successes` math above is SKIPPED entirely so an
+    // at-desired-state `(skipped) {up-to-date}` row never inflates the headline.
+    // A `count` of 0 contributes nothing (the never-silent no-op headline is the
+    // orchestrator's job), so a failure-only cascade stays e.g. `1 failure`.
+    parts.push(tallyCategory(message.tally.count, message.tally.verb, message.tally.verb));
   }
 
   if (parts.length === 0) {
@@ -2739,8 +2985,16 @@ function pluginInfoStatusGlyph(status: PluginInfoRow["status"]): string {
   switch (status) {
     case "installed":
       return ICON_INSTALLED;
+    case "force-installed":
+      // FSTAT-02 / FSTAT-07 / D-66-03: info row for an installed plugin
+      // re-resolving `unsupported` -- the dedicated `◉` glyph.
+      return ICON_FORCE_INSTALLED;
     case "available":
       return ICON_AVAILABLE;
+    case "unsupported":
+      // USTAT-01 / D-64-01: not-installed, force-installable info row -- the
+      // dedicated `⊖` glyph, distinct from the `⊘` structural-unavailable arm.
+      return ICON_UNSUPPORTED;
     case "unavailable":
     case "failed":
       // Both use the prohibited-symbol glyph.
@@ -3162,6 +3416,53 @@ export function emitContextCascade(
 }
 
 /**
+ * UGRM-01 / UGRM-02: the never-silent no-op emitter for a bulk `update` that
+ * realized ZERO transitions (0 updated, 0 failures, 0 warnings). Renders the
+ * surviving cascade body (if any) via the caller's render map, then folds the
+ * hard-coded `Plugin update: nothing to update` headline in the SAME tally slot
+ * the normal path uses -- so the line can NEVER vanish (a `tally {count: 0}`
+ * override would collapse to `""` in `composeTally`; this owns the headline
+ * instead). Two cases, both at info severity with NO reload-hint:
+ *   (a) Empty cascade (all up-to-date): no body -> emit ONLY the headline (NOT
+ *       the `(no marketplaces)` sentinel).
+ *   (b) Non-empty cascade (e.g. a benign `(force-upgradable)` decline): render
+ *       the body, then the headline below it.
+ * IL-2: exactly one `ctx.ui.notify` call via `emitWithSummary` (which emits the
+ * body unchanged at info severity -- no summary prefix).
+ */
+export function emitUpdateNoOpCascade(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  message: CascadeNotificationMessage,
+  renderPluginRowBody: (
+    p: PluginNotificationMessage,
+    probe: SoftDepStatus,
+    mpScope: Scope,
+  ) => string,
+): void {
+  const probe = softDepStatus(pi);
+
+  const blocks = message.marketplaces.map((mp) => {
+    const lines: string[] = [renderMpHeader(mp, probe)];
+    for (const p of mp.plugins) {
+      lines.push(...composePluginLinesWith(p, probe, mp.scope, renderPluginRowBody));
+    }
+
+    return lines.join("\n");
+  });
+  // Empty cascade -> "" (NOT the `(no marketplaces)` sentinel): the no-op
+  // headline alone is the never-silent output.
+  const body = blocks.join("\n\n");
+
+  // Fold the fixed headline into the tally slot (`{body}\n\n{headline}` when a
+  // body survives; just `{headline}` when empty). No reload-hint -- nothing
+  // changed on disk.
+  const withHeadline = foldTallyAndHint(body, UPDATE_NO_OP_HEADLINE, "");
+
+  emitWithSummary(ctx, message, withHeadline);
+}
+
+/**
  * RECON-04 / D-02 adapter seam: emit the `reconcile-applied-cascade` standalone
  * envelope through the shared cascade emitter. Like `dispatchInfoMessage`'s
  * standalone applied-cascade arm, NO reload-hint trailer is appended (a
@@ -3200,7 +3501,8 @@ function composePluginLinesWith(
   const lines: string[] = [`  ${renderRow(p, probe, mpScope)}`];
 
   // PL-4 (RLD-04 / D-08): the list inventory rows (`installed` / `upgradable`
-  // / `available` / `unavailable` / `disabled`) carry the manifest description;
+  // / `available` / `unavailable` / `unsupported` / `disabled` /
+  // `force-installed` / `force-upgradable`) carry the manifest description;
   // cascade `installed` rows never set `description`, so the guard keeps them
   // single-line.
   if (
@@ -3208,11 +3510,33 @@ function composePluginLinesWith(
       p.status === "upgradable" ||
       p.status === "available" ||
       p.status === "unavailable" ||
-      p.status === "disabled") &&
+      p.status === "unsupported" ||
+      p.status === "disabled" ||
+      p.status === "force-installed" ||
+      p.status === "force-upgradable") &&
     p.description !== undefined &&
     p.description.length > 0
   ) {
     lines.push(`    ${truncateDescription(p.description)}`);
+  }
+
+  // SEV-02 / D-69-03 / XSURF-01: the force-degradable install-failure row
+  // carries a 4-space-indented install-worded `--force` hint trailer. The row
+  // surfaces as `unavailable` (Phase-72 structural arm) or `unsupported`
+  // (resolver-state-driven token, XSURF-01); the structural `unavailable` arm
+  // omits `forceHint` -- force cannot help. The hint references the user's own
+  // flag only and interpolates no plugin / marketplace identifier (T-69-01).
+  // D-70-01: the byte form is FROZEN as the reconciled DOC contract, locked
+  // byte-for-byte in docs/output-catalog.md and docs/messaging-style-guide.md.
+  if ((p.status === "unavailable" || p.status === "unsupported") && p.forceHint === true) {
+    lines.push(`    ${FORCE_INSTALL_HINT_TRAILER}`);
+  }
+
+  // SEV-04 / XSURF-03: the force-upgradable manual update-decline row carries a
+  // 4-space-indented update-worded `--force` hint trailer. The list inventory
+  // `force-upgradable` row omits `forceHint` and stays byte-frozen.
+  if (p.status === "force-upgradable" && p.forceHint === true) {
+    lines.push(`    ${FORCE_UPDATE_HINT_TRAILER}`);
   }
 
   if (p.status === "failed" || p.status === "manual recovery") {

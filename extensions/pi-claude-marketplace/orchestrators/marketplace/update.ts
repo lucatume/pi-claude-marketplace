@@ -117,6 +117,7 @@ import {
 } from "../../shared/notify-context.ts";
 import { skipSeverity } from "../../shared/notify-reasons.ts";
 import { makeRawNotifyFn } from "../../shared/notify.ts";
+import { narrowUnsupportedKinds } from "../../shared/probe-classifiers.ts";
 import { withStateGuard } from "../../transaction/with-state-guard.ts";
 
 import {
@@ -633,25 +634,67 @@ function outcomeToCascadePluginMessage(outcome: PluginUpdateOutcome, scope: Scop
   // partitions and ends with an `assertNever` so any future variant addition
   // fails at compile time.
   switch (outcome.partition) {
-    case "updated":
+    case "updated": {
+      // CMC-13: declared kinds drive the per-row soft-dep marker (MSG-SD-3).
+      // The renderer narrows on `dependencies` membership ("agents" / "mcp") +
+      // the notify-time probe; we forward the boolean flags as the conventional
+      // Dependency[] representation. Shared by the `(updated)` and the degraded
+      // `(force-installed)` arms (WR-03: a force-installed row carries
+      // dependencies exactly like a clean update row).
+      const dependencies = [
+        ...(outcome.declaresAgents ? (["agents"] as const) : []),
+        ...(outcome.declaresMcp ? (["mcp"] as const) : []),
+      ];
+      // SEV-01 / WR-01: the missing-soft-dep-companion `warning` stamp is
+      // deliberately NOT applied on this autoupdate cascade surface. SEV-01
+      // targets the interactive install / manual-update success arms, where the
+      // user is present to act on an absent companion. Autoupdate is a
+      // background operation; the actionable signal it must surface is a NEW
+      // degradation, already covered by the `newlyDegraded` warning below. A
+      // companion-absence warning here would be background noise. Any change to
+      // this asymmetry is owned by the final severity/output reconcile, not by
+      // the producer-stamp wiring.
+      // SEV-03 / D-69-01 / FSTAT-07: the autoupdate cascade now TAKES the force
+      // path (`updateSinglePlugin` sets `force: true`), so a candidate that
+      // re-resolved `unsupported` degraded in place. Report `(force-installed)`
+      // with the dropped-component detail instead of `(updated)`. A clean
+      // candidate keeps `(updated)` (no `forceDegrade`). force-installed is
+      // a realized transition -> reloads Pi resources.
+      //
+      // SEV-03 / D-69-01: an autoupdate that NEWLY degrades a previously-clean
+      // plugin (the prior persisted `compatibility.unsupported` was empty, read
+      // before the update applied) silently dropped components the user did not
+      // opt into -> the row is actionable -> `warning` (prepends the
+      // `A plugin operation needs attention.` summary line). Re-degrading a
+      // plugin that was ALREADY force-installed (prior `unsupported` non-empty)
+      // is benign -> `info`. The manual `update --force` opt-in stays info on its
+      // own renderer; the warning fires ONLY on this autoupdate surface.
+      if (outcome.forceDegrade !== undefined && outcome.forceDegrade.kinds.length > 0) {
+        return {
+          status: "force-installed",
+          name: outcome.name,
+          scope,
+          version: outcome.toVersion,
+          dependencies,
+          reasons: narrowUnsupportedKinds(outcome.forceDegrade.kinds),
+          severity: outcome.forceDegrade.newlyDegraded ? "warning" : "info",
+          needsReload: true,
+        };
+      }
+
       return {
         status: "updated",
         name: outcome.name,
         scope,
         from: outcome.fromVersion,
         to: outcome.toVersion,
-        // CMC-13: declared kinds drive the per-row soft-dep marker
-        // (MSG-SD-3). The renderer narrows on `dependencies` membership
-        // ("agents" / "mcp") + the notify-time probe; we forward the boolean
-        // flags as the conventional Dependency[] representation.
-        dependencies: [
-          ...(outcome.declaresAgents ? (["agents"] as const) : []),
-          ...(outcome.declaresMcp ? (["mcp"] as const) : []),
-        ],
+        dependencies,
         // D-03/D-06: realized update transition -> info, reloads Pi resources.
         severity: "info",
         needsReload: true,
       };
+    }
+
     case "unchanged":
       return {
         status: "skipped",

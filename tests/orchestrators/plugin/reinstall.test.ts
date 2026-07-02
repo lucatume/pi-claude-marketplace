@@ -377,9 +377,9 @@ test("PRL-10: missing cached manifest entry fails and preserves old state, resou
   });
 });
 
-test("PRL-10: replacement failure rolls back earlier bridges and leaves old data intact", async () => {
+test("PRL-10 / RINST-01: bare reinstall unconditionally overwrites foreign agent content across all bridges", async () => {
   await withHermeticHome(async () => {
-    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-replace-fail-"));
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-overwrite-"));
     try {
       const locations = locationsFor("project", cwd);
       const seeded = await seedMarketplace({
@@ -388,12 +388,6 @@ test("PRL-10: replacement failure rolls back earlier bridges and leaves old data
         resources: { skill: "old skill", command: "old command", agent: "old agent" },
         install: true,
       });
-      const dataDir = await locations.pluginDataDir("mp", "hello");
-      await mkdir(dataDir, { recursive: true });
-      await writeFile(path.join(dataDir, "state.txt"), "plugin data");
-      const beforeState = await readFile(locations.stateJsonPath, "utf8");
-      const beforeSkill = await readSkill(cwd);
-      const beforeCommand = await readCommand(cwd);
       const agentPath = path.join(locations.agentsDir, `${GENERATED_AGENT_PREFIX}hello-bot.md`);
       await writeFile(agentPath, "manual foreign bytes", "utf8");
       await writePluginTree(seeded.pluginRoot, "hello", {
@@ -403,14 +397,16 @@ test("PRL-10: replacement failure rolls back earlier bridges and leaves old data
       });
       const { ctx, pi, notifications } = makeCtx();
 
+      // RINST-01 / D-67-03: a bare reinstall (no `--force`) overwrites the
+      // agent that holds foreign bytes and refreshes every bridge -- overwrite
+      // is unconditional.
       const outcome = await reinstallDefault(cwd, ctx, pi);
 
-      assert.equal(outcome.partition, "failed");
-      assert.match(notifications[0]?.message ?? "", /foreign previous content/);
-      assert.equal(await readFile(locations.stateJsonPath, "utf8"), beforeState);
-      assert.equal(await readSkill(cwd), beforeSkill);
-      assert.equal(await readCommand(cwd), beforeCommand);
-      assert.equal(await readFile(path.join(dataDir, "state.txt"), "utf8"), "plugin data");
+      assert.equal(outcome.partition, "reinstalled");
+      assert.equal(errorNotifications(notifications).length, 0);
+      assert.match(await readFile(agentPath, "utf8"), /new agent/);
+      assert.match(await readSkill(cwd), /new skill/);
+      assert.match(await readCommand(cwd), /new command/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -466,7 +462,7 @@ test("PRL-10: saveState failure rolls back physical replacements and preserves d
   });
 });
 
-test("PRL-10: force overwrites foreign previous agent content and rollback restores it on save failure", async () => {
+test("PRL-10 / RINST-01: unconditional overwrite of foreign previous agent content rolls back on save failure", async () => {
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-force-rollback-"));
     try {
@@ -490,10 +486,9 @@ test("PRL-10: force overwrites foreign previous agent content and rollback resto
         cwd,
         marketplace: "mp",
         plugin: "hello",
-        force: true,
         __deps: {
           stateTransaction: {
-            saveState: () => Promise.reject(new Error("save failure after force")),
+            saveState: () => Promise.reject(new Error("save failure after overwrite")),
           },
         },
       });
@@ -1942,10 +1937,10 @@ test("GAP-10: reinstallPlugin render=none success with no warnings returns bare 
   });
 });
 
-test("GAP-11: reinstallPlugin force=true succeeds and overwrites agent foreign content", async () => {
-  // force=true exercises the force branch in replaceAll (replacePreparedAgents
-  // called with { force: true }) -- the success path verifies that the outer
-  // render='default' success notification includes the reload hint.
+test("GAP-11 / RINST-01: reinstallPlugin unconditionally overwrites agent foreign content", async () => {
+  // RINST-01 / D-67-03: overwrite is unconditional -- replaceAll always calls
+  // replacePreparedAgents with { force: true }. The success path verifies that
+  // the outer render='default' success notification includes the reload hint.
   await withHermeticHome(async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-force-success-"));
     try {
@@ -1968,7 +1963,6 @@ test("GAP-11: reinstallPlugin force=true succeeds and overwrites agent foreign c
         cwd,
         marketplace: "mp",
         plugin: "hello",
-        force: true,
       });
 
       assert.equal(outcome.partition, "reinstalled");
@@ -2673,6 +2667,124 @@ test("LIFE-01 (reinstall): a plugin without hooks removes any stale <hooksDir>/<
         false,
         "reinstall cascade slot must removeHookConfig when the resolved plugin has no hooks",
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// BFILL-01 / RINST-01 / D-68-02: reinstall is force-capable. It resolves the
+// `installable | unsupported` union through `requireForceInstallable`, so a
+// plugin that re-resolves `unsupported` (here: a `.lsp.json` lspServers
+// convention file beside a supported skill) no longer throws `{not-installable}`
+// at the gate. Re-resolution stays cache-only (NFR-5). The persisted
+// compatibility record reflects the REAL supported/unsupported sets at the
+// SAME recorded version (a promotion-shaped repair, not an upgrade).
+async function seedThenDegradeToUnsupported(cwd: string): Promise<string> {
+  // Install a normal (installable) plugin with one supported skill.
+  const seeded = await seedMarketplace({
+    cwd,
+    marketplaceRoot: path.join(cwd, "mp-src"),
+    resources: { skill: "old skill" },
+    install: true,
+  });
+  // Drop an lspServers convention file so re-resolution degrades to
+  // `unsupported` with supported=["skills"], unsupported=["lspServers"].
+  await writeFile(path.join(seeded.pluginRoot, ".lsp.json"), "{}");
+  return seeded.pluginRoot;
+}
+
+test("BFILL-01 / RINST-01: reinstalling a force-installed (unsupported) plugin succeeds instead of throwing", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-bfill-force-"));
+    try {
+      await seedThenDegradeToUnsupported(cwd);
+
+      const { ctx, pi, notifications } = makeCtx();
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+      });
+
+      assert.equal(outcome.partition, "reinstalled");
+      assert.equal(notifications.length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("BFILL-01 / D-68-02 partial: reinstall records the REAL non-empty unsupported set at the same version", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-bfill-partial-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedThenDegradeToUnsupported(cwd);
+
+      const { ctx, pi } = makeCtx();
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+      });
+      assert.equal(outcome.partition, "reinstalled");
+
+      const record = (await loadState(locations.extensionRoot)).marketplaces["mp"]?.plugins[
+        "hello"
+      ];
+      assert.ok(record !== undefined);
+      // The partial re-materialize stays force-installed: installable=false
+      // with a non-empty unsupported set (D-66-01 derivation source).
+      assert.equal(record.compatibility.installable, false);
+      assert.deepEqual(record.compatibility.unsupported, ["lspServers"]);
+      assert.deepEqual(record.compatibility.supported, ["skills"]);
+      // D-68-02: SAME recorded version (a repair/promotion, not an upgrade).
+      assert.equal(record.version, "1.0.0");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("BFILL-01 / D-68-02 full: reinstall of an installable plugin records installable:true with empty unsupported", async () => {
+  await withHermeticHome(async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "reinstall-bfill-full-"));
+    try {
+      const locations = locationsFor("project", cwd);
+      await seedMarketplace({
+        cwd,
+        marketplaceRoot: path.join(cwd, "mp-src"),
+        resources: { skill: "old skill" },
+        install: true,
+      });
+
+      const { ctx, pi } = makeCtx();
+      const outcome = await reinstallPlugin({
+        ctx,
+        pi,
+        scope: "project",
+        cwd,
+        marketplace: "mp",
+        plugin: "hello",
+        render: "none",
+      });
+      assert.equal(outcome.partition, "reinstalled");
+
+      const record = (await loadState(locations.extensionRoot)).marketplaces["mp"]?.plugins[
+        "hello"
+      ];
+      assert.ok(record !== undefined);
+      assert.equal(record.compatibility.installable, true);
+      assert.deepEqual(record.compatibility.unsupported, []);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

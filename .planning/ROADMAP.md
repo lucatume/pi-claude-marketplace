@@ -17,6 +17,7 @@
 - Done **v1.11 Notification Summary-Line Grammar** -- Phase 50 (shipped 2026-06-08)
 - Done **v1.12 Marketplace and Plugin Config Files** -- Phases 51-56 (shipped 2026-06-11)
 - Done **v1.13 Claude Hook Bridge** -- Phases 57-63 (shipped 2026-06-19)
+- Done **force-install** -- Phases 64-74 (shipped 2026-07-02)
 
 For full details of each milestone, see `.planning/milestones/v[X.Y]-ROADMAP.md` and `.planning/milestones/v[X.Y]-REQUIREMENTS.md`.
 
@@ -173,7 +174,7 @@ Declarative per-scope config files (`claude-plugins.json` + entry-level-override
 <details>
 <summary>Done v1.13 Claude Hook Bridge (Phases 57-63) -- SHIPPED 2026-06-19</summary>
 
-Hooks component bridge alongside skills/commands/agents/MCP, translating Claude plugin hook declarations into Pi extension event subscriptions and shell-outs. Ships the **8 bucket-A direct-1:1-map events only** (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PreCompact, PostCompact, SessionEnd) — the subset where dispatch fires at 100% fidelity. Strict-supportability stance at BOTH event and plugin levels: plugins referencing other events, unmapped Claude tools, regex matchers, or non-`command` handlers install as `(unavailable) {unsupported hooks}`. Forward-compat investments shipped despite no first-party plugin exercising them under bucket-A-only scope: the `if` field permission-rule matcher (~300 LoC, MATCH-03) and the `asyncRewake` registry (~250 LoC, HOOK-06 + EXEC-05). Released as `pi-claude-marketplace@0.6.0`. 31/31 requirements complete. See `.planning/milestones/v1.13-ROADMAP.md` for full details.
+Hooks component bridge alongside skills/commands/agents/MCP, translating Claude plugin hook declarations into Pi extension event subscriptions and shell-outs. Ships the **8 bucket-A direct-1:1-map events only** (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, PreCompact, PostCompact, SessionEnd) Ã¢ÂÂ the subset where dispatch fires at 100% fidelity. Strict-supportability stance at BOTH event and plugin levels: plugins referencing other events, unmapped Claude tools, regex matchers, or non-`command` handlers install as `(unavailable) {unsupported hooks}`. Forward-compat investments shipped despite no first-party plugin exercising them under bucket-A-only scope: the `if` field permission-rule matcher (~300 LoC, MATCH-03) and the `asyncRewake` registry (~250 LoC, HOOK-06 + EXEC-05). Released as `pi-claude-marketplace@0.6.0`. 31/31 requirements complete. See `.planning/milestones/v1.13-ROADMAP.md` for full details.
 
 - [x] Phase 57: Schema, Component Type & Payload-Extension Tolerance -- HOOK-01, HOOK-02, HOOK-03 (completed 2026-06-14)
 - [x] Phase 58: Matcher Parser, Tool-Name Mapping & Supportability Gate -- MATCH-01, MATCH-02, TOOL-01, TOOL-02, HOOK-04 (pulled forward per D-58-01) (completed 2026-06-14)
@@ -185,6 +186,25 @@ Hooks component bridge alongside skills/commands/agents/MCP, translating Claude 
 
 </details>
 
+<details>
+<summary>Done force-install (Phases 64-74) -- SHIPPED 2026-07-02</summary>
+
+`install` / `update --force` degrades a *partially*-supported plugin -- installs the supported components, drops the unsupported ones, never blocks -- on a three-way resolver state (`installable` / `unsupported` / `unavailable`) with derived force-state (`force-installed` ◉ / `force-upgradable` ●; no persisted flag, no migration), desired-state severity, version-gated load-time backfill, an `--unsupported` list filter, force-aware completion, reinstall-as-repair, partial-hook degradation, and a distinct `⊖ (unsupported)` render token unified across list/info/install-error/update-decline surfaces. Released as `pi-claude-marketplace@0.7.0` (PR #77); 42/42 requirements. See `.planning/milestones/force-install-ROADMAP.md` for full details.
+
+- [x] Phase 64: Resolver Three-Way State
+- [x] Phase 65: Force Install & Update
+- [x] Phase 65.1: Reload-Deferred Will Grammar Consistency (INSERTED)
+- [x] Phase 66: Derived Force-State, Glyphs & Force-Upgradability
+- [x] Phase 67: List Filters, Completion & Reinstall Repair
+- [x] Phase 68: Load-Time Backfill
+- [x] Phase 69: Force-Path Severity
+- [x] Phase 70: Spec & Documentation Reconcile
+- [x] Phase 71: Partial Hook Force-Install
+- [x] Phase 72: Unsupported Render Token
+- [x] Phase 73: Force Cross-Surface Token Unification
+- [x] Phase 74: Bulk Update Grammar Refinement
+
+</details>
 
 ## Progress
 
@@ -251,3 +271,14 @@ Hooks component bridge alongside skills/commands/agents/MCP, translating Claude 
 | 61. `if` Field Permission-Rule Matcher                              | v1.13     | 3/3 | Complete    | 2026-06-15 |
 | 62. `asyncRewake` Registry & Background-Spawn                       | v1.13     | 3/3 | Complete    | 2026-06-16 |
 | 63. Lifecycle Cascade, User-Facing Surface & Docs                   | v1.13     | 11/11 | Complete    | 2026-06-16 |
+| 64. Resolver Three-Way State                                        | force-install | 2/2 | Complete    | 2026-06-27 |
+| 65. Force Install & Update                                          | force-install | 3/3 | Complete    | 2026-06-27 |
+| 66. Derived Force-State, Glyphs & Force-Upgradability               | force-install | 4/4 | Complete    | 2026-06-27 |
+| 67. List Filters, Completion & Reinstall Repair                     | force-install | 4/4 | Complete    | 2026-06-27 |
+| 68. Load-Time Backfill                                              | force-install | 4/4 | Complete    | 2026-06-28 |
+| 69. Force-Path Severity                                             | force-install | 4/4 | Complete    | 2026-06-28 |
+| 70. Spec & Documentation Reconcile                                  | force-install | 3/3 | Complete    | 2026-06-28 |
+| 71. Partial Hook Force-Install                                      | force-install | 4/4 | Complete    | 2026-06-28 |
+| 72. Unsupported Render Token                                        | force-install | 1/1 | Complete    | 2026-06-29 |
+| 73. Force Cross-Surface Token Unification                           | force-install | 1/1 | Complete    | 2026-06-30 |
+| 74. Bulk Update Grammar Refinement                                  | force-install | 1/1 | Complete    | 2026-06-30 |

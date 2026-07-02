@@ -247,7 +247,13 @@ test("TC-3 :: - prefix on list head also surfaces --installed/--available/--unav
     const items = await getArgumentCompletions("list -", f.resolver);
     assert.ok(items !== null);
     const labels = items.map((i) => i.label);
-    for (const expected of ["--scope", "--installed", "--available", "--unavailable"]) {
+    for (const expected of [
+      "--scope",
+      "--installed",
+      "--available",
+      "--unavailable",
+      "--unsupported",
+    ]) {
       assert.ok(labels.includes(expected), `expected ${expected} in: ${labels.join(", ")}`);
     }
   } finally {
@@ -262,7 +268,13 @@ test("TC-3 :: - prefix on ls alias also surfaces --installed/--available/--unava
     const items = await getArgumentCompletions("ls -", f.resolver);
     assert.ok(items !== null);
     const labels = items.map((i) => i.label);
-    for (const expected of ["--scope", "--installed", "--available", "--unavailable"]) {
+    for (const expected of [
+      "--scope",
+      "--installed",
+      "--available",
+      "--unavailable",
+      "--unsupported",
+    ]) {
       assert.ok(labels.includes(expected), `expected ${expected} in: ${labels.join(", ")}`);
     }
   } finally {
@@ -282,7 +294,7 @@ test("TC-3 :: - prefix on install head surfaces --map-model (260516-08j)", async
     }
 
     // list-only flags MUST NOT leak into install completions.
-    for (const unexpected of ["--installed", "--available", "--unavailable"]) {
+    for (const unexpected of ["--installed", "--available", "--unavailable", "--unsupported"]) {
       assert.ok(!labels.includes(unexpected), `unexpected ${unexpected} in: ${labels.join(", ")}`);
     }
   } finally {
@@ -302,7 +314,7 @@ test("TC-3 :: - prefix on update head surfaces --map-model (260516-08j)", async 
     }
 
     // list-only flags MUST NOT leak into update completions.
-    for (const unexpected of ["--installed", "--available", "--unavailable"]) {
+    for (const unexpected of ["--installed", "--available", "--unavailable", "--unsupported"]) {
       assert.ok(!labels.includes(unexpected), `unexpected ${unexpected} in: ${labels.join(", ")}`);
     }
   } finally {
@@ -340,16 +352,23 @@ test("TC-3 :: -- and - prefixes behave identically", async () => {
   }
 });
 
-test("PRL-16 :: reinstall flag completion includes --force only for reinstall", async () => {
+test("PRL-16 / RINST-01 :: reinstall flag completion excludes --force; --scope still offered", async () => {
   __resetCacheForTests();
   const f = await emptyFixture();
   try {
     const reinstallItems = await getArgumentCompletions("reinstall -", f.resolver);
     assert.ok(reinstallItems !== null);
-    assert.ok(reinstallItems.some((i) => i.label === "--force"));
+    // D-67-03: `--force` is retired from the reinstall completion surface.
+    assert.equal(
+      reinstallItems.some((i) => i.label === "--force"),
+      false,
+    );
     assert.ok(reinstallItems.some((i) => i.label === "--scope"));
 
-    for (const head of ["install", "uninstall", "update", "list", "ls", "marketplace"]) {
+    // LIST-02 / D-67-02: `--force` is now a completion flag for install/update
+    // (the force-gated candidate sets), so those heads are NOT in this
+    // exclusion list. uninstall/list/ls/marketplace never carry `--force`.
+    for (const head of ["uninstall", "list", "ls", "marketplace"]) {
       const items = await getArgumentCompletions(`${head} -`, f.resolver);
       assert.ok(items !== null, head);
       assert.equal(
@@ -960,27 +979,11 @@ test("PRL-16 :: reinstall completion mode shows only installed plugins", async (
   }
 });
 
-test("PRL-16 :: reinstall --force completion still reaches installed refs", async () => {
-  __resetCacheForTests();
-  const f = await makeFixture({
-    state: { user: { mp: {} }, project: {} },
-    manifests: { user: { mp: [{ name: "solo", status: "installed" }] }, project: {} },
-  });
-  try {
-    const items = await getArgumentCompletions("reinstall --force ", f.resolver);
-    assert.ok(items !== null);
-    assert.deepEqual(
-      items.map((i) => i.label),
-      ["solo@mp"],
-    );
-    assert.deepEqual(
-      items.map((i) => i.value),
-      ["reinstall --force solo@mp "],
-    );
-  } finally {
-    await f.cleanup();
-  }
-});
+// RINST-01 / D-67-03: removed the former `reinstall --force completion still
+// reaches installed refs` test -- `--force` is no longer a reinstall token, so
+// the completion provider no longer special-cases it during positional
+// extraction. The bare `reinstall ` installed-plugin completion above is the
+// surviving coverage for the reinstall ref surface.
 
 test("PRL-16 :: reinstall @ completes marketplace-only targets", async () => {
   __resetCacheForTests();
@@ -1209,6 +1212,173 @@ test("TC-6 / INFO-02 :: info --scope project <here> returns the SAME union (scop
     assert.ok(items !== null);
     const labels = items.map((i) => i.label);
     assert.deepEqual([...labels].sort(), ["bar@mp", "foo@mp"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// LIST-02 / D-67-02 -- `--force`-gated install/update completion candidate
+// sets sourced from the finer cache statuses. With `--force` preceding the
+// plugin positional, install offers `available` + `unsupported` and update
+// offers `upgradable` + `force-upgradable` (`unavailable` excluded in both).
+// Without `--force`, the candidate sets are byte-identical to today.
+// ---------------------------------------------------------------------------
+
+test("LIST-02 / D-67-02 :: install --force offers available + unsupported, excludes unavailable", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: {
+      user: {
+        mp: [
+          { name: "p-avail", status: "available" },
+          { name: "p-unsup", status: "unsupported" },
+          { name: "p-unavail", status: "unavailable" },
+          { name: "p-inst", status: "installed" },
+        ],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("install --force ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    assert.deepEqual([...labels].sort(), ["p-avail@mp", "p-unsup@mp"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("LIST-02 / D-67-02 / WR-02 :: update --force offers upgradable + force-upgradable + force-installed-upgradable, excludes installed/force-installed/unavailable", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: {
+      user: {
+        mp: [
+          { name: "p-upg", status: "upgradable" },
+          { name: "p-fupg", status: "force-upgradable" },
+          // WR-02: a force-installed row with a meaningful (newer,
+          // non-unavailable) candidate IS a real `update --force` target.
+          { name: "p-finst-upg", status: "force-installed-upgradable" },
+          { name: "p-inst", status: "installed" },
+          // Plain force-installed (no newer candidate) stays excluded.
+          { name: "p-finst", status: "force-installed" },
+          { name: "p-unavail", status: "unavailable" },
+        ],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("update --force ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    assert.deepEqual([...labels].sort(), ["p-finst-upg@mp", "p-fupg@mp", "p-upg@mp"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("LIST-02 / D-67-02 :: install (no --force) offers ONLY available -- byte-identical regression", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: {
+      user: {
+        mp: [
+          { name: "p-avail", status: "available" },
+          { name: "p-unsup", status: "unsupported" },
+          { name: "p-unavail", status: "unavailable" },
+        ],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("install ", f.resolver);
+    assert.ok(items !== null);
+    assert.deepEqual(
+      items.map((i) => i.label),
+      ["p-avail@mp"],
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("LIST-02 / D-67-02 :: update (no --force) offers ALL installed-family statuses -- byte-identical regression", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: {
+      user: {
+        mp: [
+          { name: "p-inst", status: "installed" },
+          { name: "p-upg", status: "upgradable" },
+          { name: "p-finst", status: "force-installed" },
+          { name: "p-finst-upg", status: "force-installed-upgradable" },
+          { name: "p-fupg", status: "force-upgradable" },
+          { name: "p-avail", status: "available" },
+          { name: "p-unavail", status: "unavailable" },
+        ],
+      },
+      project: {},
+    },
+  });
+  try {
+    const items = await getArgumentCompletions("update ", f.resolver);
+    assert.ok(items !== null);
+    const labels = items.map((i) => i.label);
+    // WR-02: `force-installed-upgradable` is part of the installed inventory, so
+    // the no-`--force` set still spans the full family (byte-identical contract).
+    assert.deepEqual([...labels].sort(), [
+      "p-finst-upg@mp",
+      "p-finst@mp",
+      "p-fupg@mp",
+      "p-inst@mp",
+      "p-upg@mp",
+    ]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("LIST-02 / D-67-02 :: --force is a flag completion for install/update and NOT for reinstall", async () => {
+  __resetCacheForTests();
+  const f = await emptyFixture();
+  try {
+    for (const head of ["install", "update"]) {
+      const items = await getArgumentCompletions(`${head} -`, f.resolver);
+      assert.ok(items !== null, head);
+      assert.ok(
+        items.some((i) => i.label === "--force"),
+        `expected --force under ${head}`,
+      );
+    }
+
+    const reinstallItems = await getArgumentCompletions("reinstall -", f.resolver);
+    assert.ok(reinstallItems !== null);
+    assert.equal(
+      reinstallItems.some((i) => i.label === "--force"),
+      false,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("LIST-02 / D-67-02 :: install --force <here> does not return null (positional-ref branch fires)", async () => {
+  __resetCacheForTests();
+  const f = await makeFixture({
+    state: { user: { mp: {} }, project: {} },
+    manifests: { user: { mp: [{ name: "p-avail", status: "available" }] }, project: {} },
+  });
+  try {
+    const items = await getArgumentCompletions("install --force ", f.resolver);
+    assert.notEqual(items, null);
   } finally {
     await f.cleanup();
   }

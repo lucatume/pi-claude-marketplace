@@ -356,7 +356,12 @@ async function makeTempLocations(): Promise<{
         process.env.PI_CODING_AGENT_DIR = prev;
       }
 
-      await rm(root, { recursive: true, force: true });
+      // `maxRetries` backstops the drain above: under parallel CPU load a
+      // late off-band persist (or its write-file-atomic temp file in
+      // _shared/) can still race the recursive walk and surface a transient
+      // ENOTEMPTY. Retrying the unlink converges deterministically once the
+      // last temp file is renamed away.
+      await rm(root, { recursive: true, force: true, maxRetries: 10 });
     },
   };
 }
@@ -1249,10 +1254,11 @@ describe("multi-hook fan-in", () => {
       const table2 = await readPidTable(tmp.loc);
       assert.equal(table2.length, 2);
       spy.children[0]?.emitExit(0);
-      // persistPidTableForLoc is fired with `void` inside onChildExit,
-      // so the disk write completes off-band. Two macrotask spins drain
-      // both the microtask that runs the handler and the queued I/O.
-      await new Promise((r) => setTimeout(r, 50));
+      // onChildExit runs synchronously on the `exit` emit and reassigns the
+      // module-level _lastPidTablePersist handle, so draining that exact
+      // promise is deterministic -- a fixed sleep is a race under parallel
+      // CPU load (the off-band write may not finish in time).
+      await _awaitLastPidTablePersistForTest();
       const table1 = await readPidTable(tmp.loc);
       assert.equal(table1.length, 1);
       assert.equal(table1[0]?.dispatchId, "uuid-pid-B");

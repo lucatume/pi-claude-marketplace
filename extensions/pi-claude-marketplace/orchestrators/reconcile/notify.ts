@@ -11,10 +11,16 @@
 // Pure: no I/O. The function NEVER calls `ctx.ui.notify` or any seam in
 // `shared/notify.ts` beyond importing the types and the comparator.
 //
-// Token mapping (DIFF-02 pending-tense set):
+// Token mapping (pending-tense set):
 //
-//   marketplacesToAdd     -> block.status = "will add"
-//   marketplacesToRemove  -> block.status = "will remove"
+//   marketplacesToAdd     -> dropped; marketplace add is immediate (WILL-01 /
+//                            D-65.1-02). Any child installs still build a
+//                            bare-header block via pluginsToInstall.
+//   marketplacesToRemove  -> per-recorded-plugin child row
+//                            { status: "will uninstall" } under a bare list-arm
+//                            header (status undefined). De-registration is
+//                            immediate; only the plugin-uninstall cascade is
+//                            reload-deferred (WILL-03 / D-65.1-03).
 //   sourceMismatches      -> block.status = "failed", reasons: ["source mismatch"]
 //   pluginsToInstall      -> child row { status: "will install" }
 //   pluginsToUninstall    -> child row { status: "will uninstall" }
@@ -31,15 +37,18 @@
 // orchestrator detects emptiness BEFORE calling this projection so the
 // advisory takes precedence.
 
+import { resolveStrict } from "../../domain/resolver.ts";
 import { assertNever } from "../../shared/errors.ts";
 import { compareByNameThenScope } from "../../shared/notify.ts";
+import { narrowUnsupportedKinds } from "../../shared/probe-classifiers.ts";
 
 import { sourceMismatchOutcomeSubject } from "./apply-outcomes.ts";
 import { plannedSourceMismatchSubject } from "./types.ts";
 
 import type { PerEntryOutcome } from "./apply-outcomes.ts";
 import type { PendingMsg, ReconcileAppliedMsg } from "./reconcile.messaging.ts";
-import type { ReconcilePlan } from "./types.ts";
+import type { PlannedPluginInstall, ReconcilePlan } from "./types.ts";
+import type { MarketplaceManifest } from "../../domain/manifest.ts";
 import type { MarketplaceRows, WithPlugins } from "../../shared/notify-context.ts";
 import type {
   ContentReason,
@@ -53,18 +62,18 @@ import type { Scope } from "../../shared/types.ts";
 
 /**
  * S8 (PR #51): `status` is narrowed to the closed set the pending /
- * applied-cascade projections actually assign (`"will add"` / `"will remove"`
- * from the pending list; `"added"` / `"removed"` / `"failed"` from the apply
- * cascade). The `"updated"` / `"autoupdate enabled"` / `"autoupdate disabled"`
- * / `"skipped"` members of `MarketplaceStatus` belong to other surfaces
- * (autoupdate flip, marketplace update); the reconcile projection never sets
- * them, so the previous defensive runtime throw at `blockToMarketplaceMessage`
- * is replaced by this type narrowing.
+ * applied-cascade projections actually assign. The pending list no longer
+ * assigns any marketplace-level status (add is immediate -> dropped; remove is
+ * surfaced as per-plugin `will uninstall` child rows under a bare header --
+ * WILL-01 / WILL-03 / D-65.1-02 / D-65.1-03), so only the apply-cascade
+ * transition tokens (`"added"` / `"removed"` / `"failed"`) remain. The
+ * `"updated"` / `"autoupdate enabled"` / `"autoupdate disabled"` / `"skipped"`
+ * members of `MarketplaceStatus` belong to other surfaces (autoupdate flip,
+ * marketplace update); the reconcile projection never sets them, so the
+ * previous defensive runtime throw at `blockToMarketplaceMessage` is replaced
+ * by this type narrowing.
  */
-type ReconcileBlockStatus = Extract<
-  MarketplaceStatus,
-  "will add" | "will remove" | "added" | "removed" | "failed"
->;
+type ReconcileBlockStatus = Extract<MarketplaceStatus, "added" | "removed" | "failed">;
 
 interface MarketplaceBlock<Msg extends PluginNotificationMessage = PluginNotificationMessage> {
   readonly key: string;
@@ -98,15 +107,15 @@ function ensureMarketplaceBlock<Msg extends PluginNotificationMessage>(
 
 /**
  * Construct the concrete per-status `MarketplaceNotificationMessage` arm for
- * an accumulated block. DIFF-02 token set:
- *  - `"will add"` / `"will remove"` are the new pending-tense marketplace
- *    statuses.
+ * an accumulated block. Token set:
+ *  - `"added"` / `"removed"` are the realized apply-time transition statuses.
  *  - `"failed"` is reused for source-mismatch blocks; its `reasons` is the
  *    existing `"source mismatch"` REASONS member (no new REASONS literal --
  *    the closed set already covers it).
  *  - `undefined` is the list/inventory arm; used when a block carries only
  *    plugin child rows (e.g. a pending-uninstall under an existing
- *    marketplace whose source matches).
+ *    marketplace whose source matches, or a marketplace-remove cascade whose
+ *    per-plugin `will uninstall` rows ride a bare header -- WILL-03).
  */
 function blockToMarketplaceMessage<Msg extends PluginNotificationMessage>(
   block: MarketplaceBlock<Msg>,
@@ -120,10 +129,6 @@ function blockToMarketplaceMessage<Msg extends PluginNotificationMessage>(
   // `ReconcileBlockStatus` so any attempt to assign one of those tokens here
   // is a compile error caught at edit time instead of a runtime signal.
   switch (block.status) {
-    case "will add":
-      return { name, scope, status: "will add", plugins };
-    case "will remove":
-      return { name, scope, status: "will remove", plugins };
     case "added":
       // RECON-04: realized apply-time transition token.
       return { name, scope, status: "added", plugins };
@@ -180,6 +185,34 @@ function applySourceMismatch(
 }
 
 /**
+ * WILL-03 / D-65.1-03: fold one removed marketplace into its block as a
+ * reload-deferred plugin-uninstall cascade. De-registration is immediate (no
+ * marketplace-level `will` token); synthesize one `will uninstall` child row
+ * per recorded plugin under a bare list-arm header (status left undefined).
+ * The names come from the plan DTO's `plugins` field -- NOT
+ * `plan.pluginsToUninstall`, which the planner deliberately omits removed-
+ * marketplace plugins from to avoid double-billing the apply cascade. A remove
+ * with no recorded plugins has no reload-deferred cascade, so it shows nothing
+ * pending: skip the block entirely rather than emit a bare header.
+ */
+function pushMarketplaceRemoveCascade(
+  byMp: Map<string, MarketplaceBlock<PendingMsg>>,
+  o: ReconcilePlan["marketplacesToRemove"][number],
+): void {
+  if (o.plugins.length === 0) {
+    return;
+  }
+
+  const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+  for (const pluginName of o.plugins) {
+    block.plugins.push({
+      status: "will uninstall",
+      name: pluginName,
+    });
+  }
+}
+
+/**
  * Pure projection: ReconcilePlan[] -> pending marketplace rows. The rows are
  * typed `MarketplaceRows<PendingMsg>` so the projection's plugin children are
  * statically pinned to the pending render map's status set -- the consumer
@@ -188,8 +221,18 @@ function applySourceMismatch(
  * Every plan action is folded into its `(scope, marketplace)` block. The
  * mapping is:
  *
- *   - marketplacesToAdd     -> block.status = "will add"
- *   - marketplacesToRemove  -> block.status = "will remove"
+ *   - marketplacesToAdd     -> dropped; marketplace add is immediate (WILL-01 /
+ *                              D-65.1-02). Child installs still build a
+ *                              bare-header block via pluginsToInstall.
+ *   - marketplacesToRemove  -> per-recorded-plugin child row
+ *                              { status: "will uninstall" } under a bare
+ *                              list-arm header (status undefined). De-
+ *                              registration is immediate; only the plugin-
+ *                              uninstall cascade is reload-deferred (WILL-03 /
+ *                              D-65.1-03). Names come from the plan DTO's
+ *                              `plugins` field, NOT pluginsToUninstall (which
+ *                              deliberately omits removed-marketplace plugins
+ *                              to avoid double-billing the apply cascade).
  *   - sourceMismatches      -> block.status = "failed", reasons:
  *                              ["source mismatch"] (reuses the existing
  *                              REASONS member; no new literal)
@@ -205,20 +248,101 @@ function applySourceMismatch(
  * block preserve insertion order per their owning bucket -- the apply path
  * will re-order at execution time if needed.
  */
-export function buildReconcilePendingNotification(plans: readonly ReconcilePlan[]): {
+/**
+ * FSTAT-06 / D-66-04: the no-network resolve inputs for a planned install
+ * candidate -- the candidate manifest entry plus the marketplace clone root it
+ * resolves against. Located by the caller (`pendingReconcile`) from the
+ * recorded marketplace's on-disk manifest; `resolveStrict` reads the cache
+ * only (NFR-5).
+ */
+export interface PendingInstallCandidate {
+  readonly marketplaceRoot: string;
+  readonly manifestEntry: MarketplaceManifest["plugins"][number];
+}
+
+/**
+ * Locate the no-network resolve inputs for a planned install. Returns
+ * `undefined` when the candidate cannot be resolved offline -- e.g. the
+ * marketplace is being added in the same run (not yet cloned) or its manifest
+ * lacks the plugin entry -- in which case the row stays a plain
+ * `(will install)` (the preview cannot truthfully claim a degrade).
+ */
+export type PendingInstallCandidateLocator = (
+  install: PlannedPluginInstall,
+) => Promise<PendingInstallCandidate | undefined>;
+
+/**
+ * Canonical force-install key over the `(scope, marketplace, plugin)` tuple
+ * shared between the async resolver (`resolvePendingForceInstalls`) and the
+ * pure projection (`buildReconcilePendingNotification`). NUL-delimited so a
+ * name carrying a delimiter character cannot collide two distinct installs.
+ */
+function forceInstallKey(scope: Scope, marketplace: string, plugin: string): string {
+  return `${scope}\u0000${marketplace}\u0000${plugin}`;
+}
+
+/**
+ * FSTAT-06 / D-66-04 / NFR-5: resolve every planned install candidate
+ * no-network via `resolveStrict` and collect the `(scope, marketplace, plugin)`
+ * keys whose candidate resolves `state === "unsupported"` -- the planned
+ * install would degrade and proceed under the force path, so its pending row
+ * renders `(will force install)`. The resolve is the cache/no-network resolver
+ * (guarded by the `no-orchestrator-network` architecture test); a probe throw
+ * or an unlocatable candidate degrades to NO force (the safe, truthful preview
+ * default), never a crash on this read-only surface (IL-2).
+ *
+ * D-66-05: there is deliberately NO `will force update` analog. The
+ * `ReconcilePlan` has no update bucket (install/uninstall/enable/disable +
+ * marketplace add/remove + sourceMismatches only), so only `pluginsToInstall`
+ * is resolved here -- the will-force-update token is vacuous.
+ */
+export async function resolvePendingForceInstalls(
+  plans: readonly ReconcilePlan[],
+  locate: PendingInstallCandidateLocator,
+): Promise<ReadonlySet<string>> {
+  const keys = new Set<string>();
+  for (const plan of plans) {
+    for (const install of plan.pluginsToInstall) {
+      let candidate: PendingInstallCandidate | undefined;
+      try {
+        candidate = await locate(install);
+        if (candidate === undefined) {
+          continue;
+        }
+
+        const resolved = await resolveStrict(candidate.manifestEntry, {
+          marketplaceRoot: candidate.marketplaceRoot,
+        });
+        if (resolved.state === "unsupported") {
+          keys.add(forceInstallKey(install.scope, install.marketplace, install.plugin));
+        }
+      } catch {
+        // A manifest-load / probe failure leaves the row a plain
+        // `(will install)`: the offline preview cannot assert a degrade it
+        // could not resolve, and a throw must never escape the read-only
+        // pending surface (IL-2 single-notify discipline).
+      }
+    }
+  }
+
+  return keys;
+}
+
+export function buildReconcilePendingNotification(
+  plans: readonly ReconcilePlan[],
+  forceInstallKeys: ReadonlySet<string> = new Set<string>(),
+): {
   readonly marketplaces: readonly MarketplaceRows<PendingMsg>[];
 } {
   const byMp = new Map<string, MarketplaceBlock<PendingMsg>>();
 
   for (const plan of plans) {
-    for (const o of plan.marketplacesToAdd) {
-      const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
-      block.status = "will add";
-    }
+    // marketplacesToAdd: no projection. Marketplace add is immediate (WILL-01 /
+    // D-65.1-02), so it carries no pending row; any child installs are still
+    // surfaced through the pluginsToInstall loop below.
 
     for (const o of plan.marketplacesToRemove) {
-      const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
-      block.status = "will remove";
+      pushMarketplaceRemoveCascade(byMp, o);
     }
 
     for (const o of plan.sourceMismatches) {
@@ -230,9 +354,19 @@ export function buildReconcilePendingNotification(plans: readonly ReconcilePlan[
 
     for (const o of plan.pluginsToInstall) {
       const block = ensureMarketplaceBlock(byMp, o.scope, o.marketplace);
+      // FSTAT-06 / D-66-04: stamp the force modifier when the planned install
+      // candidate resolved `unsupported` (no-network resolveStrict, computed
+      // ahead of time by resolvePendingForceInstalls). The modifier renders
+      // `(will force install)` in place of `(will install)`. D-66-05: there is
+      // deliberately NO `will force update` analog -- the ReconcilePlan has no
+      // update bucket (only install/uninstall/enable/disable + marketplace
+      // add/remove + sourceMismatches), so no force-update row is ever
+      // constructed here; the will-force-update token is vacuous.
+      const force = forceInstallKeys.has(forceInstallKey(o.scope, o.marketplace, o.plugin));
       block.plugins.push({
         status: "will install",
         name: o.plugin,
+        ...(force && { force: true }),
       });
     }
 
@@ -275,17 +409,24 @@ export function buildReconcilePendingNotification(plans: readonly ReconcilePlan[
 }
 
 /**
- * DIFF-01 SC #2 empty-plan helper. Returns `true` iff every action bucket on
- * every plan is empty. Consumed by `orchestrators/reconcile/pending.ts` so
- * the orchestrator can route the empty case to the catalog's
- * `empty-steady-state` advisory body line BEFORE invoking the projection
- * (which would otherwise emit the `(no marketplaces)` sentinel).
+ * DIFF-01 SC #2 empty-plan helper. Returns `true` iff every plan would produce
+ * NO pending row. Consumed by `orchestrators/reconcile/pending.ts` so the
+ * orchestrator can route the empty case to the catalog's `empty-steady-state`
+ * advisory body line BEFORE invoking the projection (which would otherwise emit
+ * the `(no marketplaces)` sentinel).
+ *
+ * WILL-01 / D-65.1-02 / D-65.1-03: marketplace add is immediate and produces no
+ * pending row by itself, so `marketplacesToAdd` is NOT counted -- a change
+ * consisting only of immediate marketplace adds yields the empty advisory. A
+ * `marketplacesToRemove` entry only contributes pending rows when it carries
+ * recorded plugins (its reload-deferred uninstall cascade); a removal with no
+ * recorded plugins is immediate de-registration and contributes nothing. The
+ * surviving plugin-level buckets always map to a pending row.
  */
 export function isReconcilePlanListEmpty(plans: readonly ReconcilePlan[]): boolean {
   return plans.every(
     (p) =>
-      p.marketplacesToAdd.length === 0 &&
-      p.marketplacesToRemove.length === 0 &&
+      p.marketplacesToRemove.every((m) => m.plugins.length === 0) &&
       p.pluginsToInstall.length === 0 &&
       p.pluginsToUninstall.length === 0 &&
       p.pluginsToEnable.length === 0 &&
@@ -354,6 +495,44 @@ function applyOutcomeToBlock(
         severity: "info",
         needsReload: true,
       });
+      return;
+    case "plugin-backfilled":
+      // BFILL-01 / D-68-04: a load-time backfill re-materialized the plugin in
+      // place. The re-resolved `installable` selects the row: a fully promoted
+      // plugin (unsupported set now empty) reuses the `installed` row including
+      // `dependencies` for the soft-dep markers; a partial re-materialize (still
+      // degraded) renders a `force-installed` row. Both fold into THIS single
+      // applied cascade -- no second notify() (RECON-04).
+      if (outcome.installable) {
+        block.plugins.push({
+          status: "installed",
+          name: outcome.plugin,
+          ...(outcome.version !== undefined && { version: outcome.version }),
+          dependencies: outcome.dependencies,
+          severity: "info",
+          needsReload: true,
+        });
+      } else {
+        block.plugins.push({
+          status: "force-installed",
+          name: outcome.plugin,
+          ...(outcome.version !== undefined && { version: outcome.version }),
+          dependencies: outcome.dependencies,
+          // SEV-05 / D-69-04: populate the factual `{reasons}` brace from the
+          // re-resolved dropped-component kinds through the SAME shared
+          // `narrowUnsupportedKinds` seam the install/list/info surfaces use --
+          // no per-state reasons mechanism. An empty set renders brace-less
+          // (byte-identical to a no-dropped-kinds backfill).
+          reasons: narrowUnsupportedKinds(outcome.unsupported),
+          // SEV-03 / A3: a backfill is a benign promotion (re-materializing
+          // now-supported components), NOT a new degradation, so it stays info.
+          // The SEV-03 newly-degrades warning fires only on the autoupdate
+          // cascade, not on this load-time backfill row.
+          severity: "info",
+          needsReload: true,
+        });
+      }
+
       return;
     case "plugin-uninstalled":
       block.plugins.push({

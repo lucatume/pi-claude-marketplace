@@ -66,6 +66,14 @@ export function narrowProbeError(
 }
 
 /**
+ * Closed-set REASONS vocabulary shared by the unsupported-classification
+ * helpers below (`narrowResolverNotes`, `narrowUnsupportedKinds`,
+ * `kindToReason`). Extracted so the three sites reference one alias instead of
+ * re-declaring the union.
+ */
+type UnsupportedReason = "unsupported hooks" | "lsp" | "unsupported source";
+
+/**
  * Narrow resolver `notes` strings to closed-set REASONS members.
  *
  * HOOK-04 detection is anchored on the three reason-prefix tokens emitted
@@ -84,10 +92,8 @@ export function narrowProbeError(
  * pushed, repeated notes for the same bucket are no-ops (and crucially do
  * NOT fall through to the catch-all `unsupported source` arm -- WR-01).
  */
-export function narrowResolverNotes(
-  notes: readonly string[],
-): readonly ("unsupported hooks" | "lsp" | "unsupported source")[] {
-  const out: ("unsupported hooks" | "lsp" | "unsupported source")[] = [];
+export function narrowResolverNotes(notes: readonly string[]): readonly UnsupportedReason[] {
+  const out: UnsupportedReason[] = [];
   const seen = new Set<string>();
   for (const note of notes) {
     const isHooksNote =
@@ -120,4 +126,64 @@ export function narrowResolverNotes(
   }
 
   return out;
+}
+
+/**
+ * D-64-02 / RSTATE-05: derive per-kind unsupported markers from the resolver's
+ * typed `unsupported: string[]` component-kind list (NOT the free-form `notes`).
+ *
+ * This is the single shared render-time helper for the per-kind marker family
+ * carried on the `unsupported` resolver arm. `list`, `info`, and the `install`
+ * error surface all route through it so a given unsupported plugin renders
+ * byte-identical per-kind markers across every surface (SURF-01 cross-surface
+ * parity), by construction rather than by three drift-prone copies.
+ *
+ * Mapping (HOOK-04 / D-58-02 / D-71-04): `lspServers` renders as `lsp`; the
+ * `hooks` kind (a parseable hooks.json with at least one unsupportable
+ * event / matcher group / handler dropped) renders the single aggregate
+ * `unsupported hooks` marker -- an EXISTING REASONS member, so the closed
+ * set stays 32 (no new literal). Every other unsupported component kind
+ * renders the generic `unsupported source` marker. First-wins dedup matches
+ * `narrowResolverNotes` semantics (WR-01) so a multi-kind list never emits a
+ * duplicate token (one `{unsupported hooks}` regardless of how many handlers
+ * dropped).
+ *
+ * Structural reasons (malformed `hooks.json`, NFR-10 source escape) are NOT
+ * in this family: a structural defect routes to the `unavailable` arm
+ * (D-64-07) and its reason stays on the `notes`/structural path via
+ * `narrowResolverNotes`. This helper covers only the force-degradable per-kind
+ * markers on the `unsupported` arm.
+ */
+export function narrowUnsupportedKinds(
+  unsupported: readonly string[],
+): readonly UnsupportedReason[] {
+  const out: UnsupportedReason[] = [];
+  const seen = new Set<string>();
+  for (const kind of unsupported) {
+    const reason = kindToReason(kind);
+    if (!seen.has(reason)) {
+      out.push(reason);
+      seen.add(reason);
+    }
+  }
+
+  return out;
+}
+
+// TD-3: `kind` is deliberately typed `string`, NOT the closed `UnsupportedKind`
+// union. The resolver's `unsupported` array is `Type.Array(Type.String())` and
+// legitimately carries `hooks` (a SUPPORTED kind flagged as dropped) alongside
+// the `UnsupportedKind` literals, so no closed union spans the real input. Any
+// kind outside the two recognized markers intentionally collapses to the generic
+// `"unsupported source"` reason rather than forcing an unsafe cast at the callers.
+function kindToReason(kind: string): UnsupportedReason {
+  if (kind === "lspServers") {
+    return "lsp";
+  }
+
+  if (kind === "hooks") {
+    return "unsupported hooks";
+  }
+
+  return "unsupported source";
 }

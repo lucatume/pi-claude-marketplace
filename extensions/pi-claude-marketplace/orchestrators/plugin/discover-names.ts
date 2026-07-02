@@ -16,7 +16,7 @@ import {
 
 import { pickAgentsSourceDir } from "./shared.ts";
 
-import type { ResolvedPluginInstallable } from "../../domain/resolver.ts";
+import type { MaterializablePlugin } from "../../domain/resolver.ts";
 
 export interface DiscoveredGeneratedNames {
   readonly skills: readonly string[];
@@ -27,14 +27,14 @@ export interface DiscoveredGeneratedNames {
 
 export async function discoverGeneratedNames(
   plugin: string,
-  installable: ResolvedPluginInstallable,
+  resolved: MaterializablePlugin,
 ): Promise<DiscoveredGeneratedNames> {
-  const skillsDiscovery = await discoverPluginSkills({ pluginName: plugin, resolved: installable });
+  const skillsDiscovery = await discoverPluginSkills({ pluginName: plugin, resolved });
   const commandsDiscovery = await discoverPluginCommands({
     pluginName: plugin,
-    resolved: installable,
+    resolved,
   });
-  const agentsSourceDir = pickAgentsSourceDir(installable);
+  const agentsSourceDir = pickAgentsSourceDir(resolved);
   const agentsDiscovery =
     agentsSourceDir === null
       ? { discovered: [] as readonly { readonly generatedName: string }[] }

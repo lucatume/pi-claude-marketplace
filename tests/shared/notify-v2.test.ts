@@ -401,6 +401,182 @@ test("notify renders unavailable plugin with reasons (MSG-PL-6 carve-out: NO sco
   ]);
 });
 
+test("USTAT-01 / D-64-01: notify renders unsupported plugin with the ⊖ glyph (MSG-PL-6 carve-out: NO scope bracket)", () => {
+  const ctx = makeCtx();
+  const pi = piWithNothingLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "unsupported",
+            name: "hookify",
+            reasons: ["unsupported hooks"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  // info severity -> single-arg notify (the row omits `severity`).
+  assert.equal(args.length, 1);
+  // Variant has no `version` set -> renderVersion("") -> "" slot collapsed.
+  assert.equal(args[0], `● demo [user]\n  ⊖ hookify (unsupported) {unsupported hooks}`);
+  // The unsupported glyph ⊖ is byte-distinct from the ⊘ unavailable glyph.
+  assert.ok((args[0] as string).includes("⊖ hookify"));
+  assert.ok(!(args[0] as string).includes("⊘ hookify"));
+});
+
+test("USTAT-01 / D-64-01: notify renders unsupported plugin with version and {lsp} brace", () => {
+  const ctx = makeCtx();
+  const pi = piWithNothingLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "unsupported",
+            name: "clangd-lsp",
+            version: "1.0.0",
+            reasons: ["lsp"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  assert.deepEqual(ctx.ui.notify.mock.calls[0]!.arguments, [
+    `● demo [user]\n  ⊖ clangd-lsp v1.0.0 (unsupported) {lsp}`,
+  ]);
+});
+
+test("XSURF-01: unsupported install-failure row with forceHint emits the --force install trailer", () => {
+  const ctx = makeCtx();
+  const pi = piWithNothingLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "unsupported",
+            name: "hookify",
+            version: "1.0.0",
+            reasons: ["unsupported hooks", "lsp"],
+            severity: "error",
+            forceHint: true,
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  // error severity -> notify passes the severity as a second argument.
+  assert.equal(args[1], "error");
+  assert.equal(
+    args[0],
+    `A plugin operation has failed.\n\n● demo [user]\n  ⊖ hookify v1.0.0 (unsupported) {unsupported hooks, lsp}\n    Re-run with --force to install the supported components.`,
+  );
+});
+
+test("XSURF-01: unsupported row WITHOUT forceHint stays byte-frozen (no trailer)", () => {
+  const ctx = makeCtx();
+  const pi = piWithNothingLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "unsupported",
+            name: "hookify",
+            version: "1.0.0",
+            reasons: ["unsupported hooks"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args.length, 1);
+  assert.equal(args[0], `● demo [user]\n  ⊖ hookify v1.0.0 (unsupported) {unsupported hooks}`);
+  assert.ok(!(args[0] as string).includes("--force"));
+});
+
+test("XSURF-03: force-upgradable update-decline row with forceHint emits the --force update trailer", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "force-upgradable",
+            name: "clean-plugin",
+            version: "1.0.0",
+            reasons: ["lsp"],
+            severity: "warning",
+            forceHint: true,
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args[1], "warning");
+  assert.equal(
+    args[0],
+    `A plugin operation needs attention.\n\n● demo [user]\n  ● clean-plugin v1.0.0 (force-upgradable) {lsp}\n    Re-run with --force to update with the supported components.`,
+  );
+});
+
+test("XSURF-03: list-inventory force-upgradable row WITHOUT forceHint stays byte-frozen (no trailer)", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "force-upgradable",
+            name: "clean-plugin",
+            version: "1.0.0",
+            reasons: ["unsupported hooks"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args.length, 1);
+  assert.equal(
+    args[0],
+    `● demo [user]\n  ● clean-plugin v1.0.0 (force-upgradable) {unsupported hooks}`,
+  );
+  assert.ok(!(args[0] as string).includes("--force"));
+});
+
 test("notify renders upgradable plugin with version and reasons brace", () => {
   const ctx = makeCtx();
   const pi = piWithNothingLoaded();
@@ -427,6 +603,167 @@ test("notify renders upgradable plugin with version and reasons brace", () => {
   assert.deepEqual(ctx.ui.notify.mock.calls[0]!.arguments, [
     `● demo [user]\n  ● commit-commands v1.0.0 (upgradable) {stale clone}`,
   ]);
+});
+
+test("FSTAT-02 / D-66-03: force-installed renders the ◉ glyph distinct from ● installed", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "force-installed",
+            name: "degraded-plugin",
+            version: "1.0.0",
+            reasons: ["unsupported hooks"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  // info severity -> single-arg notify (the row omits `severity`).
+  assert.equal(args.length, 1);
+  assert.equal(
+    args[0],
+    `● demo [user]\n  ◉ degraded-plugin v1.0.0 (force-installed) {unsupported hooks}`,
+  );
+  // The force-installed glyph ◉ is byte-distinct from the ● installed glyph.
+  assert.ok((args[0] as string).includes("◉ degraded-plugin"));
+  assert.ok(!(args[0] as string).includes("● degraded-plugin"));
+});
+
+test("WR-03: force-installed success row threads dependencies -> soft-dep marker fires in the SAME brace as the dropped-component reason", () => {
+  const ctx = makeCtx();
+  // Only mcp loaded -> the `agents` companion is unloaded, so the
+  // `{requires pi-subagents}` marker fires on a row declaring `agents`.
+  const pi = piWithMcpLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "official",
+        scope: "user",
+        plugins: [
+          {
+            status: "force-installed",
+            name: "helper",
+            version: "1.0.0",
+            // The force-degradable `unsupported` arm still staged agents.
+            dependencies: ["agents"],
+            reasons: ["lsp"],
+            severity: "info",
+            needsReload: true,
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  // MSG-GR-4: composeReasons appends the soft-dep marker AFTER the typed
+  // `reasons[]`, so the dropped-component token leads the shared brace.
+  assert.equal(
+    args[0],
+    `● official [user]\n  ◉ helper v1.0.0 (force-installed) {lsp, requires pi-subagents}\n\n/reload to pick up changes`,
+  );
+});
+
+test("WR-03: force-installed INVENTORY row (no dependencies) renders no soft-dep marker even when a companion is unloaded", () => {
+  const ctx = makeCtx();
+  const pi = piWithNothingLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "official",
+        scope: "user",
+        plugins: [
+          {
+            status: "force-installed",
+            name: "degraded-plugin",
+            version: "1.0.0",
+            // List/info inventory force rows OMIT `dependencies`.
+            reasons: ["lsp"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  // No `dependencies` field -> the soft-dep markers never fire; the brace
+  // carries only the dropped-component reason (unchanged from before WR-03).
+  assert.equal(args[0], `● official [user]\n  ◉ degraded-plugin v1.0.0 (force-installed) {lsp}`);
+});
+
+test("FSTAT-04 / D-66-03: force-upgradable reuses the ● glyph like the upgradable arm", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "demo",
+        scope: "user",
+        plugins: [
+          {
+            status: "force-upgradable",
+            name: "clean-plugin",
+            version: "1.0.0",
+            reasons: ["unsupported hooks"],
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args.length, 1);
+  assert.equal(
+    args[0],
+    `● demo [user]\n  ● clean-plugin v1.0.0 (force-upgradable) {unsupported hooks}`,
+  );
+});
+
+test("FSTAT-06 / D-66-04: will-install force modifier renders (will force install)", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "new-mp",
+        scope: "user",
+        plugins: [{ status: "will install", name: "degraded-plugin", force: true }],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  assert.equal(ctx.ui.notify.mock.calls.length, 1);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args.length, 1);
+  assert.equal(args[0], `● new-mp [user]\n  ● degraded-plugin (will force install)`);
+});
+
+test("FSTAT-06 / D-66-04: will-install WITHOUT the force modifier renders (will install)", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "new-mp",
+        scope: "user",
+        plugins: [{ status: "will install", name: "plain-plugin", force: false }],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const args = ctx.ui.notify.mock.calls[0]!.arguments;
+  assert.equal(args[0], `● new-mp [user]\n  ● plain-plugin (will install)`);
 });
 
 test("notify renders benign skipped plugin with up-to-date reason (info severity, UXG-02 / D-28-06)", () => {
@@ -1144,6 +1481,33 @@ test("PL-4: unavailable row with description emits description line", () => {
   assert.equal(
     body,
     "● official [user]\n  ⊘ delta (unavailable) {unsupported hooks}\n    Unavailable plugin that still surfaces its description.",
+  );
+});
+
+test("PL-4 / CR-01: unsupported row with description emits description line", () => {
+  const ctx = makeCtx();
+  const pi = piWithBothLoaded();
+  const msg: NotificationMessage = {
+    marketplaces: [
+      {
+        name: "official",
+        scope: "user",
+        plugins: [
+          {
+            status: "unsupported",
+            name: "delta",
+            reasons: ["lsp"],
+            description: "Unsupported plugin that still surfaces its description.",
+          },
+        ],
+      },
+    ],
+  };
+  notify(ctx as never, pi as never, msg);
+  const body = ctx.ui.notify.mock.calls[0]!.arguments[0] as string;
+  assert.equal(
+    body,
+    "● official [user]\n  ⊖ delta (unsupported) {lsp}\n    Unsupported plugin that still surfaces its description.",
   );
 });
 
@@ -3292,11 +3656,12 @@ test("INFO-05: renderPluginInfo (componentsResolved:false emits the `components:
 // bare `<event>` for non-tool events).
 // ===========================================================================
 
-test("SURF-02 / D-63-06: HookSummaryEntry discriminator REQUIRES matcher for tool events, FORBIDS it for non-tool events", () => {
-  // Compile-time exhaustiveness pin: tool events (PreToolUse, PostToolUse,
-  // PostToolUseFailure) carry a `matcher: string` field; non-tool events
-  // (SessionStart, etc.) cannot. The `@ts-expect-error` directives below
-  // assert that the misuse cases fail to typecheck.
+test("SURF-02 / D-63-06: HookSummaryEntry discriminator REQUIRES matcher for the untagged tool-event arm", () => {
+  // Compile-time exhaustiveness pin: the untagged tool-event arm
+  // (PreToolUse, PostToolUse, PostToolUseFailure) carries a required
+  // `matcher: string`; the untagged non-tool arm carries no matcher field.
+  // The `@ts-expect-error` below asserts the missing-matcher misuse fails to
+  // typecheck.
 
   // Valid: tool event with matcher.
   const validToolEntry: HookSummaryEntry = { event: "PreToolUse", matcher: "Bash" };
@@ -3305,8 +3670,20 @@ test("SURF-02 / D-63-06: HookSummaryEntry discriminator REQUIRES matcher for too
 
   // @ts-expect-error PreToolUse requires matcher per D-63-06
   const missingMatcher: HookSummaryEntry = { event: "PreToolUse" };
-  // @ts-expect-error SessionStart forbids matcher per D-63-06
-  const extraneousMatcher: HookSummaryEntry = { event: "SessionStart", matcher: "anything" };
+
+  // PHOOK-05 / D-71-05: the lenient arm now carries an OPTIONAL `matcher` so
+  // the info surface can enumerate a dropped matcher group as
+  // `event(matcher) (unsupported)`. Because `matcher` is now a known
+  // property of the union, a non-tool event literal carrying one is no longer
+  // a union-level excess-property error -- it is tolerated against the
+  // untagged non-tool arm. The untagged non-tool arm itself still declares no
+  // matcher field; only the tagged lenient arm accepts one.
+  const lenientDroppedGroup: HookSummaryEntry = {
+    kind: "lenient",
+    event: "PreToolUse",
+    supported: false,
+    matcher: ".*",
+  };
 
   // Reference the locals so TS does not flag them unused (the assertions
   // ABOVE -- not the runtime body -- are the actual contract).
@@ -3314,7 +3691,7 @@ test("SURF-02 / D-63-06: HookSummaryEntry discriminator REQUIRES matcher for too
   assert.equal(validToolEntry.matcher, "Bash");
   assert.equal(validNonToolEntry.event, "SessionStart");
   assert.equal((missingMatcher as { event: string }).event, "PreToolUse");
-  assert.equal((extraneousMatcher as { event: string }).event, "SessionStart");
+  assert.equal("kind" in lenientDroppedGroup && lenientDroppedGroup.matcher, ".*");
 });
 
 test("SURF-02 / D-63-04: renderer emits multi-line `hooks:` block at 4-space header + 6-space per-entry indent (mixed tool/non-tool entries)", () => {
@@ -3969,13 +4346,16 @@ test('Migration Strategy #2: cascade payload WITHOUT `kind` field byte-equals pa
 // ===========================================================================
 // DIFF-02 -- pending-tense `(will *)` pending rows.
 //
-// Six new tokens (4 plugin + 2 marketplace) emitted by `/claude:plugin pending`.
-// All are info-severity (no failure / skipped / manual-recovery semantics) so
-// the 2nd `ctx.ui.notify` arg is omitted. None are in shouldEmitReloadHint's
-// trigger set, so no `/reload to pick up changes` trailer is appended.
+// Four pending-tense plugin-level tokens emitted by `/claude:plugin pending`.
+// WILL-01 / D-65.1-02 / D-65.1-03: the marketplace level carries no pending
+// token -- add is immediate, remove surfaces as per-plugin `will uninstall`
+// child rows under a bare header. All four are info-severity (no failure /
+// skipped / manual-recovery semantics) so the 2nd `ctx.ui.notify` arg is
+// omitted. None are in shouldEmitReloadHint's trigger set, so no
+// `/reload to pick up changes` trailer is appended.
 // ===========================================================================
 
-test("DIFF-02: will-add marketplace header + will-install plugin child (orphan-fold suppresses [scope])", () => {
+test("WILL-01: marketplace add renders a bare header + will-install plugin child (orphan-fold suppresses [scope])", () => {
   const ctx = makeCtx();
   const pi = piWithBothLoaded();
   const msg: NotificationMessage = {
@@ -3983,7 +4363,6 @@ test("DIFF-02: will-add marketplace header + will-install plugin child (orphan-f
       {
         name: "new-mp",
         scope: "user",
-        status: "will add",
         plugins: [{ status: "will install", name: "alpha" }],
       },
     ],
@@ -3993,26 +4372,7 @@ test("DIFF-02: will-add marketplace header + will-install plugin child (orphan-f
   assert.equal(ctx.ui.notify.mock.calls.length, 1);
   const args = ctx.ui.notify.mock.calls[0]!.arguments;
   assert.equal(args.length, 1);
-  assert.equal(args[0], `● new-mp [user] (will add)\n  ● alpha (will install)`);
-});
-
-test("DIFF-02: will-remove marketplace header (open circle, no plugin children)", () => {
-  const ctx = makeCtx();
-  const pi = piWithBothLoaded();
-  const msg: NotificationMessage = {
-    marketplaces: [
-      {
-        name: "old-mp",
-        scope: "project",
-        status: "will remove",
-        plugins: [],
-      },
-    ],
-  };
-  notify(ctx as never, pi as never, msg);
-  const args = ctx.ui.notify.mock.calls[0]!.arguments;
-  assert.equal(args.length, 1);
-  assert.equal(args[0], `○ old-mp [project] (will remove)`);
+  assert.equal(args[0], `● new-mp [user]\n  ● alpha (will install)`);
 });
 
 test("DIFF-02: will-uninstall plugin under existing (no-status) marketplace block", () => {
@@ -4062,7 +4422,6 @@ test("DIFF-02: cross-scope orphan-fold -- plugin scope differs from marketplace 
       {
         name: "shared",
         scope: "project",
-        status: "will add",
         plugins: [
           // Plugin's scope explicitly differs from marketplace -> bracket emits.
           { status: "will install", name: "alpha", scope: "user" },
@@ -4073,7 +4432,7 @@ test("DIFF-02: cross-scope orphan-fold -- plugin scope differs from marketplace 
   notify(ctx as never, pi as never, msg);
   const args = ctx.ui.notify.mock.calls[0]!.arguments;
   assert.equal(args.length, 1);
-  assert.equal(args[0], `● shared [project] (will add)\n  ● alpha [user] (will install)`);
+  assert.equal(args[0], `● shared [project]\n  ● alpha [user] (will install)`);
 });
 
 test("DIFF-02: will-* cascade emits NO /reload to pick up changes trailer (pending rows are pre-transition)", () => {
@@ -4084,7 +4443,6 @@ test("DIFF-02: will-* cascade emits NO /reload to pick up changes trailer (pendi
       {
         name: "mp",
         scope: "user",
-        status: "will add",
         plugins: [
           { status: "will install", name: "a" },
           { status: "will uninstall", name: "b" },
@@ -4108,7 +4466,6 @@ test("DIFF-02: will-* cascade computes info severity (no second arg to ctx.ui.no
       {
         name: "mp",
         scope: "user",
-        status: "will remove",
         plugins: [{ status: "will uninstall", name: "p" }],
       },
     ],
