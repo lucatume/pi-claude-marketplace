@@ -271,12 +271,13 @@ List plugins available for installation. Omit the marketplace name to list acros
 /claude:plugin list --available
 ```
 
-Filter the list by plugin status, installed, available for installation, partially available, or unavailable to install.
+Filter the list by plugin status, installed, available for installation, partially available (not all features supported), remote (a plugin in a remote repository not yet fetched), or unavailable to install.
 
 ```text
 /claude:plugin list --installed
 /claude:plugin list --available
 /claude:plugin list --partial
+/claude:plugin list --remote
 /claude:plugin list --unavailable
 ```
 
@@ -324,12 +325,6 @@ Limit reinstall to one scope with `--scope user` or `--scope project`. The flag 
 /claude:plugin reinstall @context7-marketplace --scope user
 ```
 
-Force a reinstall should any foreign content have altered the plugin.
-
-```text
-/claude:plugin reinstall context7-plugin@context7-marketplace --force
-```
-
 Uninstall a plugin.
 
 ```text
@@ -340,6 +335,36 @@ Reload Pi after changes.
 
 ```text
 /reload
+```
+
+#### Remote plugins
+
+Marketplaces can declare remote plugins hosted in a different Git repository. They can be listed with the `--remote` option.
+
+```text
+/claude:plugin list --remote
+```
+
+Repositories of remote plugins are lazily fetched, so `/claude:plugin info` will not resolve their components. The `--fetch` option can be passed to fetch the repository of a specific plugin.
+
+```text
+/claude:plugin info 2crunch-api-security-testing@claude-plugins-official --fetch
+```
+
+The repository of a specific remote plugin, of all the plugins in a marketplace, or of all remote plugins across all marketplaces can also be be eagerly fetched:
+
+```text
+/claude:plugin fetch 2crunch-api-security-testing@claude-plugins-official
+/claude:plugin fetch @claude-plugins-official
+/claude:plugin fetch
+```
+
+Once fetched, plugins are determined to be available, partially-available or unavailable for installation.
+
+The `/claude:plugin install` command automatically fetches a remote plugin.
+
+```text
+/claude:plugin install 2crunch-api-security-testing@claude-plugins-official
 ```
 
 ### Bootstrap

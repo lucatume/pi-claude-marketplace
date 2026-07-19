@@ -213,6 +213,7 @@ async function runEnableBranch(
       state,
       locations,
       {
+        ctx: opts.ctx,
         scope,
         cwd: opts.cwd,
         marketplace: opts.marketplace,

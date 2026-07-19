@@ -57,10 +57,11 @@ const INSTALLED_INVENTORY_STATUSES: ReadonlySet<PluginIndexRow["status"]> = new 
 ]);
 
 /**
- * D-67-02 / LIST-02: without `--partial`, install offers only `available` plugins
- * (byte-identical to today).
+ * D-67-02 / LIST-02: without `--partial`, install offers `available` plugins.
+ * RSTA-01 / D-80-05: it ALSO offers `remote` plugins -- install performs the
+ * fetch, so a not-yet-fetched git-source plugin is a valid install target.
  */
-const INSTALL_STATUSES: ReadonlySet<PluginIndexRow["status"]> = new Set(["available"]);
+const INSTALL_STATUSES: ReadonlySet<PluginIndexRow["status"]> = new Set(["available", "remote"]);
 
 /**
  * D-67-02 / LIST-02: with `--partial`, install offers the partial-install
@@ -89,8 +90,27 @@ const PARTIAL_UPDATE_STATUSES: ReadonlySet<PluginIndexRow["status"]> = new Set([
   "partially-upgradable",
 ]);
 
+/**
+ * D-81-03: the fetchable git-source buckets. `fetch` warms a clone/mirror the
+ * plugin does not yet have (or refreshes a mutable mirror), so it offers the
+ * warm-or-warmable statuses: `remote` (unmaterialized), plus `available` /
+ * `partially-available` / `unavailable` (already-warm rows that a re-fetch
+ * refreshes). The completion cache cannot distinguish pinned-warm from
+ * unpinned-warm, so pinned-warm is not excluded here -- it is accepted-if-typed
+ * and simply no-ops at execution (D-81-03 option (a)). Installed-family rows
+ * never appear (no fetchable status). Not-installed path-source rows DO appear
+ * (they classify available / partially-available / unavailable, all in this
+ * set); a path-source fetch no-ops as `skipped` at execution.
+ */
+const FETCH_STATUSES: ReadonlySet<PluginIndexRow["status"]> = new Set([
+  "remote",
+  "available",
+  "partially-available",
+  "unavailable",
+]);
+
 type PluginRefCompletionMode =
-  "install" | "uninstall" | "update" | "reinstall" | "info" | "enable" | "disable";
+  "install" | "uninstall" | "update" | "fetch" | "reinstall" | "info" | "enable" | "disable";
 
 // ---------------------------------------------------------------------------
 // LocationsResolver -- the edge/ -> persistence/ injection seam.
@@ -392,6 +412,20 @@ async function getInstalledPluginToMarketplacesMap(
   // (`upgradable` + `partially-upgradable` + `partially-installed-upgradable`) -- plain
   // `installed` / `partially-installed` have no newer candidate to upgrade to.
   const allowed = partial ? PARTIAL_UPDATE_STATUSES : INSTALLED_INVENTORY_STATUSES;
+  return collectPluginToMarketplacesMap(resolver, explicitScope, allowed);
+}
+
+/**
+ * Shared scope sweep for the status-filtered candidate maps: walk every
+ * marketplace in the requested scopes (both when no explicit `--scope`),
+ * read each cached plugin index, and admit every row whose derived status is
+ * in `allowed` into the plugin -> marketplaces map.
+ */
+async function collectPluginToMarketplacesMap(
+  resolver: LocationsResolver,
+  explicitScope: Scope | undefined,
+  allowed: ReadonlySet<PluginIndexRow["status"]>,
+): Promise<Map<string, string[]>> {
   const result = new Map<string, string[]>();
   const scopes: readonly Scope[] =
     explicitScope === undefined ? ["project", "user"] : [explicitScope];
@@ -413,6 +447,22 @@ async function getInstalledPluginToMarketplacesMap(
   }
 
   return result;
+}
+
+/**
+ * FTCH-07 / D-81-03: the fetchable candidate map. Manifest-driven (NOT the
+ * installed inventory): every marketplace row whose derived status is in
+ * `FETCH_STATUSES` is a fetch target, with no installed-name skip beyond that
+ * status filter (installed-family statuses are already excluded by
+ * `FETCH_STATUSES`, so completion never offers them; a typed installed ref
+ * still executes because the orchestrator is manifest-driven). Explicit
+ * `--scope` narrows the enumerated scopes; omitting it spans both.
+ */
+async function getFetchPluginToMarketplacesMap(
+  resolver: LocationsResolver,
+  explicitScope: Scope | undefined,
+): Promise<Map<string, string[]>> {
+  return collectPluginToMarketplacesMap(resolver, explicitScope, FETCH_STATUSES);
 }
 
 /**
@@ -458,6 +508,10 @@ export async function getPluginToMarketplacesMap(
     return getInfoPluginToMarketplacesMap(resolver);
   }
 
+  if (mode === "fetch") {
+    return getFetchPluginToMarketplacesMap(resolver, options.targetScope);
+  }
+
   if (mode === "install") {
     return getInstallPluginToMarketplacesMap(
       resolver,
@@ -500,6 +554,7 @@ async function getPluginHalfCompletions(
 }
 
 async function getMarketplaceOnlyCompletions(
+  mode: PluginRefCompletionMode,
   marketplacePart: string,
   argumentTextPrefix: string,
   resolver: LocationsResolver,
@@ -510,7 +565,10 @@ async function getMarketplaceOnlyCompletions(
     return [];
   }
 
-  const map = await getPluginToMarketplacesMap("update", resolver, options);
+  // Build the offered marketplace set from the SAME candidate map the plugin
+  // half uses so `@<mp>` only lists marketplaces that carry a mode-relevant
+  // plugin (update/reinstall -> installed inventory; fetch -> fetchable set).
+  const map = await getPluginToMarketplacesMap(mode, resolver, options);
   const all = Array.from(new Set(Array.from(map.values()).flat()));
   return all
     .filter((m) => m.startsWith(marketplacePart))
@@ -549,6 +607,7 @@ export async function getPluginRefCompletions(
 
   if (pluginPart === "") {
     return getMarketplaceOnlyCompletions(
+      mode,
       marketplacePart,
       argumentTextPrefix,
       resolver,
